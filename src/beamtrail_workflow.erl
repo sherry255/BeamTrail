@@ -16,3 +16,11 @@
 -callback idempotency_key(RunId :: run_id(), StepId :: step_id(), Input :: term()) -> term().
 -callback execute(StepId :: step_id(), StepVersion :: step_version(), Input :: term(), Context :: map()) ->
     {ok, term()} | {error, term()}.
+
+%% Optional. Total wall-clock budget for the whole workflow instance,
+%% measured from workflow.instance.created.occurred_at. Defaults to
+%% infinity (no workflow-level timeout). When the runtime dispatches and
+%% finds the budget exceeded, it emits workflow.failed with reason
+%% workflow_timeout instead of running the next step.
+-optional_callbacks([workflow_timeout_ms/0]).
+-callback workflow_timeout_ms() -> timeout().

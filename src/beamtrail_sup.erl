@@ -7,11 +7,37 @@ start_link() ->
     supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
 init([]) ->
-    Children =
-        [#{id => beamtrail_memory_storage,
-           start => {beamtrail_memory_storage, start_link, []},
+    ScanInterval =
+        case application:get_env(beamtrail, scanner_interval_ms) of
+            {ok, V} -> V;
+            undefined -> 5000
+        end,
+    StorageChild =
+        case beamtrail:storage() of
+            beamtrail_memory_storage ->
+                [#{id => beamtrail_memory_storage,
+                   start => {beamtrail_memory_storage, start_link, []},
+                   restart => permanent,
+                   shutdown => 5000,
+                   type => worker,
+                   modules => [beamtrail_memory_storage]}];
+            _Other ->
+                %% Durable adapters wire their own connection pool /
+                %% supervision; we don't start them ad-hoc here.
+                []
+        end,
+    Children = StorageChild ++
+        [#{id => beamtrail_worker_sup,
+           start => {beamtrail_worker_sup, start_link, []},
+           restart => permanent,
+           shutdown => 5000,
+           type => supervisor,
+           modules => [beamtrail_worker_sup]},
+         #{id => beamtrail_scanner,
+           start => {beamtrail_scanner, start_link,
+                     [#{interval_ms => ScanInterval, auto_start => true}]},
            restart => permanent,
            shutdown => 5000,
            type => worker,
-           modules => [beamtrail_memory_storage]}],
-    {ok, {{one_for_one, 3, 10}, Children}}.
+           modules => [beamtrail_scanner]}],
+    {ok, {{one_for_one, 5, 10}, Children}}.

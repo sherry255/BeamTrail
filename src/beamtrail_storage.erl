@@ -14,3 +14,11 @@
 -callback acquire_lease(RunId :: binary(), Owner :: term(), TtlMs :: pos_integer()) ->
     {ok, map()} | {error, leased}.
 -callback read_lease(RunId :: binary()) -> {ok, map()} | not_found.
+-callback list_run_ids() -> [binary()].
+
+%% Optional read-model accessors. Derived from the append-only event log,
+%% never written as the primary source of truth.
+-optional_callbacks([read_instance/1, read_attempts/1, telemetry_counters/0]).
+-callback read_instance(RunId :: binary()) -> {ok, map()} | not_found.
+-callback read_attempts(RunId :: binary()) -> {ok, [map()]} | not_found.
+-callback telemetry_counters() -> map().

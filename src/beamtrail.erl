@@ -2,9 +2,11 @@
 
 -export([start/0, stop/0]).
 -export([start_workflow/2, start_workflow/3, dispatch/1, recover_unfinished/0]).
--export([get_state/1, events/1]).
+-export([get_state/1, events/1, storage/0]).
+-export([list_recoverable/0, mark_recovery_requeued/1]).
 
--define(STORAGE, beamtrail_memory_storage).
+-define(STORAGE_DEFAULT, beamtrail_memory_storage).
+-define(LEASE_TTL_MS, 30000).
 -define(SNAPSHOT_EVERY, 5).
 
 start() ->
@@ -21,7 +23,7 @@ start_workflow(Workflow, Input, Options) ->
     RunId = maps:get(run_id, Options, new_run_id()),
     Steps = Workflow:steps(Input),
     {ok, _Event} =
-        ?STORAGE:append_event(
+        (storage()):append_event(
           RunId,
           'workflow.instance.created',
           undefined,
@@ -56,7 +58,7 @@ dispatch(RunId) ->
 
 recover_unfinished() ->
     ok = ensure_storage(),
-    RunIds = ?STORAGE:list_run_ids(),
+    RunIds = (storage()):list_run_ids(),
     Requeued =
         [RunId || RunId <- RunIds, recover_if_unfinished(RunId)],
     {ok, Requeued}.
@@ -64,20 +66,20 @@ recover_unfinished() ->
 get_state(RunId) ->
     ok = ensure_storage(),
     State =
-        case ?STORAGE:read_snapshot(RunId) of
+        case (storage()):read_snapshot(RunId) of
             {ok, Snapshot} ->
                 SnapshotSeq = maps:get(snapshot_seq, Snapshot),
-                {ok, TailEvents} = ?STORAGE:read_events(RunId, SnapshotSeq + 1, infinity),
+                {ok, TailEvents} = (storage()):read_events(RunId, SnapshotSeq + 1, infinity),
                 beamtrail_reducer:from_snapshot_and_events(maps:get(state, Snapshot), TailEvents);
             not_found ->
-                {ok, Events} = ?STORAGE:events(RunId),
+                {ok, Events} = (storage()):events(RunId),
                 beamtrail_reducer:from_events(Events)
         end,
     enrich_version_migration(State).
 
 events(RunId) ->
     ok = ensure_storage(),
-    ?STORAGE:events(RunId).
+    (storage()):events(RunId).
 
 dispatch_retrying(RunId, State) ->
     Now = erlang:system_time(millisecond),
@@ -87,12 +89,53 @@ dispatch_retrying(RunId, State) ->
     end.
 
 dispatch_ready(RunId, State) ->
-    case maps:get(current_step, State) of
-        undefined ->
-            complete_if_needed(RunId, State);
-        StepId ->
-            run_step(RunId, State, StepId)
+    case workflow_timeout_exceeded(State) of
+        true ->
+            fail_workflow_with_timeout(RunId, State);
+        false ->
+            case maps:get(current_step, State) of
+                undefined ->
+                    complete_if_needed(RunId, State);
+                StepId ->
+                    run_step(RunId, State, StepId)
+            end
     end.
+
+workflow_timeout_exceeded(State) ->
+    case maps:get(workflow, State, undefined) of
+        undefined -> false;
+        Workflow ->
+            case workflow_timeout_ms(Workflow) of
+                infinity -> false;
+                undefined -> false;
+                Budget when is_integer(Budget) ->
+                    case maps:get(created_at, State, undefined) of
+                        undefined -> false;
+                        CreatedAt ->
+                            erlang:system_time(millisecond) - CreatedAt > Budget
+                    end
+            end
+    end.
+
+workflow_timeout_ms(Workflow) ->
+    _ = code:ensure_loaded(Workflow),
+    case erlang:function_exported(Workflow, workflow_timeout_ms, 0) of
+        true ->
+            try Workflow:workflow_timeout_ms() catch _:_ -> infinity end;
+        false ->
+            infinity
+    end.
+
+fail_workflow_with_timeout(RunId, State) ->
+    StepId = maps:get(current_step, State),
+    Payload = #{reason => workflow_timeout,
+                class => workflow_timeout,
+                created_at => maps:get(created_at, State, undefined),
+                failed_at => erlang:system_time(millisecond)},
+    {ok, _} = (storage()):append_event(RunId, 'workflow.failed', StepId,
+                                    undefined, undefined, Payload),
+    maybe_snapshot(RunId, true),
+    {ok, get_state(RunId)}.
 
 complete_if_needed(RunId, State) ->
     case maps:get(status, State) of
@@ -100,7 +143,7 @@ complete_if_needed(RunId, State) ->
             {ok, State};
         _ ->
             {ok, _Event} =
-                ?STORAGE:append_event(
+                (storage()):append_event(
                   RunId,
                   'workflow.completed',
                   undefined,
@@ -139,7 +182,7 @@ ensure_attempt_started(RunId, Workflow, Input, State, StepId) ->
             StepVersion = Workflow:step_version(StepId),
             IdempotencyKey = Workflow:idempotency_key(RunId, StepId, Input),
             {ok, Event} =
-                ?STORAGE:append_event(
+                (storage()):append_event(
                   RunId,
                   'attempt.started',
                   StepId,
@@ -195,7 +238,7 @@ run_with_timeout(Fun, TimeoutMs) when is_integer(TimeoutMs), TimeoutMs >= 0 ->
 handle_step_success(RunId, _State, Attempt, Value) ->
     StepId = maps:get(step_id, Attempt),
     {ok, _Event} =
-        ?STORAGE:append_event(
+        (storage()):append_event(
           RunId,
           'step.succeeded',
           StepId,
@@ -209,7 +252,7 @@ handle_step_failure(RunId, State, Attempt, Reason) ->
     StepId = maps:get(step_id, Attempt),
     FailurePayload = #{reason => Reason, class => error_key(Reason), attempt => maps:get(attempt, Attempt)},
     {ok, _FailedEvent} =
-        ?STORAGE:append_event(
+        (storage()):append_event(
           RunId,
           'step.failed',
           StepId,
@@ -236,7 +279,7 @@ schedule_retry(RunId, _State, Attempt, Reason, Policy) ->
           attempt => maps:get(attempt, Attempt),
           next_retry_at => NextRetryAt},
     {ok, _RetryEvent} =
-        ?STORAGE:append_event(
+        (storage()):append_event(
           RunId,
           'retry.scheduled',
           StepId,
@@ -253,7 +296,7 @@ schedule_retry(RunId, _State, Attempt, Reason, Policy) ->
 
 fail_workflow(RunId, Attempt, FailurePayload) ->
     {ok, _FailedEvent} =
-        ?STORAGE:append_event(
+        (storage()):append_event(
           RunId,
           'workflow.failed',
           maps:get(step_id, Attempt),
@@ -279,12 +322,54 @@ recover_if_unfinished(RunId) ->
     State = get_state(RunId),
     case recoverable(State) of
         true ->
-            {ok, _RecoveredState} = dispatch(RunId),
-            beamtrail_telemetry:execute([beamtrail, recovery, requeued], #{count => 1}, #{run_id => RunId}),
-            maybe_snapshot(RunId, true),
-            true;
+            case mark_recovery_requeued(RunId) of
+                {ok, requeued} ->
+                    {ok, _RecoveredState} = dispatch(RunId),
+                    maybe_snapshot(RunId, true),
+                    true;
+                {ok, skipped} ->
+                    false
+            end;
         false ->
             false
+    end.
+
+list_recoverable() ->
+    ok = ensure_storage(),
+    [RunId || RunId <- (storage()):list_run_ids(),
+              recoverable(get_state(RunId))].
+
+%% Acquires a lease (best-effort) and appends a durable `recovery.requeued'
+%% event to the log so the scanner's decision is observable in the inspector,
+%% not only via telemetry counters. Idempotent on lease contention.
+mark_recovery_requeued(RunId) ->
+    ok = ensure_storage(),
+    Mod = storage(),
+    {EventType, LeaseInfo} =
+        case Mod:acquire_lease(RunId, node(), ?LEASE_TTL_MS) of
+            {ok, Lease} -> {'recovery.requeued', Lease};
+            {error, leased} ->
+                ExistingLease = case Mod:read_lease(RunId) of
+                                    {ok, L} -> L;
+                                    _ -> undefined
+                                end,
+                {'recovery.skipped', ExistingLease}
+        end,
+    Payload = #{requeued_at => erlang:system_time(millisecond),
+                owner_node => node(),
+                lease => LeaseInfo},
+    {ok, _} = Mod:append_event(RunId, EventType, undefined,
+                               undefined, undefined, Payload),
+    TelemetryEvent = case EventType of
+                         'recovery.requeued' -> [beamtrail, recovery, requeued];
+                         'recovery.skipped' -> [beamtrail, recovery, skipped]
+                     end,
+    beamtrail_telemetry:execute(TelemetryEvent,
+                                #{count => 1},
+                                #{run_id => RunId, lease => LeaseInfo}),
+    case EventType of
+        'recovery.requeued' -> {ok, requeued};
+        'recovery.skipped' -> {ok, skipped}
     end.
 
 recoverable(State) ->
@@ -305,7 +390,7 @@ maybe_snapshot(RunId, Force) ->
     ShouldWrite = Force orelse (Seq > 0 andalso Seq rem ?SNAPSHOT_EVERY =:= 0),
     case ShouldWrite of
         true ->
-            ok = ?STORAGE:write_snapshot(RunId, State, Seq, 1),
+            ok = (storage()):write_snapshot(RunId, State, Seq, 1),
             beamtrail_telemetry:execute([beamtrail, snapshot, written], #{count => 1},
                                         #{run_id => RunId, snapshot_seq => Seq});
         false ->
@@ -335,14 +420,28 @@ current_step_version(Workflow, StepId) ->
     end.
 
 ensure_storage() ->
-    case whereis(?STORAGE) of
-        undefined ->
-            case ?STORAGE:start_link() of
-                {ok, _Pid} -> ok;
-                {error, {already_started, _Pid}} -> ok
+    Mod = storage(),
+    %% Only ad-hoc start for the in-memory adapter; durable adapters are
+    %% expected to be started under the supervision tree with their own
+    %% connection setup.
+    case Mod =:= ?STORAGE_DEFAULT of
+        true ->
+            case whereis(Mod) of
+                undefined ->
+                    case Mod:start_link() of
+                        {ok, _Pid} -> ok;
+                        {error, {already_started, _Pid}} -> ok
+                    end;
+                _Pid -> ok
             end;
-        _Pid ->
+        false ->
             ok
+    end.
+
+storage() ->
+    case application:get_env(beamtrail, storage_adapter) of
+        {ok, M} when is_atom(M) -> M;
+        _ -> ?STORAGE_DEFAULT
     end.
 
 new_run_id() ->

@@ -1,7 +1,7 @@
 {application, beamtrail,
  [{description, "Durable workflow runtime for OTP"},
   {vsn, "0.1.0"},
-  {registered, [beamtrail_memory_storage]},
+  {registered, [beamtrail_memory_storage, beamtrail_scanner]},
   {applications, [kernel, stdlib]},
   {mod, {beamtrail_app, []}},
   {env, []}]}.

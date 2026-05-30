@@ -38,6 +38,7 @@ apply_event_type('workflow.instance.created', State, Event) ->
            status => running,
            current_step => first_step(Steps),
            completed_steps => 0,
+           created_at => maps:get(occurred_at, Event),
            terminal => false};
 apply_event_type('attempt.started', State, Event) ->
     StepId = maps:get(step_id, Event),
