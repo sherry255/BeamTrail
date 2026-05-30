@@ -13,7 +13,9 @@ extended_test_() ->
       fun telemetry_counters_track_attempts/0,
       fun postgres_stub_is_loud_about_not_implemented/0,
       fun retry_attempts_preserved_in_chronological_order/0,
-      fun storage_adapter_is_application_configurable/0
+      fun storage_adapter_is_application_configurable/0,
+      fun query_describe_exposes_prototype_blocks/0,
+      fun recovery_requeued_records_recovered_in_ms/0
      ]}.
 
 setup() ->
@@ -122,6 +124,48 @@ storage_adapter_is_application_configurable() ->
     ?assertEqual(beamtrail_postgres_storage, beamtrail:storage()),
     ok = application:unset_env(beamtrail, storage_adapter),
     ?assertEqual(beamtrail_memory_storage, beamtrail:storage()).
+
+query_describe_exposes_prototype_blocks() ->
+    Input = #{order_id => <<"o-proto-1">>, test_pid => self()},
+    {ok, RunId} = beamtrail:start_workflow(bt_success_workflow, Input),
+    _ = receive_exec(), _ = receive_exec(),
+    Q = beamtrail_query:describe(RunId),
+    ?assertMatch(#{authoritative := <<"workflow_events", _/binary>>,
+                   snapshot := #{snapshot_seq := _, replay_tail_events := _},
+                   read_models := [_ | _]}, maps:get(source_of_truth, Q)),
+    ?assertMatch(#{step_version_source := <<"attempt.started.step_version">>,
+                   migration_required_for_version_change := false},
+                 maps:get(replay_policy, Q)),
+    ?assertMatch(#{owner_node := _}, maps:get(ownership, Q)),
+    ?assertMatch(#{target_ms := 30000, status := _},
+                 maps:get(recovery, Q)),
+    ?assertMatch(#{module := beamtrail_memory_storage,
+                   primary_writes := [_ | _]},
+                 maps:get(storage_adapter, Q)).
+
+recovery_requeued_records_recovered_in_ms() ->
+    RunId = <<"recov-in-ms-1">>,
+    Input = #{order_id => <<"o-rec-1">>},
+    {ok, _} = beamtrail_memory_storage:append_event(
+                RunId, 'workflow.instance.created', undefined, undefined,
+                undefined,
+                #{workflow => bt_versioned_workflow, input => Input,
+                  steps => [charge]}),
+    {ok, _} = beamtrail_memory_storage:append_event(
+                RunId, 'attempt.started', charge, 1,
+                {charge, <<"o-rec-1">>}, #{attempt => 1}),
+    timer:sleep(15),
+    {ok, requeued} = beamtrail:mark_recovery_requeued(RunId),
+    {ok, Events} = beamtrail:events(RunId),
+    [Req] = [E || E <- Events, maps:get(event_type, E) =:= 'recovery.requeued'],
+    Payload = maps:get(payload, Req),
+    Recovered = maps:get(recovered_in_ms, Payload),
+    ?assert(is_integer(Recovered)),
+    ?assert(Recovered >= 10),
+    Q = beamtrail_query:describe(RunId),
+    ?assertEqual(Recovered, maps:get(recovered_in_ms, Q)),
+    ?assertMatch(#{status := pass, recovered_in_ms := Recovered},
+                 maps:get(recovery, Q)).
 
 receive_exec() ->
     receive Message -> Message

@@ -355,9 +355,12 @@ mark_recovery_requeued(RunId) ->
                                 end,
                 {'recovery.skipped', ExistingLease}
         end,
-    Payload = #{requeued_at => erlang:system_time(millisecond),
+    Now = erlang:system_time(millisecond),
+    RecoveredInMs = compute_recovered_in_ms(RunId, Now),
+    Payload = #{requeued_at => Now,
                 owner_node => node(),
-                lease => LeaseInfo},
+                lease => LeaseInfo,
+                recovered_in_ms => RecoveredInMs},
     {ok, _} = Mod:append_event(RunId, EventType, undefined,
                                undefined, undefined, Payload),
     TelemetryEvent = case EventType of
@@ -371,6 +374,44 @@ mark_recovery_requeued(RunId) ->
         'recovery.requeued' -> {ok, requeued};
         'recovery.skipped' -> {ok, skipped}
     end.
+
+%% recovered_in_ms = wall-clock gap between the earliest still-open
+%% `attempt.started' (no closure observed) and this recovery event,
+%% i.e. how long the longest-orphaned attempt has been stuck.
+%% Returns `undefined' when there is no orphan attempt to recover.
+compute_recovered_in_ms(RunId, Now) ->
+    case (storage()):read_events(RunId, 1, infinity) of
+        {ok, Events} ->
+            case open_attempt_started_at(Events) of
+                undefined -> undefined;
+                Ts when is_integer(Ts) -> max(0, Now - Ts)
+            end;
+        _ -> undefined
+    end.
+
+%% Walk the log keeping at most one open attempt per step_id. A completion
+%% event clears only the open attempt for its own step_id, so interleaved
+%% step activity (today sequential, tomorrow possibly concurrent) does not
+%% spuriously cancel another step's open attempt. Returns the earliest
+%% still-open started_at, or undefined if nothing is open.
+open_attempt_started_at(Events) ->
+    Open = lists:foldl(fun open_step_fold/2, #{}, Events),
+    case [T || T <- maps:values(Open)] of
+        [] -> undefined;
+        Ts -> lists:min(Ts)
+    end.
+
+open_step_fold(#{event_type := 'attempt.started',
+                 step_id := StepId, occurred_at := T}, Acc) ->
+    maps:put(StepId, T, Acc);
+open_step_fold(#{event_type := Et, step_id := StepId}, Acc)
+  when Et =:= 'step.succeeded'; Et =:= 'step.failed' ->
+    maps:remove(StepId, Acc);
+open_step_fold(#{event_type := Et}, _Acc)
+  when Et =:= 'workflow.completed'; Et =:= 'workflow.failed';
+       Et =:= 'recovery.requeued' ->
+    #{};
+open_step_fold(_, Acc) -> Acc.
 
 recoverable(State) ->
     case maps:get(status, State) of
