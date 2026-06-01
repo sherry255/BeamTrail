@@ -29,61 +29,58 @@ init(RunId) ->
     process_flag(trap_exit, true),
     {ok, idle, #{run_id => RunId,
                  lease => undefined,
-                 retry_timer => undefined,
+                 retry_due_at => undefined,
                  heartbeat_timer => undefined,
                  dispatch => undefined,
                  attempt => undefined}}.
 
 handle_event(cast, dispatch, executing, Data) ->
-    {next_state, executing, Data};
+    {keep_state, Data};
 handle_event(cast, {dispatch, _Lease}, executing, Data) ->
-    {next_state, executing, Data};
+    {keep_state, Data};
 handle_event(cast, dispatch, _StateName, Data) ->
     start_dispatch(Data);
 handle_event(cast, {dispatch, Lease}, _StateName, Data) ->
     start_dispatch(seed_lease(Lease, Data));
 handle_event({call, From}, info, StateName, Data) ->
-    {next_state, StateName, Data,
-     [{reply, From, info_map(StateName, Data)}]};
+    {keep_state, Data, [{reply, From, info_map(StateName, Data)}]};
 handle_event(internal, dispatch_now, executing, Data) ->
-    {next_state, executing, Data};
+    {keep_state, Data};
 handle_event(internal, dispatch_now, _StateName, Data) ->
     start_dispatch(Data);
-handle_event(info, {retry_due, Ref}, _StateName,
-             #{retry_timer := {Ref, _TRef, _DueAt}} = Data) ->
-    start_dispatch(Data#{retry_timer := undefined});
-handle_event(info, {retry_due, _Ref}, StateName, Data) ->
-    {next_state, StateName, Data};
+handle_event(state_timeout, retry_due, waiting_retry, Data) ->
+    start_dispatch(Data#{retry_due_at := undefined});
+handle_event(state_timeout, retry_due, _StateName, Data) ->
+    {keep_state, Data};
 handle_event(info, {step_result, Ref, Result}, _StateName,
              #{dispatch := {Ref, _Pid}} = Data) ->
     handle_step_result(Result, clear_step_execution(Data));
-handle_event(info, {step_result, _Ref, _Result}, StateName, Data) ->
-    {next_state, StateName, Data};
+handle_event(info, {step_result, _Ref, _Result}, _StateName, Data) ->
+    {keep_state, Data};
 handle_event(state_timeout, {step_timeout, Ref}, _StateName,
              #{dispatch := {Ref, Pid}} = Data) ->
     exit(Pid, kill),
     handle_step_result({error, timeout}, clear_step_execution(Data));
-handle_event(state_timeout, {step_timeout, _Ref}, StateName, Data) ->
-    {next_state, StateName, Data};
-handle_event(info, {'EXIT', Pid, normal}, StateName,
+handle_event(state_timeout, {step_timeout, _Ref}, _StateName, Data) ->
+    {keep_state, Data};
+handle_event(info, {'EXIT', Pid, normal}, _StateName,
              #{dispatch := {_Ref, Pid}} = Data) ->
-    {next_state, StateName, Data};
+    {keep_state, Data};
 handle_event(info, {'EXIT', Pid, Reason}, _StateName,
              #{dispatch := {_Ref, Pid}} = Data) ->
     handle_step_result({error, #{class => exit, reason => Reason}},
                        clear_step_execution(Data));
-handle_event(info, {'EXIT', _Pid, _Reason}, StateName, Data) ->
-    {next_state, StateName, Data};
+handle_event(info, {'EXIT', _Pid, _Reason}, _StateName, Data) ->
+    {keep_state, Data};
 handle_event(info, {lease_heartbeat, Ref}, StateName,
              #{heartbeat_timer := {Ref, _TRef, _DueAt}} = Data) ->
     renew_lease(StateName, Data#{heartbeat_timer := undefined});
-handle_event(info, {lease_heartbeat, _Ref}, StateName, Data) ->
-    {next_state, StateName, Data};
-handle_event(_, _, StateName, Data) ->
-    {next_state, StateName, Data}.
+handle_event(info, {lease_heartbeat, _Ref}, _StateName, Data) ->
+    {keep_state, Data};
+handle_event(_, _, _StateName, Data) ->
+    {keep_state, Data}.
 
 terminate(_, _, Data) ->
-    cancel_timer(maps:get(retry_timer, Data, undefined)),
     cancel_timer(maps:get(heartbeat_timer, Data, undefined)),
     cancel_dispatch(maps:get(dispatch, Data, undefined)),
     ok.
@@ -92,7 +89,7 @@ code_change(_, StateName, Data, _) ->
     {ok, StateName, Data}.
 
 start_dispatch(Data0) ->
-    Data1 = cancel_heartbeat_timer(cancel_retry_timer(Data0)),
+    Data1 = cancel_heartbeat_timer(clear_retry_due(Data0)),
     case ensure_lease(Data1) of
         {ok, #{run_id := RunId, lease := Lease} = Data2} ->
             case beamtrail_runner_transition:next_action(RunId, Lease) of
@@ -151,9 +148,9 @@ schedule_retry_or_dispatch(State, Data) ->
     Now = erlang:system_time(millisecond),
     case maps:get(next_retry_at, State, 0) of
         NextRetryAt when is_integer(NextRetryAt), NextRetryAt > Now ->
-            Data1 = schedule_retry_timer(NextRetryAt - Now, Data),
+            Data1 = set_retry_due(NextRetryAt, Data),
             Data2 = schedule_heartbeat(Data1),
-            {next_state, waiting_retry, Data2};
+            {next_state, waiting_retry, Data2, retry_timeout_action(Data2)};
         _ ->
             schedule_immediate(Data)
     end.
@@ -177,26 +174,21 @@ seed_lease(Lease, #{lease := undefined} = Data) when is_map(Lease) ->
 seed_lease(_Lease, Data) ->
     Data.
 
-renew_lease(StateName, #{run_id := RunId, lease := Lease} = Data)
+renew_lease(_StateName, #{run_id := RunId, lease := Lease} = Data)
   when is_map(Lease) ->
     case beamtrail_lease_manager:renew(
            RunId, maps:get(fencing_token, Lease),
            beamtrail_lease_manager:default_ttl_ms()) of
         {ok, Renewed} ->
-            {next_state, StateName, schedule_heartbeat(Data#{lease := Renewed})};
+            {keep_state, schedule_heartbeat(Data#{lease := Renewed})};
         {error, _} ->
             {stop, normal, Data}
     end;
 renew_lease(_StateName, Data) ->
     {stop, normal, Data}.
 
-schedule_retry_timer(DelayMs, Data) ->
-    Data1 = cancel_retry_timer(Data),
-    Ref = make_ref(),
-    Delay = max(0, DelayMs),
-    DueAt = erlang:system_time(millisecond) + Delay,
-    TRef = erlang:send_after(Delay, self(), {retry_due, Ref}),
-    Data1#{retry_timer := {Ref, TRef, DueAt}}.
+set_retry_due(DueAt, Data) ->
+    Data#{retry_due_at := DueAt}.
 
 schedule_heartbeat(#{lease := undefined} = Data) ->
     Data;
@@ -215,9 +207,14 @@ step_timeout_action(undefined, _Ref) ->
 step_timeout_action(TimeoutMs, Ref) when is_integer(TimeoutMs), TimeoutMs >= 0 ->
     [{state_timeout, TimeoutMs, {step_timeout, Ref}}].
 
-cancel_retry_timer(Data) ->
-    cancel_timer(maps:get(retry_timer, Data, undefined)),
-    Data#{retry_timer := undefined}.
+retry_timeout_action(#{retry_due_at := DueAt}) when is_integer(DueAt) ->
+    Delay = max(0, DueAt - erlang:system_time(millisecond)),
+    [{state_timeout, Delay, retry_due}];
+retry_timeout_action(_Data) ->
+    [].
+
+clear_retry_due(Data) ->
+    Data#{retry_due_at := undefined}.
 
 cancel_heartbeat_timer(Data) ->
     cancel_timer(maps:get(heartbeat_timer, Data, undefined)),
@@ -252,8 +249,8 @@ info_map(StateName, Data) ->
       fencing_token => lease_field(Lease, fencing_token),
       lease_until => lease_field(Lease, lease_until),
       dispatch_pid => dispatch_pid(maps:get(dispatch, Data, undefined)),
-      retry_due_at => timer_due_at(maps:get(retry_timer, Data, undefined)),
-      retry_due_in_ms => timer_due_in_ms(maps:get(retry_timer, Data, undefined)),
+      retry_due_at => maps:get(retry_due_at, Data, undefined),
+      retry_due_in_ms => due_in_ms(maps:get(retry_due_at, Data, undefined)),
       heartbeat_due_at => timer_due_at(maps:get(heartbeat_timer, Data, undefined)),
       heartbeat_due_in_ms => timer_due_in_ms(maps:get(heartbeat_timer, Data, undefined))}.
 
@@ -270,6 +267,11 @@ timer_due_at(_) ->
 timer_due_in_ms({_Ref, _TRef, DueAt}) ->
     max(0, DueAt - erlang:system_time(millisecond));
 timer_due_in_ms(_) ->
+    undefined.
+
+due_in_ms(DueAt) when is_integer(DueAt) ->
+    max(0, DueAt - erlang:system_time(millisecond));
+due_in_ms(_) ->
     undefined.
 
 dispatch_pid({_Ref, Pid}) ->

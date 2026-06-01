@@ -32,6 +32,7 @@ extended_test_() ->
       fun dispatch_refuses_stale_lease_before_replay/0,
       fun dispatch_renews_lease_while_step_runs/0,
       fun active_runner_wakes_retry_without_scanner_tick/0,
+      fun active_runner_retry_timer_survives_heartbeat_and_lookup/0,
       fun active_runner_supervisor_rejects_when_pool_full/0,
       fun active_runner_crash_allows_scanner_takeover_after_lease_expiry/0,
       fun active_runner_stops_step_when_lease_heartbeat_fails/0,
@@ -439,6 +440,37 @@ active_runner_wakes_retry_without_scanner_tick() ->
     ?assertMatch({retry_backoff_execute, 1, {charge, <<"o-active-retry-1">>}},
                  receive_exec()),
     ?assertMatch({retry_backoff_execute, 2, {charge, <<"o-active-retry-1">>}},
+                 receive_exec()),
+    ok = wait_for_status(RunId, completed, 1000).
+
+active_runner_retry_timer_survives_heartbeat_and_lookup() ->
+    ok = application:set_env(beamtrail, lease_ttl_ms, 60),
+    {ok, Registry} = beamtrail_run_registry:start_link(),
+    unlink(Registry),
+    {ok, RunSup} = beamtrail_run_sup:start_link(),
+    unlink(RunSup),
+    Input = #{order_id => <<"o-active-retry-heartbeat-1">>, test_pid => self()},
+    {ok, RunId} = beamtrail:start_workflow(bt_retry_heartbeat_backoff_workflow, Input,
+                                           #{run_id => <<"active-retry-heartbeat-run-1">>,
+                                             auto_dispatch => false}),
+    ?assertMatch({ok, _Pid}, beamtrail_run_sup:dispatch(RunId)),
+    ?assertMatch({retry_backoff_execute, 1, {charge, <<"o-active-retry-heartbeat-1">>}},
+                 receive_exec()),
+    ok = wait_for_status(RunId, retrying, 1000),
+    ?assertMatch(
+       {ok, #{status := waiting_retry,
+              retry_due_in_ms := RetryDueInMs,
+              heartbeat_due_in_ms := _}}
+       when is_integer(RetryDueInMs),
+       beamtrail_run_registry:lookup(RunId)),
+    timer:sleep(80),
+    ?assertMatch(
+       {ok, #{status := waiting_retry,
+              retry_due_in_ms := RetryDueInMs,
+              heartbeat_due_in_ms := _}}
+       when is_integer(RetryDueInMs),
+       beamtrail_run_registry:lookup(RunId)),
+    ?assertMatch({retry_backoff_execute, 2, {charge, <<"o-active-retry-heartbeat-1">>}},
                  receive_exec()),
     ok = wait_for_status(RunId, completed, 1000).
 
