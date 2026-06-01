@@ -23,21 +23,29 @@ start_workflow(Workflow, Input, Options) ->
     ok = ensure_storage(),
     RunId = maps:get(run_id, Options, new_run_id()),
     Steps = Workflow:steps(Input),
-    {ok, _Event} =
-        (storage()):append_event(
-          RunId,
-          0,
-          undefined,
-          'workflow.instance.created',
-          undefined,
-          undefined,
-          undefined,
-          #{workflow => Workflow, input => Input, steps => Steps}),
-    maybe_snapshot(RunId, false),
+    case (storage()):append_event(
+           RunId,
+           0,
+           undefined,
+           'workflow.instance.created',
+           undefined,
+           undefined,
+           undefined,
+           #{workflow => Workflow, input => Input, steps => Steps}) of
+        {ok, _Event} ->
+            maybe_snapshot(RunId, false),
+            start_workflow_dispatch(RunId, Options);
+        {error, Reason} ->
+            {error, {create_failed, RunId, Reason}}
+    end.
+
+start_workflow_dispatch(RunId, Options) ->
     case maps:get(auto_dispatch, Options, true) of
         true ->
-            {ok, _State} = dispatch(RunId),
-            {ok, RunId};
+            case dispatch(RunId) of
+                {ok, _State} -> {ok, RunId};
+                {error, Reason} -> {error, {dispatch_failed, RunId, Reason}}
+            end;
         false ->
             {ok, RunId}
     end.

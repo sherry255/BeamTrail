@@ -11,6 +11,7 @@ extended_test_() ->
       fun scanner_requeues_unknown_attempts/0,
       fun scanner_scans_one_batch_at_a_time/0,
       fun worker_supervisor_rejects_when_pool_full/0,
+      fun start_workflow_returns_error_for_duplicate_run_id/0,
       fun query_describe_exposes_read_model/0,
       fun query_instance_current_step_matches_reducer/0,
       fun telemetry_counters_track_attempts/0,
@@ -71,12 +72,12 @@ scanner_requeues_unknown_attempts() ->
                 undefined,
                 #{workflow => bt_success_workflow, input => Input,
                   steps => [charge]}),
-    {ok, Lease} = beamtrail_memory_storage:acquire_lease(RunId, scanner_seed, 1),
+    {ok, Lease} = beamtrail_memory_storage:acquire_lease(RunId, scanner_seed, 100),
     {ok, _} = beamtrail_memory_storage:append_event(
                 RunId, 1, maps:get(fencing_token, Lease),
                 'attempt.started', charge, 1,
                 {charge, <<"o-sc-1">>}, #{attempt => 1}),
-    timer:sleep(2),
+    timer:sleep(120),
     {ok, _Pid} = beamtrail_scanner:start_link(#{interval_ms => infinity,
                                                 auto_start => false}),
     {ok, Requeued} = beamtrail_scanner:scan_now(),
@@ -122,6 +123,17 @@ worker_supervisor_rejects_when_pool_full() ->
     ?assertEqual({error, worker_pool_full}, beamtrail_worker_sup:dispatch_async(Run2)),
     ?assertMatch({slow_executed, slow}, receive_exec()),
     ?assertEqual(timeout, receive_exec_short()).
+
+start_workflow_returns_error_for_duplicate_run_id() ->
+    RunId = <<"duplicate-run-1">>,
+    Input = #{order_id => <<"o-dup-1">>},
+    {ok, RunId} = beamtrail:start_workflow(bt_timeout_workflow, Input,
+                                           #{run_id => RunId,
+                                             auto_dispatch => false}),
+    ?assertMatch({error, {create_failed, RunId, {conflict, _}}},
+                 beamtrail:start_workflow(bt_timeout_workflow, Input,
+                                          #{run_id => RunId,
+                                            auto_dispatch => false})).
 
 query_describe_exposes_read_model() ->
     Input = #{order_id => <<"o-q-1">>, test_pid => self()},
@@ -361,12 +373,12 @@ recovery_requeued_records_recovered_in_ms() ->
                 undefined,
                 #{workflow => bt_versioned_workflow, input => Input,
                   steps => [charge]}),
-    {ok, Lease} = beamtrail_memory_storage:acquire_lease(RunId, recovery_seed, 1),
+    {ok, Lease} = beamtrail_memory_storage:acquire_lease(RunId, recovery_seed, 100),
     {ok, _} = beamtrail_memory_storage:append_event(
                 RunId, 1, maps:get(fencing_token, Lease),
                 'attempt.started', charge, 1,
                 {charge, <<"o-rec-1">>}, #{attempt => 1}),
-    timer:sleep(15),
+    timer:sleep(120),
     {ok, requeued} = beamtrail:mark_recovery_requeued(RunId),
     {ok, Events} = beamtrail:events(RunId),
     [Req] = [E || E <- Events, maps:get(event_type, E) =:= 'recovery.requeued'],
