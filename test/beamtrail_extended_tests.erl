@@ -15,6 +15,7 @@ extended_test_() ->
       fun postgres_stub_is_loud_about_not_implemented/0,
       fun storage_rejects_expected_seq_conflict/0,
       fun storage_renews_current_lease_without_changing_fence/0,
+      fun storage_refuses_to_renew_expired_lease/0,
       fun dispatch_refuses_when_run_is_leased/0,
       fun dispatch_refuses_stale_lease_before_replay/0,
       fun dispatch_renews_lease_while_step_runs/0,
@@ -162,6 +163,14 @@ storage_renews_current_lease_without_changing_fence() ->
     ?assert(maps:get(lease_until, Renewed) > maps:get(lease_until, Lease)),
     ?assertEqual({error, stale_fence},
                  beamtrail_memory_storage:renew_lease(RunId, Fence - 1, 100)).
+
+storage_refuses_to_renew_expired_lease() ->
+    RunId = <<"expired-renew-run-1">>,
+    {ok, Lease} = beamtrail_memory_storage:acquire_lease(RunId, worker_a, 1),
+    timer:sleep(2),
+    ?assertEqual({error, lease_expired},
+                 beamtrail_memory_storage:renew_lease(
+                   RunId, maps:get(fencing_token, Lease), 100)).
 
 dispatch_refuses_when_run_is_leased() ->
     RunId = <<"leased-run-1">>,

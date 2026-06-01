@@ -156,6 +156,8 @@ handle_call({renew_lease, RunId, FencingToken, TtlMs}, _From, State) ->
     case maps:get(RunId, Leases, undefined) of
         undefined ->
             {reply, {error, no_lease}, State};
+        #{lease_until := LeaseUntil} when LeaseUntil =< Now ->
+            {reply, {error, lease_expired}, State};
         #{fencing_token := FencingToken} = Current when is_integer(FencingToken) ->
             Renewed = Current#{lease_until := Now + TtlMs,
                                renewed_at => Now},

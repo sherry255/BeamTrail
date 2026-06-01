@@ -32,16 +32,8 @@ describe(RunId) ->
             {ok, L} -> L;
             not_found -> undefined
         end,
-    Attempts =
-        case optional_read(Mod, read_attempts, [RunId], not_found) of
-            {ok, A} -> A;
-            not_found -> derive_attempts(Events)
-        end,
-    Instance =
-        case optional_read(Mod, read_instance, [RunId], not_found) of
-            {ok, I} -> I;
-            not_found -> derive_instance(Events)
-        end,
+    Attempts = maps:get(attempts, State, []),
+    Instance = instance_from_state(State),
     LastSeq = maps:get(last_event_seq, State, 0),
     TailLen = replay_tail(Snapshot, LastSeq),
     Recovered = recovered_in_ms_from_events(Events),
@@ -74,8 +66,7 @@ describe(RunId) ->
                   policy => <<"every_5_events_plus_terminal_and_recovery">>,
                   replay_tail_events => TailLen},
             read_models =>
-                [workflow_instances_projection,
-                 step_attempts_projection,
+                [reducer_state,
                  telemetry_counters]},
       replay_policy =>
           #{step_version_source => <<"attempt.started.step_version">>,
@@ -179,33 +170,14 @@ pair_starts([#{event_type := Et, occurred_at := T} | Rest], Pending, _Pair)
 pair_starts([_ | Rest], Pending, Pair) ->
     pair_starts(Rest, Pending, Pair).
 
-optional_read(Mod, Fun, Args, Default) ->
-    case erlang:function_exported(Mod, Fun, length(Args)) of
-        true -> apply(Mod, Fun, Args);
-        false -> Default
-    end.
-
-%% Fallback when an adapter does not provide a read-model accessor: derive
-%% the instance descriptor from the workflow.instance.created event.
-derive_instance(Events) ->
-    case [P || #{event_type := 'workflow.instance.created', payload := P} <- Events] of
-        [P | _] -> P;
-        [] -> undefined
-    end.
-
-%% Fallback when an adapter lacks read_attempts/1: derive a flat list of
-%% attempt records by scanning the event log.
-derive_attempts(Events) ->
-    lists:reverse(lists:foldl(fun derive_attempt/2, [], Events)).
-
-derive_attempt(#{event_type := 'attempt.started'} = E, Acc) ->
-    [#{step_id => maps:get(step_id, E),
-       step_version => maps:get(step_version, E),
-       idempotency_key => maps:get(idempotency_key, E),
-       started_at => maps:get(occurred_at, E),
-       status => started} | Acc];
-derive_attempt(#{event_type := Et} = E, [Last | Rest])
-  when Et =:= 'step.succeeded'; Et =:= 'step.failed' ->
-    Status = case Et of 'step.succeeded' -> succeeded; _ -> failed end,
-    [Last#{status => Status, closed_at => maps:get(occurred_at, E)} | Rest];
-derive_attempt(_, Acc) -> Acc.
+instance_from_state(#{run_id := undefined}) ->
+    undefined;
+instance_from_state(State) ->
+    #{run_id => maps:get(run_id, State),
+      workflow => maps:get(workflow, State),
+      status => maps:get(status, State),
+      current_step => maps:get(current_step, State),
+      last_event_seq => maps:get(last_event_seq, State, 0),
+      next_retry_at => maps:get(next_retry_at, State, undefined),
+      failure => maps:get(failure, State, undefined),
+      terminal => maps:get(terminal, State, false)}.
