@@ -22,6 +22,7 @@ extended_test_() ->
       fun recover_unfinished_returns_storage_error/0,
       fun recovery_marker_returns_storage_error/0,
       fun start_workflow_returns_snapshot_write_error/0,
+      fun load_state_ignores_obsolete_snapshot_revision/0,
       fun storage_lists_run_ids_with_cursor/0,
       fun storage_rejects_expected_seq_conflict/0,
       fun storage_renews_current_lease_without_changing_fence/0,
@@ -248,6 +249,24 @@ start_workflow_returns_snapshot_write_error() ->
                  receive_exec()),
     ?assertMatch({executed, ship, 1, {ship, <<"o-snapshot-fail-1">>}},
                  receive_exec()).
+
+load_state_ignores_obsolete_snapshot_revision() ->
+    RunId = <<"obsolete-snapshot-run-1">>,
+    {ok, _} = beamtrail_memory_storage:append_event(
+                RunId, 0, undefined,
+                'workflow.instance.created', undefined, undefined,
+                undefined,
+                #{workflow => bt_success_workflow, input => #{}, steps => []}),
+    {ok, Lease} = beamtrail_memory_storage:acquire_lease(RunId, snapshot_seed, 1000),
+    {ok, _} = beamtrail_memory_storage:append_event(
+                RunId, 1, maps:get(fencing_token, Lease),
+                'workflow.completed', undefined, undefined,
+                undefined, #{}),
+    ok = beamtrail_memory_storage:write_snapshot(
+           RunId, beamtrail_reducer:new(), 2, 0),
+    State = beamtrail:get_state(RunId),
+    ?assertEqual(completed, maps:get(status, State)),
+    ?assertEqual(2, maps:get(last_event_seq, State)).
 
 storage_lists_run_ids_with_cursor() ->
     {ok, _} = beamtrail:start_workflow(bt_timeout_workflow, #{order_id => <<"o-page-2">>},

@@ -16,8 +16,8 @@ execute(EventName, Measurements, Metadata) ->
 
 %% Counters are an optional capability of the storage adapter. Adapters that
 %% want in-process counters (e.g. beamtrail_memory_storage) export
-%% bump_counter/2; adapters that don't (e.g. beamtrail_postgres_storage stub)
-%% simply skip. The :telemetry application, if present, is always notified.
+%% bump_counter/2; adapters that don't simply skip. The :telemetry application,
+%% if present, is always notified.
 bump_storage_counter(EventName, Measurements) ->
     Count = maps:get(count, Measurements, 1),
     Mod = try beamtrail:storage()

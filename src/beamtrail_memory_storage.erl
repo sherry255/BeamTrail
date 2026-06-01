@@ -70,6 +70,7 @@ init([]) ->
 
 empty_state() ->
     #{events => #{},
+      event_counts => #{},
       snapshots => #{},
       leases => #{},
       instances => #{},
@@ -81,8 +82,9 @@ handle_call(reset, _From, _State) ->
 handle_call({append_event, RunId, ExpectedSeq, FencingToken,
              EventType, StepId, StepVersion, IdempotencyKey, Payload}, _From, State) ->
     EventsByRun = maps:get(events, State),
+    EventCounts = maps:get(event_counts, State),
     RunEvents = maps:get(RunId, EventsByRun, []),
-    ActualSeq = length(RunEvents),
+    ActualSeq = maps:get(RunId, EventCounts, 0),
     case ExpectedSeq =:= ActualSeq of
         false ->
             {reply, {error, {conflict, #{expected_seq => ExpectedSeq,
@@ -102,7 +104,9 @@ handle_call({append_event, RunId, ExpectedSeq, FencingToken,
                           fencing_token => FencingToken,
                           payload => Payload,
                           occurred_at => erlang:system_time(millisecond)},
-                    State1 = State#{events := maps:put(RunId, RunEvents ++ [Event], EventsByRun)},
+                    State1 =
+                        State#{events := maps:put(RunId, [Event | RunEvents], EventsByRun),
+                               event_counts := maps:put(RunId, EventSeq, EventCounts)},
                     State2 = project_event(State1, Event),
                     {reply, {ok, Event}, State2};
                 {error, _} = Error ->
@@ -110,7 +114,7 @@ handle_call({append_event, RunId, ExpectedSeq, FencingToken,
             end
     end;
 handle_call({read_events, RunId, FromSeq, Limit}, _From, State) ->
-    RunEvents = maps:get(RunId, maps:get(events, State), []),
+    RunEvents = lists:reverse(maps:get(RunId, maps:get(events, State), [])),
     Tail = [E || E <- RunEvents, maps:get(event_seq, E) >= FromSeq],
     Result =
         case Limit of

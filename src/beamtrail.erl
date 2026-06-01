@@ -9,6 +9,7 @@
 -define(STORAGE_DEFAULT, beamtrail_memory_storage).
 -define(LEASE_TTL_MS, 30000).
 -define(SNAPSHOT_EVERY, 5).
+-define(SNAPSHOT_REVISION, 1).
 
 start() ->
     application:ensure_all_started(beamtrail).
@@ -101,25 +102,37 @@ load_state(RunId) ->
     ok = ensure_storage(),
     case (storage()):read_snapshot(RunId) of
         {ok, Snapshot} ->
-            SnapshotSeq = maps:get(snapshot_seq, Snapshot),
-            case (storage()):read_events(RunId, SnapshotSeq + 1, infinity) of
-                {ok, TailEvents} ->
-                    State = beamtrail_reducer:from_snapshot_and_events(
-                              maps:get(state, Snapshot), TailEvents),
-                    {ok, enrich_version_migration(State)};
-                {error, _} = Error ->
-                    Error
+            case snapshot_revision_compatible(Snapshot) of
+                true -> load_state_from_snapshot(RunId, Snapshot);
+                false -> load_state_from_events(RunId)
             end;
         not_found ->
-            case (storage()):events(RunId) of
-                {ok, Events} ->
-                    {ok, enrich_version_migration(beamtrail_reducer:from_events(Events))};
-                {error, _} = Error ->
-                    Error
-            end;
+            load_state_from_events(RunId);
         {error, _} = Error ->
             Error
     end.
+
+load_state_from_snapshot(RunId, Snapshot) ->
+    SnapshotSeq = maps:get(snapshot_seq, Snapshot),
+    case (storage()):read_events(RunId, SnapshotSeq + 1, infinity) of
+        {ok, TailEvents} ->
+            State = beamtrail_reducer:from_snapshot_and_events(
+                      maps:get(state, Snapshot), TailEvents),
+            {ok, enrich_version_migration(State)};
+        {error, _} = Error ->
+            Error
+    end.
+
+load_state_from_events(RunId) ->
+    case (storage()):events(RunId) of
+        {ok, Events} ->
+            {ok, enrich_version_migration(beamtrail_reducer:from_events(Events))};
+        {error, _} = Error ->
+            Error
+    end.
+
+snapshot_revision_compatible(Snapshot) ->
+    maps:get(snapshot_revision, Snapshot, 0) =:= ?SNAPSHOT_REVISION.
 
 events(RunId) ->
     ok = ensure_storage(),
@@ -644,7 +657,7 @@ maybe_snapshot(RunId, Force) ->
             ShouldWrite = Force orelse (Seq > 0 andalso Seq rem ?SNAPSHOT_EVERY =:= 0),
             case ShouldWrite of
                 true ->
-                    case (storage()):write_snapshot(RunId, State, Seq, 1) of
+                    case (storage()):write_snapshot(RunId, State, Seq, ?SNAPSHOT_REVISION) of
                         ok ->
                             beamtrail_telemetry:execute([beamtrail, snapshot, written],
                                                         #{count => 1},

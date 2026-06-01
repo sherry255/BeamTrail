@@ -1,5 +1,7 @@
 # BeamTrail
 
+[![CI](https://github.com/sherry255/BeamTrail/actions/workflows/ci.yml/badge.svg)](https://github.com/sherry255/BeamTrail/actions/workflows/ci.yml)
+
 BeamTrail is an Erlang/OTP durable workflow runtime built around
 event-sourced execution.
 
@@ -12,12 +14,16 @@ adapter is included for durable event, snapshot, and lease storage.
 
 ## Current State
 
-- `beamtrail_memory_storage` is the default adapter.
+- `beamtrail_memory_storage` is the default adapter for local development and
+  tests. It is a single in-memory process and is not the production durability
+  path.
 - `beamtrail_postgres_storage` uses epgsql and the schema in
   `priv/sql/postgres.sql`.
 - PostgreSQL payloads, idempotency keys, leases, and snapshots are stored as
   Erlang external-term-format `bytea` values. This keeps replay exact; SQL-level
   JSON inspection is not implemented yet.
+- Snapshot reads are revision-gated. If a stored snapshot uses an obsolete
+  revision, BeamTrail ignores it and replays from the append-only event stream.
 - Workflows are linear step lists. There is no branching, DAG execution, or
   fan-out.
 - Idempotency keys are recorded and passed to workflow code. Deduplicating
@@ -53,6 +59,24 @@ rebar3 eunit
 
 Build output is written under `_build/` and ignored by Git.
 
+PostgreSQL integration tests are disabled by default. To run them locally:
+
+```sh
+docker run --name beamtrail-pg-test \
+  -e POSTGRES_USER=beamtrail \
+  -e POSTGRES_PASSWORD=beamtrail \
+  -e POSTGRES_DB=beamtrail \
+  -p 55432:5432 \
+  -d postgres:16
+
+BEAMTRAIL_PG_TEST=1 BEAMTRAIL_PG_PORT=55432 rebar3 eunit
+
+docker rm -f beamtrail-pg-test
+```
+
+GitHub Actions runs both the default EUnit suite and the PostgreSQL integration
+suite on every push to `main` and on pull requests.
+
 ## Configuration
 
 Set these application environment values before starting `beamtrail`:
@@ -74,6 +98,17 @@ application:set_env(beamtrail, postgres,
 
 ok = beamtrail_postgres_storage:init_schema().
 ```
+
+## Production Notes
+
+- Use PostgreSQL for durable storage. The memory adapter is useful for local
+  development and tests, but it is still process memory.
+- PostgreSQL append uses expected sequence checks and fencing tokens. The
+  current adapter serializes appends with a table lock; narrowing that to
+  per-run contention is the next scalability improvement.
+- External side effects must be idempotent at the workflow boundary. BeamTrail
+  records stable idempotency keys but does not deduplicate calls to outside
+  systems.
 
 ## Workflow Module
 

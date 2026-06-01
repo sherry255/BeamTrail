@@ -1,7 +1,7 @@
 -module(beamtrail_query).
 
-%% Query/read-model API. Returns a single map that matches the prototype's
-%% inspector shape: event ledger, attempts, snapshot/replay info, recovery
+%% Query/read-model API. Returns a single map for runtime inspection:
+%% event ledger, attempts, snapshot/replay info, recovery
 %% status, lease/fencing, telemetry counters, version mismatch, and a
 %% copyable query body.
 
