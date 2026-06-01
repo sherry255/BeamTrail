@@ -29,6 +29,9 @@ fencing_token(Lease) when is_map(Lease) ->
 fencing_token(_) ->
     undefined.
 
+ttl_ms(#{lease_until := Until, renewed_at := RenewedAt})
+  when is_integer(Until), is_integer(RenewedAt), Until > RenewedAt ->
+    Until - RenewedAt;
 ttl_ms(#{lease_until := Until, acquired_at := AcquiredAt})
   when is_integer(Until), is_integer(AcquiredAt), Until > AcquiredAt ->
     Until - AcquiredAt;

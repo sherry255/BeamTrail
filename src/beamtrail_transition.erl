@@ -394,13 +394,33 @@ should_retry(Policy, Reason, AttemptNo) ->
 safe_retry_policy(Workflow, StepId) ->
     try Workflow:retry_policy(StepId) of
         Policy when is_map(Policy) ->
-            {ok, Policy};
+            validate_retry_policy(Policy);
         Other ->
             {error, #{callback => retry_policy, reason => {bad_return, Other}}}
     catch
         Class:Reason:_Stacktrace ->
             {error, #{callback => retry_policy, class => Class, reason => Reason}}
     end.
+
+validate_retry_policy(Policy) ->
+    MaxAttempts = maps:get(max_attempts, Policy, 1),
+    BackoffMs = maps:get(backoff_ms, Policy, 0),
+    RetryableErrors = maps:get(retryable_errors, Policy, []),
+    case valid_retry_policy(MaxAttempts, BackoffMs, RetryableErrors) of
+        true ->
+            {ok, Policy#{max_attempts => MaxAttempts,
+                         backoff_ms => BackoffMs,
+                         retryable_errors => RetryableErrors}};
+        false ->
+            {error, #{callback => retry_policy,
+                      reason => {bad_policy, Policy}}}
+    end.
+
+valid_retry_policy(MaxAttempts, BackoffMs, RetryableErrors) ->
+    is_integer(MaxAttempts) andalso MaxAttempts >= 1
+        andalso is_integer(BackoffMs) andalso BackoffMs >= 0
+        andalso is_list(RetryableErrors)
+        andalso lists:all(fun is_atom/1, RetryableErrors).
 
 error_key(Reason) when is_atom(Reason) ->
     Reason;

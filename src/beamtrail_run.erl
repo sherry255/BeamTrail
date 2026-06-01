@@ -214,7 +214,7 @@ schedule_heartbeat(#{lease := undefined} = Data) ->
 schedule_heartbeat(#{lease := Lease} = Data) when is_map(Lease) ->
     Data1 = cancel_heartbeat_timer(Data),
     Ref = make_ref(),
-    Delay = beamtrail_lease_manager:heartbeat_interval_ms(),
+    Delay = beamtrail_lease_manager:heartbeat_interval_ms(Lease),
     DueAt = erlang:system_time(millisecond) + Delay,
     Data1#{heartbeat_timer := {Ref, DueAt}}.
 

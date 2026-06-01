@@ -19,7 +19,9 @@ extended_test_() ->
       fun get_state_returns_storage_error/0,
       fun dispatch_returns_storage_error/0,
       fun query_describe_returns_storage_error/0,
+      fun query_handles_storage_bootstrap_and_lease_errors/0,
       fun recover_unfinished_returns_storage_error/0,
+      fun recovery_skips_runs_with_state_load_errors/0,
       fun recovery_marker_returns_storage_error/0,
       fun recovery_marker_surfaces_append_error/0,
       fun snapshot_write_failure_is_nonfatal/0,
@@ -37,6 +39,7 @@ extended_test_() ->
       fun scanner_rejects_invalid_interval/0,
       fun active_runner_wakes_retry_without_scanner_tick/0,
       fun active_runner_retry_timer_survives_heartbeat_and_lookup/0,
+      fun active_runner_heartbeat_uses_supplied_lease_ttl/0,
       fun active_runner_supervisor_rejects_when_pool_full/0,
       fun active_runner_crash_allows_scanner_takeover_after_lease_expiry/0,
       fun active_runner_stops_step_when_lease_heartbeat_fails/0,
@@ -49,16 +52,20 @@ extended_test_() ->
       fun completed_step_version_change_does_not_block_next_step/0,
       fun scanner_skips_migration_blocked_runs/0,
       fun retry_policy_failure_fails_terminally_without_retry_loop/0,
+      fun malformed_retry_policy_map_fails_terminally_without_retry_loop/0,
       fun retry_attempts_preserved_in_chronological_order/0,
       fun storage_adapter_is_application_configurable/0,
       fun query_describe_exposes_inspector_blocks/0,
-      fun recovery_requeued_records_recovered_in_ms/0
+      fun recovery_requeued_records_recovered_in_ms/0,
+      fun repeated_recovery_requeued_keeps_open_attempt_metric/0
      ]}.
 
 setup() ->
     ok = application:unset_env(beamtrail, storage_adapter),
     case whereis(beamtrail_memory_storage) of
-        undefined -> {ok, _} = beamtrail_memory_storage:start_link();
+        undefined ->
+            {ok, Pid} = beamtrail_memory_storage:start_link(),
+            unlink(Pid);
         _ -> ok
     end,
     ok = beamtrail_memory_storage:reset(),
@@ -260,10 +267,53 @@ query_describe_returns_storage_error() ->
     ?assertEqual({error, postgres_not_configured},
                  beamtrail_query:describe(<<"query-error-run">>)).
 
+query_handles_storage_bootstrap_and_lease_errors() ->
+    OldTrapExit = process_flag(trap_exit, true),
+    ok = stop_registered(beamtrail_memory_storage),
+    receive {'EXIT', _Pid, shutdown} -> ok after 0 -> ok end,
+    process_flag(trap_exit, OldTrapExit),
+    ?assertEqual([], beamtrail_query:list()),
+    ?assertEqual(#{}, beamtrail_query:telemetry()),
+    ok = application:set_env(beamtrail, storage_adapter,
+                             bt_read_error_storage),
+    RunId = <<"query-lease-error-run">>,
+    {ok, _} = beamtrail_memory_storage:append_event(
+                RunId, 0, undefined,
+                'workflow.instance.created', undefined, undefined,
+                undefined,
+                #{workflow => bt_success_workflow, input => #{},
+                  steps => []}),
+    Q = beamtrail_query:describe(RunId),
+    ?assertMatch(#{error := lease_read_failed}, maps:get(lease, Q)).
+
 recover_unfinished_returns_storage_error() ->
     ok = application:set_env(beamtrail, storage_adapter,
                              beamtrail_postgres_storage),
     ?assertEqual({error, postgres_not_configured}, beamtrail:recover_unfinished()).
+
+recovery_skips_runs_with_state_load_errors() ->
+    ok = application:set_env(beamtrail, storage_adapter,
+                             bt_read_error_storage),
+    BadRun = <<"state-read-error-run">>,
+    GoodRun = <<"state-read-good-run">>,
+    {ok, _} = beamtrail_memory_storage:append_event(
+                BadRun, 0, undefined,
+                'workflow.instance.created', undefined, undefined,
+                undefined,
+                #{workflow => bt_success_workflow, input => #{},
+                  steps => []}),
+    {ok, _} = beamtrail_memory_storage:append_event(
+                GoodRun, 0, undefined,
+                'workflow.instance.created', undefined, undefined,
+                undefined,
+                #{workflow => bt_success_workflow, input => #{},
+                  steps => []}),
+    ?assertEqual([GoodRun], beamtrail:list_recoverable()),
+    ?assertMatch({ok, #{run_ids := [GoodRun]}},
+                 beamtrail:list_recoverable(undefined, 100)),
+    ?assertEqual({ok, [GoodRun]}, beamtrail:recover_unfinished()),
+    ?assertEqual({error, state_read_failed},
+                 beamtrail:mark_recovery_requeued(BadRun)).
 
 recovery_marker_returns_storage_error() ->
     ok = application:set_env(beamtrail, storage_adapter,
@@ -450,10 +500,10 @@ dispatch_refuses_stale_lease_before_replay() ->
 
 dispatch_renews_lease_while_step_runs() ->
     Input = #{order_id => <<"o-slow-lease-1">>, test_pid => self(),
-              sleep_ms => 160},
+              sleep_ms => 220},
     {ok, RunId} = beamtrail:start_workflow(bt_slow_success_workflow, Input,
                                            #{auto_dispatch => false}),
-    {ok, Lease} = beamtrail_memory_storage:acquire_lease(RunId, slow_worker, 50),
+    {ok, Lease} = beamtrail_memory_storage:acquire_lease(RunId, slow_worker, 100),
     ?assertMatch({ok, #{status := completed}}, beamtrail:dispatch(RunId, Lease)),
     ?assertMatch({slow_executed, slow}, receive_exec()),
     {ok, Events} = beamtrail:events(RunId),
@@ -536,6 +586,23 @@ active_runner_retry_timer_survives_heartbeat_and_lookup() ->
     ?assertMatch({retry_backoff_execute, 2, {charge, <<"o-active-retry-heartbeat-1">>}},
                  receive_exec()),
     ok = wait_for_status(RunId, completed, 1000).
+
+active_runner_heartbeat_uses_supplied_lease_ttl() ->
+    {ok, Registry} = beamtrail_run_registry:start_link(),
+    unlink(Registry),
+    {ok, RunSup} = beamtrail_run_sup:start_link(),
+    unlink(RunSup),
+    Input = #{order_id => <<"o-active-short-lease-1">>, test_pid => self(),
+              sleep_ms => 160},
+    {ok, RunId} = beamtrail:start_workflow(bt_slow_success_workflow, Input,
+                                           #{run_id => <<"active-short-lease-run-1">>,
+                                             auto_dispatch => false}),
+    {ok, Lease} = beamtrail_memory_storage:acquire_lease(RunId, short_owner, 60),
+    ?assertMatch({ok, _Pid}, beamtrail_run_sup:dispatch(RunId, Lease)),
+    ?assertMatch({slow_executed, slow}, receive_exec()),
+    ok = wait_for_status(RunId, completed, 1000),
+    {ok, CurrentLease} = beamtrail_memory_storage:read_lease(RunId),
+    ?assert(maps:get(lease_until, CurrentLease) > maps:get(lease_until, Lease)).
 
 active_runner_supervisor_rejects_when_pool_full() ->
     ok = application:set_env(beamtrail, run_max_children, 1),
@@ -817,6 +884,30 @@ retry_policy_failure_fails_terminally_without_retry_loop() ->
     {ok, EventsAfterRecovery} = beamtrail:events(RunId),
     ?assertEqual(length(Events), length(EventsAfterRecovery)).
 
+malformed_retry_policy_map_fails_terminally_without_retry_loop() ->
+    RunId = <<"malformed-retry-policy-run-1">>,
+    Input = #{order_id => <<"o-malformed-retry-policy-1">>, test_pid => self()},
+    ?assertEqual({ok, RunId},
+                 beamtrail:start_workflow(bt_malformed_retry_policy_workflow,
+                                          Input, #{run_id => RunId})),
+    ?assertEqual({malformed_retry_execute, 1}, receive_exec()),
+    State = beamtrail:get_state(RunId),
+    ?assertEqual(failed, maps:get(status, State)),
+    ?assertEqual(true, maps:get(terminal, State)),
+    Failure = maps:get(failure, State),
+    ?assertMatch(#{retry_policy_error :=
+                       #{callback := retry_policy,
+                         reason := {bad_policy, _}}},
+                 Failure),
+    {ok, Events} = beamtrail:events(RunId),
+    ?assertEqual(1, length([E || E <- Events,
+                            maps:get(event_type, E) =:= 'attempt.started'])),
+    ?assertEqual(0, length([E || E <- Events,
+                            maps:get(event_type, E) =:= 'retry.scheduled'])),
+    ?assertEqual({ok, []}, beamtrail:recover_unfinished()),
+    {ok, EventsAfterRecovery} = beamtrail:events(RunId),
+    ?assertEqual(length(Events), length(EventsAfterRecovery)).
+
 retry_attempts_preserved_in_chronological_order() ->
     Input = #{order_id => <<"o-ord-1">>, test_pid => self()},
     {ok, RunId} = beamtrail:start_workflow(bt_retry_workflow, Input),
@@ -889,6 +980,34 @@ recovery_requeued_records_recovered_in_ms() ->
     ?assertEqual(Recovered, maps:get(recovered_in_ms, Q)),
     ?assertMatch(#{status := pass, recovered_in_ms := Recovered},
                  maps:get(recovery, Q)).
+
+repeated_recovery_requeued_keeps_open_attempt_metric() ->
+    ok = application:set_env(beamtrail, lease_ttl_ms, 50),
+    RunId = <<"recov-in-ms-repeat-1">>,
+    Input = #{order_id => <<"o-rec-repeat-1">>},
+    {ok, _} = beamtrail_memory_storage:append_event(
+                RunId, 0, undefined,
+                'workflow.instance.created', undefined, undefined,
+                undefined,
+                #{workflow => bt_versioned_workflow, input => Input,
+                  steps => [charge]}),
+    {ok, Lease} = beamtrail_memory_storage:acquire_lease(RunId, recovery_seed, 30),
+    {ok, _} = beamtrail_memory_storage:append_event(
+                RunId, 1, maps:get(fencing_token, Lease),
+                'attempt.started', charge, 1,
+                {charge, <<"o-rec-repeat-1">>}, #{attempt => 1}),
+    ok = wait_until_lease_expired(RunId, 1000),
+    {ok, requeued} = beamtrail:mark_recovery_requeued(RunId),
+    ok = wait_until_lease_expired(RunId, 1000),
+    {ok, requeued} = beamtrail:mark_recovery_requeued(RunId),
+    {ok, Events} = beamtrail:events(RunId),
+    [First, Second] = [E || E <- Events,
+                            maps:get(event_type, E) =:= 'recovery.requeued'],
+    FirstRecovered = maps:get(recovered_in_ms, maps:get(payload, First)),
+    SecondRecovered = maps:get(recovered_in_ms, maps:get(payload, Second)),
+    ?assert(is_integer(FirstRecovered)),
+    ?assert(is_integer(SecondRecovered)),
+    ?assert(SecondRecovered >= FirstRecovered).
 
 receive_exec() ->
     receive Message -> Message

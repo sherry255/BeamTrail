@@ -134,24 +134,36 @@ dispatch_retrying(RunId, State, Lease, Options) ->
     end.
 
 recover_if_unfinished(RunId) ->
-    State = get_state(RunId),
+    case load_state(RunId) of
+        {ok, State} ->
+            recover_loaded_if_unfinished(RunId, State);
+        {error, _} ->
+            false
+    end.
+
+recover_loaded_if_unfinished(RunId, State) ->
     case recoverable(RunId, State) of
         true ->
-            case mark_recovery_requeued_with_lease(RunId) of
-                {ok, {requeued, Lease}} ->
-                    case dispatch(RunId, Lease) of
-                        {ok, _RecoveredState} ->
-                            _ = maybe_snapshot(RunId, true),
-                            true;
-                        {error, {migration_required, _}} ->
-                            false;
-                        {error, _} ->
-                            false
-                    end;
-                {ok, skipped} ->
+            recover_requeued(RunId);
+        false ->
+            false
+    end.
+
+recover_requeued(RunId) ->
+    case mark_recovery_requeued_with_lease(RunId) of
+        {ok, {requeued, Lease}} ->
+            case dispatch(RunId, Lease) of
+                {ok, _RecoveredState} ->
+                    _ = maybe_snapshot(RunId, true),
+                    true;
+                {error, {migration_required, _}} ->
+                    false;
+                {error, _} ->
                     false
             end;
-        false ->
+        {ok, skipped} ->
+            false;
+        {error, _} ->
             false
     end.
 
@@ -159,7 +171,7 @@ list_recoverable() ->
     ok = ensure_storage(),
     case (storage()):list_run_ids() of
         {ok, RunIds} ->
-            [RunId || RunId <- RunIds, recoverable(RunId, get_state(RunId))];
+            [RunId || RunId <- RunIds, run_recoverable(RunId)];
         {error, _} = Error ->
             Error
     end.
@@ -169,9 +181,15 @@ list_recoverable(Cursor, Limit) ->
     case (storage()):list_run_ids(Cursor, Limit) of
         {ok, #{run_ids := RunIds} = Page} ->
             {ok, Page#{run_ids := [RunId || RunId <- RunIds,
-                                            recoverable(RunId, get_state(RunId))]}};
+                                            run_recoverable(RunId)]}};
         {error, _} = Error ->
             Error
+    end.
+
+run_recoverable(RunId) ->
+    case load_state(RunId) of
+        {ok, State} -> recoverable(RunId, State);
+        {error, _} -> false
     end.
 
 %% Acquires a lease and appends a durable `recovery.requeued' event to the log
@@ -199,20 +217,25 @@ mark_recovery_requeued_with_lease(RunId) ->
 
 append_recovery_marker(Mod, RunId, 'recovery.requeued', Lease) ->
     Now = erlang:system_time(millisecond),
-    ExpectedSeq = maps:get(last_event_seq, get_state(RunId), 0),
-    RecoveredInMs = compute_recovered_in_ms(RunId, Now),
-    Payload = #{requeued_at => Now,
-                owner_node => beamtrail_transition:owner(),
-                lease => Lease,
-                recovered_in_ms => RecoveredInMs},
-    FencingToken = beamtrail_lease_manager:fencing_token(Lease),
-    case Mod:append_event(RunId, ExpectedSeq, FencingToken, 'recovery.requeued',
-                          undefined, undefined, undefined, Payload) of
-        {ok, _} ->
-            beamtrail_telemetry:execute([beamtrail, recovery, requeued],
-                                        #{count => 1},
-                                        #{run_id => RunId, lease => Lease}),
-            {ok, {requeued, Lease}};
+    case load_state(RunId) of
+        {ok, State} ->
+            ExpectedSeq = maps:get(last_event_seq, State, 0),
+            RecoveredInMs = compute_recovered_in_ms(RunId, Now),
+            Payload = #{requeued_at => Now,
+                        owner_node => beamtrail_transition:owner(),
+                        lease => Lease,
+                        recovered_in_ms => RecoveredInMs},
+            FencingToken = beamtrail_lease_manager:fencing_token(Lease),
+            case Mod:append_event(RunId, ExpectedSeq, FencingToken, 'recovery.requeued',
+                                  undefined, undefined, undefined, Payload) of
+                {ok, _} ->
+                    beamtrail_telemetry:execute([beamtrail, recovery, requeued],
+                                                #{count => 1},
+                                                #{run_id => RunId, lease => Lease}),
+                    {ok, {requeued, Lease}};
+                {error, _} = Error ->
+                    Error
+            end;
         {error, _} = Error ->
             Error
     end.
@@ -250,8 +273,7 @@ open_step_fold(#{event_type := Et, step_id := StepId}, Acc)
   when Et =:= 'step.succeeded'; Et =:= 'step.failed' ->
     maps:remove(StepId, Acc);
 open_step_fold(#{event_type := Et}, _Acc)
-  when Et =:= 'workflow.completed'; Et =:= 'workflow.failed';
-       Et =:= 'recovery.requeued' ->
+  when Et =:= 'workflow.completed'; Et =:= 'workflow.failed' ->
     #{};
 open_step_fold(_, Acc) -> Acc.
 

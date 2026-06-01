@@ -8,6 +8,7 @@
 -export([describe/1, list/0, telemetry/0]).
 
 list() ->
+    ok = beamtrail_config:ensure_storage(),
     Mod = beamtrail_config:storage(),
     case Mod:list_run_ids() of
         {ok, RunIds} -> [describe(R) || R <- RunIds];
@@ -15,6 +16,7 @@ list() ->
     end.
 
 telemetry() ->
+    ok = beamtrail_config:ensure_storage(),
     Mod = beamtrail_config:storage(),
     case erlang:function_exported(Mod, telemetry_counters, 0) of
         true -> Mod:telemetry_counters();
@@ -22,6 +24,7 @@ telemetry() ->
     end.
 
 describe(RunId) ->
+    ok = beamtrail_config:ensure_storage(),
     Mod = beamtrail_config:storage(),
     case beamtrail:get_state(RunId) of
         {error, _} = Error ->
@@ -48,7 +51,8 @@ describe_loaded_events(RunId, Mod, State, Events) ->
     Lease =
         case Mod:read_lease(RunId) of
             {ok, L} -> L;
-            not_found -> undefined
+            not_found -> undefined;
+            {error, Reason} -> #{error => Reason}
         end,
     Attempts = maps:get(attempts, State, []),
     Instance = instance_from_state(State),
