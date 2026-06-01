@@ -38,6 +38,7 @@ adapter is included for durable event, snapshot, and lease storage.
 - Retry failed steps according to a per-step retry policy.
 - Record step and workflow timeouts.
 - Recover unfinished in-flight attempts through the scanner.
+- Keep active runs in supervised per-run processes between retry timers.
 - Renew leases while a step is running.
 - Query a run's events, attempts, snapshot, lease, recovery metadata, and
   telemetry counters.
@@ -84,6 +85,7 @@ Set these application environment values before starting `beamtrail`:
 - `storage_adapter`: storage module, default `beamtrail_memory_storage`.
 - `scanner_interval_ms`: recovery scan interval, default `5000`.
 - `worker_max_children`: concurrent dispatch workers, default `64`.
+- `run_max_children`: concurrent active run processes, default `64`.
 
 For PostgreSQL:
 
@@ -105,6 +107,8 @@ ok = beamtrail_postgres_storage:init_schema().
   development and tests, but it is still process memory.
 - PostgreSQL append uses expected sequence checks, fencing tokens, and per-run
   row locks so different runs can append concurrently.
+- Active run processes are a fast path. PostgreSQL events, leases, fencing
+  tokens, and snapshots remain the recovery boundary.
 - External side effects must be idempotent at the workflow boundary. BeamTrail
   records stable idempotency keys but does not deduplicate calls to outside
   systems.

@@ -30,6 +30,8 @@ extended_test_() ->
       fun dispatch_refuses_when_run_is_leased/0,
       fun dispatch_refuses_stale_lease_before_replay/0,
       fun dispatch_renews_lease_while_step_runs/0,
+      fun active_runner_wakes_retry_without_scanner_tick/0,
+      fun active_runner_supervisor_rejects_when_pool_full/0,
       fun dispatch_refuses_version_mismatch_without_migration/0,
       fun retry_attempts_preserved_in_chronological_order/0,
       fun storage_adapter_is_application_configurable/0,
@@ -55,9 +57,22 @@ cleanup(_) ->
         undefined -> ok;
         Pid ->
             unlink(Pid),
-            exit(Pid, shutdown)
+            stop_registered(beamtrail_worker_sup)
+    end,
+    case whereis(beamtrail_run_sup) of
+        undefined -> ok;
+        RunSup ->
+            unlink(RunSup),
+            stop_registered(beamtrail_run_sup)
+    end,
+    case whereis(beamtrail_run_registry) of
+        undefined -> ok;
+        Registry ->
+            unlink(Registry),
+            stop_registered(beamtrail_run_registry)
     end,
     ok = application:unset_env(beamtrail, worker_max_children),
+    ok = application:unset_env(beamtrail, run_max_children),
     ok = application:unset_env(beamtrail, storage_adapter),
     ok = beamtrail_memory_storage:reset().
 
@@ -371,6 +386,42 @@ dispatch_renews_lease_while_step_runs() ->
                  maps:get(fencing_token, CurrentLease)),
     ?assert(maps:get(lease_until, CurrentLease) > maps:get(lease_until, Lease)).
 
+active_runner_wakes_retry_without_scanner_tick() ->
+    {ok, Registry} = beamtrail_run_registry:start_link(),
+    unlink(Registry),
+    {ok, RunSup} = beamtrail_run_sup:start_link(),
+    unlink(RunSup),
+    Input = #{order_id => <<"o-active-retry-1">>, test_pid => self()},
+    {ok, RunId} = beamtrail:start_workflow(bt_retry_backoff_workflow, Input,
+                                           #{run_id => <<"active-retry-run-1">>,
+                                             auto_dispatch => false}),
+    ?assertMatch({ok, _Pid}, beamtrail_run_sup:dispatch(RunId)),
+    ?assertMatch({retry_backoff_execute, 1, {charge, <<"o-active-retry-1">>}},
+                 receive_exec()),
+    ?assertMatch({retry_backoff_execute, 2, {charge, <<"o-active-retry-1">>}},
+                 receive_exec()),
+    ok = wait_for_status(RunId, completed, 1000).
+
+active_runner_supervisor_rejects_when_pool_full() ->
+    ok = application:set_env(beamtrail, run_max_children, 1),
+    {ok, Registry} = beamtrail_run_registry:start_link(),
+    unlink(Registry),
+    {ok, RunSup} = beamtrail_run_sup:start_link(),
+    unlink(RunSup),
+    Input1 = #{order_id => <<"o-active-pool-1">>, test_pid => self(),
+               sleep_ms => 200},
+    Input2 = #{order_id => <<"o-active-pool-2">>, test_pid => self(),
+               sleep_ms => 200},
+    {ok, Run1} = beamtrail:start_workflow(bt_slow_success_workflow, Input1,
+                                          #{run_id => <<"active-pool-run-1">>,
+                                            auto_dispatch => false}),
+    {ok, Run2} = beamtrail:start_workflow(bt_slow_success_workflow, Input2,
+                                          #{run_id => <<"active-pool-run-2">>,
+                                            auto_dispatch => false}),
+    ?assertMatch({ok, _Pid}, beamtrail_run_sup:dispatch(Run1)),
+    ?assertEqual({error, run_pool_full}, beamtrail_run_sup:dispatch(Run2)),
+    ?assertMatch({slow_executed, slow}, receive_exec()).
+
 dispatch_refuses_version_mismatch_without_migration() ->
     RunId = <<"version-gate-run-1">>,
     Input = #{order_id => <<"o-version-1">>, test_pid => self()},
@@ -482,3 +533,7 @@ wait_for_status(RunId, Target, Remaining) ->
             timer:sleep(20),
             wait_for_status(RunId, Target, Remaining - 20)
     end.
+
+stop_registered(Name) ->
+    _ = catch gen_server:stop(Name, shutdown, 1000),
+    ok.
