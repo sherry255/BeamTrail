@@ -2,7 +2,8 @@
 
 -export([start/0, stop/0]).
 -export([start_workflow/2, start_workflow/3, dispatch/1, dispatch/2,
-         dispatch_from_runner/2, recover_unfinished/0]).
+         next_runner_action/2, execute_runner_attempt/1,
+         finish_runner_attempt/4, recover_unfinished/0]).
 -export([get_state/1, events/1, storage/0]).
 -export([list_recoverable/0, list_recoverable/2,
          mark_recovery_requeued/1, mark_recovery_requeued_with_lease/1]).
@@ -77,10 +78,27 @@ dispatch(RunId) ->
 dispatch(RunId, Lease) when is_map(Lease) ->
     dispatch_with_lease(RunId, Lease, #{lease_heartbeat => internal}).
 
-%% Used by beamtrail_run: the active runner owns lease renewal while dispatch
-%% owns event transitions and step timeout handling.
-dispatch_from_runner(RunId, Lease) when is_map(Lease) ->
-    dispatch_with_lease(RunId, Lease, #{lease_heartbeat => external}).
+%% Used by beamtrail_run. The active runner owns lease renewal, step process
+%% lifetime, and timeout handling; this module still owns durable transitions.
+next_runner_action(RunId, Lease) when is_map(Lease) ->
+    dispatch_with_lease(RunId, Lease, #{runner_mode => prepare}).
+
+execute_runner_attempt(ExecSpec) when is_map(ExecSpec) ->
+    Workflow = maps:get(workflow, ExecSpec),
+    safe_execute(Workflow,
+                 maps:get(step_id, ExecSpec),
+                 maps:get(step_version, ExecSpec),
+                 maps:get(input, ExecSpec),
+                 maps:get(context, ExecSpec)).
+
+finish_runner_attempt(RunId, Lease, Attempt, Result) when is_map(Lease), is_map(Attempt) ->
+    Options = #{runner_mode => finish},
+    case Result of
+        {ok, Value} ->
+            handle_step_success(RunId, Attempt, Value, Lease, Options);
+        {error, Reason} ->
+            handle_step_failure(RunId, Attempt, Reason, Lease, Options)
+    end.
 
 dispatch_with_lease(RunId, Lease, Options) ->
     ok = ensure_storage(),
@@ -275,12 +293,18 @@ run_step(RunId, State, StepId, Lease, Options) ->
                 false ->
                     ok
             end,
-            Result = execute_attempt(RunId, Workflow, Input, Attempt, Lease, Options),
-            case Result of
-                {ok, Value} ->
-                    handle_step_success(RunId, Attempt, Value, Lease, Options);
-                {error, Reason} ->
-                    handle_step_failure(RunId, Attempt, Reason, Lease, Options)
+            case maps:get(runner_mode, Options, dispatch) of
+                prepare ->
+                    {ok, {execute, Attempt,
+                          execution_spec(RunId, Workflow, StepId, Input, Attempt)}};
+                _ ->
+                    Result = execute_attempt(RunId, Workflow, Input, Attempt, Lease, Options),
+                    case Result of
+                        {ok, Value} ->
+                            handle_step_success(RunId, Attempt, Value, Lease, Options);
+                        {error, Reason} ->
+                            handle_step_failure(RunId, Attempt, Reason, Lease, Options)
+                    end
             end;
         {error, _} = Error ->
             Error
@@ -322,23 +346,28 @@ ensure_attempt_started(RunId, Workflow, Input, State, StepId, Lease) ->
             end
     end.
 
-execute_attempt(RunId, Workflow, Input, Attempt, Lease, Options) ->
-    StepId = maps:get(step_id, Attempt),
+execution_spec(RunId, Workflow, StepId, Input, Attempt) ->
     StepVersion = maps:get(step_version, Attempt),
-    Context =
-        #{run_id => RunId,
-          step_id => StepId,
-          step_version => StepVersion,
-          attempt => maps:get(attempt, Attempt),
-          idempotency_key => maps:get(idempotency_key, Attempt)},
-    Timeout = Workflow:timeout_ms(StepId),
-    Fun = fun() -> safe_execute(Workflow, StepId, StepVersion, Input, Context) end,
-    case maps:get(lease_heartbeat, Options, internal) of
-        external ->
-            run_with_timeout_linked(Fun, Timeout);
-        internal ->
-            run_with_timeout_and_lease_heartbeat(RunId, Lease, Fun, Timeout)
-    end.
+    #{workflow => Workflow,
+      step_id => StepId,
+      step_version => StepVersion,
+      input => Input,
+      timeout_ms => Workflow:timeout_ms(StepId),
+      context => execution_context(RunId, Attempt)}.
+
+execution_context(RunId, Attempt) ->
+    #{run_id => RunId,
+      step_id => maps:get(step_id, Attempt),
+      step_version => maps:get(step_version, Attempt),
+      attempt => maps:get(attempt, Attempt),
+      idempotency_key => maps:get(idempotency_key, Attempt)}.
+
+execute_attempt(RunId, Workflow, Input, Attempt, Lease, _Options) ->
+    StepId = maps:get(step_id, Attempt),
+    ExecSpec = execution_spec(RunId, Workflow, StepId, Input, Attempt),
+    Timeout = maps:get(timeout_ms, ExecSpec),
+    Fun = fun() -> execute_runner_attempt(ExecSpec) end,
+    run_with_timeout_and_lease_heartbeat(RunId, Lease, Fun, Timeout).
 
 safe_execute(Workflow, StepId, StepVersion, Input, Context) ->
     try Workflow:execute(StepId, StepVersion, Input, Context) of
@@ -374,34 +403,6 @@ run_with_timeout_and_lease_heartbeat(RunId, Lease, Fun, TimeoutMs) ->
             cancel_attempt_timeout(TimeoutRef),
             exit(ExecPid, kill),
             {error, #{class => lease_lost, reason => Reason}}
-    end.
-
-run_with_timeout_linked(Fun, TimeoutMs) ->
-    Parent = self(),
-    ResultRef = make_ref(),
-    ExecPid = spawn_link(fun() -> Parent ! {ResultRef, execute, guarded_execute(Fun)} end),
-    TimeoutRef = arm_attempt_timeout(ResultRef, TimeoutMs),
-    receive
-        {ResultRef, execute, Result} ->
-            cancel_attempt_timeout(TimeoutRef),
-            unlink(ExecPid),
-            flush_exit(ExecPid),
-            Result;
-        {ResultRef, timeout} ->
-            unlink(ExecPid),
-            exit(ExecPid, kill),
-            flush_exit(ExecPid),
-            {error, timeout};
-        {'EXIT', ExecPid, Reason} ->
-            cancel_attempt_timeout(TimeoutRef),
-            {error, #{class => exit, reason => Reason}}
-    end.
-
-flush_exit(Pid) ->
-    receive
-        {'EXIT', Pid, _Reason} -> ok
-    after 0 ->
-        ok
     end.
 
 guarded_execute(Fun) ->
@@ -459,7 +460,12 @@ handle_step_success(RunId, Attempt, Value, Lease, Options) ->
                     with_snapshot(
                       RunId,
                       false,
-                      fun() -> dispatch_locked(RunId, get_state(RunId), Lease, Options) end);
+                      fun() ->
+                              case maps:get(runner_mode, Options, dispatch) of
+                                  finish -> {ok, get_state(RunId)};
+                                  _ -> dispatch_locked(RunId, get_state(RunId), Lease, Options)
+                              end
+                      end);
                 {error, _} = Error ->
                     Error
             end;
@@ -531,7 +537,11 @@ schedule_retry(RunId, Attempt, Reason, Policy, Lease, ExpectedSeq, Options) ->
               false,
               fun() ->
                       case BackoffMs of
-                          0 -> dispatch_retrying(RunId, get_state(RunId), Lease, Options);
+                          0 ->
+                              case maps:get(runner_mode, Options, dispatch) of
+                                  finish -> {ok, get_state(RunId)};
+                                  _ -> dispatch_retrying(RunId, get_state(RunId), Lease, Options)
+                              end;
                           _ -> {ok, get_state(RunId)}
                       end
               end);

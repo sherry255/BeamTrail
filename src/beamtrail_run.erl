@@ -31,7 +31,9 @@ init(RunId) ->
                  lease => undefined,
                  retry_timer => undefined,
                  heartbeat_timer => undefined,
-                 dispatch => undefined}}.
+                 step_timeout_timer => undefined,
+                 dispatch => undefined,
+                 attempt => undefined}}.
 
 handle_event(cast, dispatch, executing, Data) ->
     {next_state, executing, Data};
@@ -53,17 +55,24 @@ handle_event(info, {retry_due, Ref}, _StateName,
     start_dispatch(Data#{retry_timer := undefined});
 handle_event(info, {retry_due, _Ref}, StateName, Data) ->
     {next_state, StateName, Data};
-handle_event(info, {dispatch_result, Ref, Result}, _StateName,
+handle_event(info, {step_result, Ref, Result}, _StateName,
              #{dispatch := {Ref, _Pid}} = Data) ->
-    handle_dispatch_result(Result, Data#{dispatch := undefined});
-handle_event(info, {dispatch_result, _Ref, _Result}, StateName, Data) ->
+    handle_step_result(Result, clear_step_execution(Data));
+handle_event(info, {step_result, _Ref, _Result}, StateName, Data) ->
+    {next_state, StateName, Data};
+handle_event(info, {step_timeout, Ref}, _StateName,
+             #{dispatch := {Ref, Pid}} = Data) ->
+    exit(Pid, kill),
+    handle_step_result({error, timeout}, clear_step_execution(Data));
+handle_event(info, {step_timeout, _Ref}, StateName, Data) ->
     {next_state, StateName, Data};
 handle_event(info, {'EXIT', Pid, normal}, StateName,
              #{dispatch := {_Ref, Pid}} = Data) ->
     {next_state, StateName, Data};
-handle_event(info, {'EXIT', Pid, _Reason}, _StateName,
+handle_event(info, {'EXIT', Pid, Reason}, _StateName,
              #{dispatch := {_Ref, Pid}} = Data) ->
-    {stop, normal, Data#{dispatch := undefined}};
+    handle_step_result({error, #{class => exit, reason => Reason}},
+                       clear_step_execution(Data));
 handle_event(info, {'EXIT', _Pid, _Reason}, StateName, Data) ->
     {next_state, StateName, Data};
 handle_event(info, {lease_heartbeat, Ref}, StateName,
@@ -77,6 +86,7 @@ handle_event(_, _, StateName, Data) ->
 terminate(_, _, Data) ->
     cancel_timer(maps:get(retry_timer, Data, undefined)),
     cancel_timer(maps:get(heartbeat_timer, Data, undefined)),
+    cancel_timer(maps:get(step_timeout_timer, Data, undefined)),
     cancel_dispatch(maps:get(dispatch, Data, undefined)),
     ok.
 
@@ -84,26 +94,43 @@ code_change(_, StateName, Data, _) ->
     {ok, StateName, Data}.
 
 start_dispatch(Data0) ->
-    Data1 = cancel_heartbeat_timer(cancel_retry_timer(Data0)),
+    Data1 = cancel_step_timeout_timer(cancel_heartbeat_timer(cancel_retry_timer(Data0))),
     case ensure_lease(Data1) of
         {ok, #{run_id := RunId, lease := Lease} = Data2} ->
-            Ref = make_ref(),
-            Parent = self(),
-            Data3 = schedule_heartbeat(Data2),
-            Pid = spawn_link(
-                    fun() ->
-                            process_flag(trap_exit, true),
-                            Parent ! {dispatch_result, Ref,
-                                      beamtrail:dispatch_from_runner(RunId, Lease)}
-                    end),
-            {next_state, executing, Data3#{dispatch := {Ref, Pid}}};
+            case beamtrail:next_runner_action(RunId, Lease) of
+                {ok, {execute, Attempt, ExecSpec}} ->
+                    start_step_execution(Attempt, ExecSpec, Data2);
+                {ok, State} ->
+                    after_dispatch(State, Data2);
+                {error, _Reason} ->
+                    {stop, normal, Data2}
+            end;
         {error, _Reason} ->
             {stop, normal, Data1}
     end.
 
-handle_dispatch_result({ok, State}, Data) ->
-    after_dispatch(State, Data);
-handle_dispatch_result({error, _Reason}, Data) ->
+start_step_execution(Attempt, ExecSpec, Data0) ->
+    Ref = make_ref(),
+    Parent = self(),
+    Pid = spawn_link(
+            fun() ->
+                    Parent ! {step_result, Ref,
+                              beamtrail:execute_runner_attempt(ExecSpec)}
+            end),
+    Data1 = schedule_heartbeat(Data0),
+    Data2 = schedule_step_timeout(maps:get(timeout_ms, ExecSpec, infinity), Ref, Data1),
+    {next_state, executing, Data2#{dispatch := {Ref, Pid},
+                                   attempt := Attempt}}.
+
+handle_step_result(Result, #{run_id := RunId, lease := Lease, attempt := Attempt} = Data)
+  when is_map(Attempt) ->
+    case beamtrail:finish_runner_attempt(RunId, Lease, Attempt, Result) of
+        {ok, State} ->
+            after_dispatch(State, Data#{attempt := undefined});
+        {error, _Reason} ->
+            {stop, normal, Data#{attempt := undefined}}
+    end;
+handle_step_result(_Result, Data) ->
     {stop, normal, Data}.
 
 after_dispatch(State, Data) ->
@@ -182,6 +209,16 @@ schedule_heartbeat(#{lease := Lease} = Data) when is_map(Lease) ->
     TRef = erlang:send_after(Delay, self(), {lease_heartbeat, Ref}),
     Data1#{heartbeat_timer := {Ref, TRef, DueAt}}.
 
+schedule_step_timeout(infinity, _Ref, Data) ->
+    Data;
+schedule_step_timeout(undefined, _Ref, Data) ->
+    Data;
+schedule_step_timeout(TimeoutMs, Ref, Data) when is_integer(TimeoutMs), TimeoutMs >= 0 ->
+    Data1 = cancel_step_timeout_timer(Data),
+    DueAt = erlang:system_time(millisecond) + TimeoutMs,
+    TRef = erlang:send_after(TimeoutMs, self(), {step_timeout, Ref}),
+    Data1#{step_timeout_timer := {Ref, TRef, DueAt}}.
+
 cancel_retry_timer(Data) ->
     cancel_timer(maps:get(retry_timer, Data, undefined)),
     Data#{retry_timer := undefined}.
@@ -189,6 +226,13 @@ cancel_retry_timer(Data) ->
 cancel_heartbeat_timer(Data) ->
     cancel_timer(maps:get(heartbeat_timer, Data, undefined)),
     Data#{heartbeat_timer := undefined}.
+
+cancel_step_timeout_timer(Data) ->
+    cancel_timer(maps:get(step_timeout_timer, Data, undefined)),
+    Data#{step_timeout_timer := undefined}.
+
+clear_step_execution(Data) ->
+    cancel_step_timeout_timer(Data#{dispatch := undefined}).
 
 cancel_timer(undefined) ->
     ok;

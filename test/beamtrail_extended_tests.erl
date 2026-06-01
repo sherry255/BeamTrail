@@ -35,6 +35,7 @@ extended_test_() ->
       fun active_runner_supervisor_rejects_when_pool_full/0,
       fun active_runner_crash_allows_scanner_takeover_after_lease_expiry/0,
       fun active_runner_stops_step_when_lease_heartbeat_fails/0,
+      fun active_runner_records_step_timeout/0,
       fun active_runner_registry_exposes_live_state/0,
       fun query_describe_exposes_active_runner/0,
       fun active_runner_stays_inspectable_while_step_executes/0,
@@ -504,6 +505,26 @@ active_runner_stops_step_when_lease_heartbeat_fails() ->
     ?assertEqual(0, length([E || E <- Events,
                             maps:get(event_type, E) =:= 'step.succeeded'])).
 
+active_runner_records_step_timeout() ->
+    {ok, Registry} = beamtrail_run_registry:start_link(),
+    unlink(Registry),
+    {ok, RunSup} = beamtrail_run_sup:start_link(),
+    unlink(RunSup),
+    Input = #{order_id => <<"o-active-timeout-1">>},
+    {ok, RunId} = beamtrail:start_workflow(bt_timeout_workflow, Input,
+                                           #{run_id => <<"active-timeout-run-1">>,
+                                             auto_dispatch => false}),
+    {ok, Pid} = beamtrail_run_sup:dispatch(RunId),
+    ok = wait_until_dead(Pid, 1000),
+    State = beamtrail:get_state(RunId),
+    ?assertEqual(failed, maps:get(status, State)),
+    ?assertMatch(#{reason := timeout}, maps:get(failure, State)),
+    {ok, Events} = beamtrail:events(RunId),
+    ?assertEqual(1, length([E || E <- Events,
+                            maps:get(event_type, E) =:= 'step.failed'])),
+    ?assertEqual(0, length([E || E <- Events,
+                            maps:get(event_type, E) =:= 'step.succeeded'])).
+
 active_runner_registry_exposes_live_state() ->
     {ok, Registry} = beamtrail_run_registry:start_link(),
     unlink(Registry),
@@ -570,7 +591,8 @@ active_runner_stays_inspectable_while_step_executes() ->
     ?assertMatch(#{run_id := RunId,
                    pid := Pid,
                    status := executing,
-                   fencing_token := 1},
+                   fencing_token := 1,
+                   dispatch_pid := ExecPid},
                  Active),
     ?assert(is_integer(maps:get(heartbeat_due_in_ms, Active))),
     ?assert(erlang:monotonic_time(millisecond) - StartedAt < 200),
