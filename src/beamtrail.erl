@@ -10,8 +10,6 @@
          mark_recovery_requeued/1, mark_recovery_requeued_with_lease/1]).
 
 -define(STORAGE_DEFAULT, beamtrail_memory_storage).
--define(SNAPSHOT_EVERY, 5).
--define(SNAPSHOT_REVISION, 1).
 
 start() ->
     application:ensure_all_started(beamtrail).
@@ -141,39 +139,7 @@ get_state(RunId) ->
 
 load_state(RunId) ->
     ok = ensure_storage(),
-    case (storage()):read_snapshot(RunId) of
-        {ok, Snapshot} ->
-            case snapshot_revision_compatible(Snapshot) of
-                true -> load_state_from_snapshot(RunId, Snapshot);
-                false -> load_state_from_events(RunId)
-            end;
-        not_found ->
-            load_state_from_events(RunId);
-        {error, _} = Error ->
-            Error
-    end.
-
-load_state_from_snapshot(RunId, Snapshot) ->
-    SnapshotSeq = maps:get(snapshot_seq, Snapshot),
-    case (storage()):read_events(RunId, SnapshotSeq + 1, infinity) of
-        {ok, TailEvents} ->
-            State = beamtrail_reducer:from_snapshot_and_events(
-                      maps:get(state, Snapshot), TailEvents),
-            {ok, enrich_version_migration(State)};
-        {error, _} = Error ->
-            Error
-    end.
-
-load_state_from_events(RunId) ->
-    case (storage()):events(RunId) of
-        {ok, Events} ->
-            {ok, enrich_version_migration(beamtrail_reducer:from_events(Events))};
-        {error, _} = Error ->
-            Error
-    end.
-
-snapshot_revision_compatible(Snapshot) ->
-    maps:get(snapshot_revision, Snapshot, 0) =:= ?SNAPSHOT_REVISION.
+    beamtrail_state:load(RunId, storage()).
 
 events(RunId) ->
     ok = ensure_storage(),
@@ -384,73 +350,7 @@ execution_context(RunId, Attempt) ->
 execute_attempt(RunId, Workflow, Input, Attempt, Lease, _Options) ->
     StepId = maps:get(step_id, Attempt),
     ExecSpec = execution_spec(RunId, Workflow, StepId, Input, Attempt),
-    Timeout = maps:get(timeout_ms, ExecSpec),
-    Fun = fun() -> beamtrail_runner_transition:execute_attempt(ExecSpec) end,
-    run_with_timeout_and_lease_heartbeat(RunId, Lease, Fun, Timeout).
-
-run_with_timeout_and_lease_heartbeat(RunId, Lease, Fun, TimeoutMs) ->
-    Parent = self(),
-    ResultRef = make_ref(),
-    StopRef = make_ref(),
-    ExecPid = spawn(fun() -> Parent ! {ResultRef, execute, guarded_execute(Fun)} end),
-    HeartbeatPid =
-        spawn(fun() ->
-                      ParentRef = erlang:monitor(process, Parent),
-                      lease_heartbeat_loop(RunId, Lease, StopRef, ParentRef, Parent)
-              end),
-    TimeoutRef = arm_attempt_timeout(ResultRef, TimeoutMs),
-    receive
-        {ResultRef, execute, Result} ->
-            cancel_attempt_timeout(TimeoutRef),
-            HeartbeatPid ! {StopRef, stop},
-            Result;
-        {ResultRef, timeout} ->
-            exit(ExecPid, kill),
-            HeartbeatPid ! {StopRef, stop},
-            {error, timeout};
-        {StopRef, lease_lost, Reason} ->
-            cancel_attempt_timeout(TimeoutRef),
-            exit(ExecPid, kill),
-            {error, #{class => lease_lost, reason => Reason}}
-    end.
-
-guarded_execute(Fun) ->
-    try Fun()
-    catch
-        Class:Reason:_Stacktrace ->
-            {error, #{class => Class, reason => Reason}}
-    end.
-
-arm_attempt_timeout(_ResultRef, infinity) ->
-    undefined;
-arm_attempt_timeout(ResultRef, TimeoutMs)
-  when is_integer(TimeoutMs), TimeoutMs >= 0 ->
-    erlang:send_after(TimeoutMs, self(), {ResultRef, timeout}).
-
-cancel_attempt_timeout(undefined) ->
-    ok;
-cancel_attempt_timeout(TimeoutRef) ->
-    erlang:cancel_timer(TimeoutRef),
-    ok.
-
-lease_heartbeat_loop(RunId, Lease, StopRef, ParentRef, Parent) ->
-    Interval = lease_heartbeat_interval_ms(Lease),
-    receive
-        {StopRef, stop} ->
-            erlang:demonitor(ParentRef, [flush]),
-            ok;
-        {'DOWN', ParentRef, process, _Pid, _Reason} ->
-            ok
-    after Interval ->
-        case (storage()):renew_lease(RunId, lease_fencing_token(Lease),
-                                     lease_ttl_ms(Lease)) of
-            {ok, _Renewed} ->
-                lease_heartbeat_loop(RunId, Lease, StopRef, ParentRef, Parent);
-            {error, Reason} ->
-                Parent ! {StopRef, lease_lost, Reason},
-                ok
-        end
-    end.
+    beamtrail_runner_transition:execute_attempt(RunId, Lease, ExecSpec).
 
 handle_step_success(RunId, Attempt, Value, Lease, Options) ->
     case maps:get(runner_state, Options, undefined) of
@@ -792,48 +692,10 @@ maybe_snapshot(RunId, Force) ->
     end.
 
 maybe_snapshot_state(RunId, State, Force) ->
-    Seq = maps:get(last_event_seq, State, 0),
-    ShouldWrite = Force orelse (Seq > 0 andalso Seq rem ?SNAPSHOT_EVERY =:= 0),
-    case ShouldWrite of
-        true ->
-            case (storage()):write_snapshot(RunId, State, Seq, ?SNAPSHOT_REVISION) of
-                ok ->
-                    beamtrail_telemetry:execute([beamtrail, snapshot, written],
-                                                #{count => 1},
-                                                #{run_id => RunId,
-                                                  snapshot_seq => Seq}),
-                    ok;
-                {error, _} = Error ->
-                    Error
-            end;
-        false ->
-            ok
-    end.
-
-enrich_version_migration(State = #{workflow := undefined}) ->
-    State#{migration_required_for_version_change => false};
-enrich_version_migration(State) ->
-    Workflow = maps:get(workflow, State),
-    Attempts = maps:get(attempts, State, []),
-    MigrationRequired =
-        lists:any(
-          fun(Attempt) ->
-                  StepId = maps:get(step_id, Attempt),
-                  RecordedVersion = maps:get(step_version, Attempt),
-                  current_step_version(Workflow, StepId) =/= RecordedVersion
-          end,
-          Attempts),
-    State#{migration_required_for_version_change => MigrationRequired}.
-
-current_step_version(Workflow, StepId) ->
-    try Workflow:step_version(StepId) of
-        Version -> Version
-    catch
-        _:_ -> undefined
-    end.
+    beamtrail_state:maybe_snapshot(RunId, State, Force, storage()).
 
 apply_runtime_event(State, Event) ->
-    enrich_version_migration(beamtrail_reducer:apply_event(State, Event)).
+    beamtrail_state:apply_event(State, Event).
 
 append_event(RunId, ExpectedSeq, Lease, EventType, StepId, StepVersion,
              IdempotencyKey, Payload) ->
@@ -845,17 +707,6 @@ lease_fencing_token(Lease) when is_map(Lease) ->
     maps:get(fencing_token, Lease, undefined);
 lease_fencing_token(_) ->
     undefined.
-
-lease_ttl_ms(#{lease_until := Until, acquired_at := AcquiredAt})
-  when is_integer(Until), is_integer(AcquiredAt), Until > AcquiredAt ->
-    Until - AcquiredAt;
-lease_ttl_ms(#{lease_until := Until}) when is_integer(Until) ->
-    max(1, Until - erlang:system_time(millisecond));
-lease_ttl_ms(_) ->
-    beamtrail_lease_manager:default_ttl_ms().
-
-lease_heartbeat_interval_ms(Lease) ->
-    max(1, min(5000, lease_ttl_ms(Lease) div 3)).
 
 lease_current(RunId, Lease) ->
     FencingToken = lease_fencing_token(Lease),
