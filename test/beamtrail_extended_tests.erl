@@ -15,7 +15,7 @@ extended_test_() ->
       fun query_describe_exposes_read_model/0,
       fun query_instance_current_step_matches_reducer/0,
       fun telemetry_counters_track_attempts/0,
-      fun postgres_stub_is_loud_about_not_implemented/0,
+      fun postgres_adapter_requires_config/0,
       fun get_state_returns_storage_error/0,
       fun dispatch_returns_storage_error/0,
       fun query_describe_returns_storage_error/0,
@@ -193,48 +193,49 @@ telemetry_counters_track_attempts() ->
     ?assertEqual(2, Started),
     ?assert(Snap >= 1).
 
-postgres_stub_is_loud_about_not_implemented() ->
-    ?assertEqual({error, not_implemented},
+postgres_adapter_requires_config() ->
+    ?assertEqual({error, postgres_not_configured},
                  beamtrail_postgres_storage:append_event(
                    <<"r">>, 0, undefined, 'workflow.instance.created', undefined,
                    undefined, undefined, #{})),
-    ?assertEqual({error, not_implemented},
+    ?assertEqual({error, postgres_not_configured},
                  beamtrail_postgres_storage:read_events(<<"r">>, 1, infinity)),
-    ?assertEqual({error, not_implemented},
+    ?assertEqual({error, postgres_not_configured},
                  beamtrail_postgres_storage:events(<<"r">>)),
-    ?assertEqual({error, not_implemented},
+    ?assertEqual({error, postgres_not_configured},
                  beamtrail_postgres_storage:list_run_ids()),
-    ?assertEqual({error, not_implemented},
+    ?assertEqual({error, postgres_not_configured},
                  beamtrail_postgres_storage:list_run_ids(undefined, 10)),
-    ?assertEqual(not_found, beamtrail_postgres_storage:read_lease(<<"r">>)).
+    ?assertEqual({error, postgres_not_configured},
+                 beamtrail_postgres_storage:read_lease(<<"r">>)).
 
 get_state_returns_storage_error() ->
     ok = application:set_env(beamtrail, storage_adapter,
                              beamtrail_postgres_storage),
-    ?assertEqual({error, not_implemented},
+    ?assertEqual({error, postgres_not_configured},
                  beamtrail:get_state(<<"state-error-run">>)).
 
 dispatch_returns_storage_error() ->
     ok = application:set_env(beamtrail, storage_adapter,
                              beamtrail_postgres_storage),
-    ?assertEqual({error, not_implemented},
+    ?assertEqual({error, postgres_not_configured},
                  beamtrail:dispatch(<<"dispatch-error-run">>)).
 
 query_describe_returns_storage_error() ->
     ok = application:set_env(beamtrail, storage_adapter,
                              beamtrail_postgres_storage),
-    ?assertEqual({error, not_implemented},
+    ?assertEqual({error, postgres_not_configured},
                  beamtrail_query:describe(<<"query-error-run">>)).
 
 recover_unfinished_returns_storage_error() ->
     ok = application:set_env(beamtrail, storage_adapter,
                              beamtrail_postgres_storage),
-    ?assertEqual({error, not_implemented}, beamtrail:recover_unfinished()).
+    ?assertEqual({error, postgres_not_configured}, beamtrail:recover_unfinished()).
 
 recovery_marker_returns_storage_error() ->
     ok = application:set_env(beamtrail, storage_adapter,
                              beamtrail_postgres_storage),
-    ?assertEqual({error, not_implemented},
+    ?assertEqual({error, postgres_not_configured},
                  beamtrail:mark_recovery_requeued(<<"missing-run">>)).
 
 start_workflow_returns_snapshot_write_error() ->

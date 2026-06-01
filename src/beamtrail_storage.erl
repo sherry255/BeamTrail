@@ -18,7 +18,7 @@
     {ok, map()} | {error, term()}.
 -callback renew_lease(RunId :: binary(), FencingToken :: pos_integer(), TtlMs :: pos_integer()) ->
     {ok, map()} | {error, no_lease | stale_fence | term()}.
--callback read_lease(RunId :: binary()) -> {ok, map()} | not_found.
+-callback read_lease(RunId :: binary()) -> {ok, map()} | not_found | {error, term()}.
 -callback list_run_ids() -> {ok, [binary()]} | {error, term()}.
 -callback list_run_ids(Cursor :: binary() | undefined, Limit :: pos_integer()) ->
     {ok, #{run_ids := [binary()],

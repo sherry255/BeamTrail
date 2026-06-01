@@ -7,20 +7,21 @@ It stores each workflow run as an append-only event stream, derives state by
 reducing events, and runs a static list of workflow steps with retry, timeout,
 lease, and recovery metadata recorded in the log.
 
-The current repository still has missing durable-storage work. The only
-working storage adapter is currently in-memory.
+The in-memory adapter is the default for local development. A PostgreSQL
+adapter is included for durable event, snapshot, and lease storage.
 
 ## Current State
 
-- `beamtrail_memory_storage` is the only supported adapter.
-- `beamtrail_postgres_storage` is a stub and returns `{error, not_implemented}`.
-- `priv/sql/postgres.sql` sketches the intended PostgreSQL schema.
+- `beamtrail_memory_storage` is the default adapter.
+- `beamtrail_postgres_storage` uses epgsql and the schema in
+  `priv/sql/postgres.sql`.
+- PostgreSQL payloads, idempotency keys, leases, and snapshots are stored as
+  Erlang external-term-format `bytea` values. This keeps replay exact; SQL-level
+  JSON inspection is not implemented yet.
 - Workflows are linear step lists. There is no branching, DAG execution, or
   fan-out.
 - Idempotency keys are recorded and passed to workflow code. Deduplicating
   external side effects is still the workflow's job.
-- Lease/fencing is enforced in the in-memory adapter. Multi-node durable
-  takeover still needs a real storage backend.
 - There is no HTTP API or browser UI.
 
 ## What Works
@@ -59,6 +60,20 @@ Set these application environment values before starting `beamtrail`:
 - `storage_adapter`: storage module, default `beamtrail_memory_storage`.
 - `scanner_interval_ms`: recovery scan interval, default `5000`.
 - `worker_max_children`: concurrent dispatch workers, default `64`.
+
+For PostgreSQL:
+
+```erlang
+application:set_env(beamtrail, storage_adapter, beamtrail_postgres_storage),
+application:set_env(beamtrail, postgres,
+                    #{host => "localhost",
+                      port => 5432,
+                      username => "beamtrail",
+                      password => "beamtrail",
+                      database => "beamtrail"}).
+
+ok = beamtrail_postgres_storage:init_schema().
+```
 
 ## Workflow Module
 

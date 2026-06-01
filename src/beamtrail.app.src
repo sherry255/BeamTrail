@@ -2,6 +2,6 @@
  [{description, "Durable workflow runtime for OTP"},
   {vsn, "0.1.0"},
   {registered, [beamtrail_memory_storage, beamtrail_scanner]},
-  {applications, [kernel, stdlib]},
+  {applications, [kernel, stdlib, epgsql]},
   {mod, {beamtrail_app, []}},
   {env, []}]}.
