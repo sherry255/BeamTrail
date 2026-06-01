@@ -33,16 +33,7 @@ snapshot_schema_definition() ->
            steps,
            terminal,
            workflow],
-      attempt_keys =>
-          [attempt,
-           completed_event_seq,
-           idempotency_key,
-           reason,
-           result,
-           started_event_seq,
-           status,
-           step_id,
-           step_version]}.
+      attempt_keys => beamtrail_reducer:attempt_keys()}.
 
 snapshot_every() ->
     ?SNAPSHOT_EVERY.

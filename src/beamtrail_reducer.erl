@@ -1,6 +1,7 @@
 -module(beamtrail_reducer).
 
--export([new/0, from_events/1, from_snapshot_and_events/2, apply_event/2]).
+-export([new/0, from_events/1, from_snapshot_and_events/2, apply_event/2,
+         attempt_keys/0]).
 
 new() ->
     #{run_id => undefined,
@@ -23,6 +24,32 @@ from_events(Events) ->
 
 from_snapshot_and_events(SnapshotState, Events) ->
     lists:foldl(fun(Event, State) -> apply_event(State, Event) end, SnapshotState, Events).
+
+attempt_keys() ->
+    State = from_events(
+              [#{run_id => <<"schema-run">>,
+                 event_seq => 1,
+                 event_type => 'workflow.instance.created',
+                 payload => #{workflow => undefined,
+                              input => undefined,
+                              steps => [schema_step]},
+                 occurred_at => 0},
+               #{run_id => <<"schema-run">>,
+                 event_seq => 2,
+                 event_type => 'attempt.started',
+                 step_id => schema_step,
+                 step_version => 1,
+                 idempotency_key => schema_key,
+                 payload => #{attempt => 1},
+                 occurred_at => 1},
+               #{run_id => <<"schema-run">>,
+                 event_seq => 3,
+                 event_type => 'step.succeeded',
+                 step_id => schema_step,
+                 payload => #{result => schema_result},
+                 occurred_at => 2}]),
+    [Attempt] = maps:get(attempts, State),
+    maps:keys(Attempt).
 
 apply_event(State0, Event) ->
     State = State0#{last_event_seq => maps:get(event_seq, Event)},

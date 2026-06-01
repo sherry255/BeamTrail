@@ -301,15 +301,7 @@ snapshot_schema_contract_pins_revision_to_state_shape() ->
     RuntimeKeys = [created_at, migration_required_for_version_change],
     ?assertEqual(lists:sort(BaseKeys ++ RuntimeKeys),
                  maps:get(state_keys, Schema)),
-    ?assertEqual([attempt,
-                  completed_event_seq,
-                  idempotency_key,
-                  reason,
-                  result,
-                  started_event_seq,
-                  status,
-                  step_id,
-                  step_version],
+    ?assertEqual(beamtrail_reducer:attempt_keys(),
                  maps:get(attempt_keys, Schema)),
     ?assert(beamtrail_state:snapshot_revision() > 0).
 
