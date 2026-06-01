@@ -317,13 +317,11 @@ execute_attempt(RunId, Workflow, Input, Attempt, Lease) ->
           attempt => maps:get(attempt, Attempt),
           idempotency_key => maps:get(idempotency_key, Attempt)},
     Timeout = Workflow:timeout_ms(StepId),
-    with_lease_heartbeat(
+    run_with_timeout_and_lease_heartbeat(
       RunId,
       Lease,
-      fun() ->
-              run_with_timeout(fun() -> safe_execute(Workflow, StepId, StepVersion, Input, Context) end,
-                               Timeout)
-      end).
+      fun() -> safe_execute(Workflow, StepId, StepVersion, Input, Context) end,
+      Timeout).
 
 safe_execute(Workflow, StepId, StepVersion, Input, Context) ->
     try Workflow:execute(StepId, StepVersion, Input, Context) of
@@ -335,33 +333,52 @@ safe_execute(Workflow, StepId, StepVersion, Input, Context) ->
             {error, #{class => Class, reason => Reason}}
     end.
 
-run_with_timeout(Fun, infinity) ->
-    Fun();
-run_with_timeout(Fun, TimeoutMs) when is_integer(TimeoutMs), TimeoutMs >= 0 ->
+run_with_timeout_and_lease_heartbeat(RunId, Lease, Fun, TimeoutMs) ->
     Parent = self(),
-    Ref = make_ref(),
-    Pid = spawn(fun() -> Parent ! {Ref, Fun()} end),
-    receive
-        {Ref, Result} ->
-            Result
-    after TimeoutMs ->
-        exit(Pid, kill),
-        {error, timeout}
-    end.
-
-with_lease_heartbeat(RunId, Lease, Fun) ->
+    ResultRef = make_ref(),
     StopRef = make_ref(),
-    Parent = self(),
-    Pid = spawn(fun() ->
-                        ParentRef = erlang:monitor(process, Parent),
-                        lease_heartbeat_loop(RunId, Lease, StopRef, ParentRef)
-                end),
-    try Fun()
-    after
-        Pid ! {StopRef, stop}
+    ExecPid = spawn(fun() -> Parent ! {ResultRef, execute, guarded_execute(Fun)} end),
+    HeartbeatPid =
+        spawn(fun() ->
+                      ParentRef = erlang:monitor(process, Parent),
+                      lease_heartbeat_loop(RunId, Lease, StopRef, ParentRef, Parent)
+              end),
+    TimeoutRef = arm_attempt_timeout(ResultRef, TimeoutMs),
+    receive
+        {ResultRef, execute, Result} ->
+            cancel_attempt_timeout(TimeoutRef),
+            HeartbeatPid ! {StopRef, stop},
+            Result;
+        {ResultRef, timeout} ->
+            exit(ExecPid, kill),
+            HeartbeatPid ! {StopRef, stop},
+            {error, timeout};
+        {StopRef, lease_lost, Reason} ->
+            cancel_attempt_timeout(TimeoutRef),
+            exit(ExecPid, kill),
+            {error, #{class => lease_lost, reason => Reason}}
     end.
 
-lease_heartbeat_loop(RunId, Lease, StopRef, ParentRef) ->
+guarded_execute(Fun) ->
+    try Fun()
+    catch
+        Class:Reason:_Stacktrace ->
+            {error, #{class => Class, reason => Reason}}
+    end.
+
+arm_attempt_timeout(_ResultRef, infinity) ->
+    undefined;
+arm_attempt_timeout(ResultRef, TimeoutMs)
+  when is_integer(TimeoutMs), TimeoutMs >= 0 ->
+    erlang:send_after(TimeoutMs, self(), {ResultRef, timeout}).
+
+cancel_attempt_timeout(undefined) ->
+    ok;
+cancel_attempt_timeout(TimeoutRef) ->
+    erlang:cancel_timer(TimeoutRef),
+    ok.
+
+lease_heartbeat_loop(RunId, Lease, StopRef, ParentRef, Parent) ->
     Interval = lease_heartbeat_interval_ms(Lease),
     receive
         {StopRef, stop} ->
@@ -373,8 +390,9 @@ lease_heartbeat_loop(RunId, Lease, StopRef, ParentRef) ->
         case (storage()):renew_lease(RunId, lease_fencing_token(Lease),
                                      lease_ttl_ms(Lease)) of
             {ok, _Renewed} ->
-                lease_heartbeat_loop(RunId, Lease, StopRef, ParentRef);
-            {error, _} ->
+                lease_heartbeat_loop(RunId, Lease, StopRef, ParentRef, Parent);
+            {error, Reason} ->
+                Parent ! {StopRef, lease_lost, Reason},
                 ok
         end
     end.

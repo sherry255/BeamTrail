@@ -33,6 +33,7 @@ extended_test_() ->
       fun active_runner_wakes_retry_without_scanner_tick/0,
       fun active_runner_supervisor_rejects_when_pool_full/0,
       fun active_runner_crash_allows_scanner_takeover_after_lease_expiry/0,
+      fun active_runner_stops_step_when_lease_heartbeat_fails/0,
       fun dispatch_refuses_version_mismatch_without_migration/0,
       fun retry_attempts_preserved_in_chronological_order/0,
       fun storage_adapter_is_application_configurable/0,
@@ -447,6 +448,26 @@ active_runner_crash_allows_scanner_takeover_after_lease_expiry() ->
                  receive_exec()),
     ok = wait_for_status(RunId, completed, 1000).
 
+active_runner_stops_step_when_lease_heartbeat_fails() ->
+    ok = application:set_env(beamtrail, storage_adapter, bt_no_renew_storage),
+    ok = application:set_env(beamtrail, lease_ttl_ms, 60),
+    {ok, Registry} = beamtrail_run_registry:start_link(),
+    unlink(Registry),
+    {ok, RunSup} = beamtrail_run_sup:start_link(),
+    unlink(RunSup),
+    Input = #{order_id => <<"o-lease-lost-1">>, test_pid => self(),
+              gate => lease_lost_gate},
+    {ok, RunId} = beamtrail:start_workflow(bt_blocking_success_workflow, Input,
+                                           #{run_id => <<"lease-lost-run-1">>,
+                                             auto_dispatch => false}),
+    {ok, Pid} = beamtrail_run_sup:dispatch(RunId),
+    ?assertMatch({blocking_started, _ExecPid, 1}, receive_exec()),
+    ok = wait_until_dead(Pid, 1000),
+    ?assertEqual(timeout, receive_exec_short()),
+    {ok, Events} = beamtrail:events(RunId),
+    ?assertEqual(0, length([E || E <- Events,
+                            maps:get(event_type, E) =:= 'step.succeeded'])).
+
 dispatch_refuses_version_mismatch_without_migration() ->
     RunId = <<"version-gate-run-1">>,
     Input = #{order_id => <<"o-version-1">>, test_pid => self()},
@@ -557,6 +578,16 @@ wait_for_status(RunId, Target, Remaining) ->
         _ ->
             timer:sleep(20),
             wait_for_status(RunId, Target, Remaining - 20)
+    end.
+
+wait_until_dead(_Pid, Remaining) when Remaining =< 0 ->
+    {error, timeout};
+wait_until_dead(Pid, Remaining) ->
+    case is_process_alive(Pid) of
+        false -> ok;
+        true ->
+            timer:sleep(20),
+            wait_until_dead(Pid, Remaining - 20)
     end.
 
 stop_registered(Name) ->
