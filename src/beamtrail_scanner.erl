@@ -13,6 +13,7 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
 -define(DEFAULT_INTERVAL_MS, 5000).
+-define(DEFAULT_BATCH_SIZE, 100).
 
 start_link() ->
     start_link(#{interval_ms => ?DEFAULT_INTERVAL_MS, auto_start => true}).
@@ -34,9 +35,12 @@ stop() ->
 
 init(Opts) ->
     Interval = maps:get(interval_ms, Opts, ?DEFAULT_INTERVAL_MS),
+    BatchSize = maps:get(batch_size, Opts, ?DEFAULT_BATCH_SIZE),
     Auto = maps:get(auto_start, Opts, true),
     State =
         #{interval_ms => Interval,
+          batch_size => BatchSize,
+          cursor => undefined,
           timer => undefined,
           last_scan_at => undefined,
           last_requeued => []},
@@ -55,7 +59,9 @@ handle_call({set_interval, Ms}, _From, State) ->
     {reply, ok, State1};
 handle_call(last_scan, _From, State) ->
     {reply, #{at => maps:get(last_scan_at, State),
-              requeued => maps:get(last_requeued, State)}, State};
+              requeued => maps:get(last_requeued, State),
+              cursor => maps:get(cursor, State),
+              batch_size => maps:get(batch_size, State)}, State};
 handle_call(_, _, State) ->
     {reply, {error, unknown_call}, State}.
 
@@ -74,20 +80,32 @@ terminate(_, State) ->
 code_change(_, S, _) -> {ok, S}.
 
 do_scan(State) ->
-    %% Detect recoverable runs synchronously, then hand each one to a
-    %% supervised worker via beamtrail_worker_sup. Execution does NOT
-    %% happen on the scanner process, so a slow run can't stall scans.
+    %% Detect one cursor page synchronously, then hand recoverable runs to a
+    %% supervised worker via beamtrail_worker_sup. Execution does NOT happen
+    %% on the scanner process, so a slow run can't stall scans.
+    Cursor = maps:get(cursor, State, undefined),
+    BatchSize = maps:get(batch_size, State, ?DEFAULT_BATCH_SIZE),
     Result =
-        try beamtrail:list_recoverable() of
-            RunIds when is_list(RunIds) ->
+        try beamtrail:list_recoverable(Cursor, BatchSize) of
+            {ok, #{run_ids := RunIds} = Page} ->
                 Spawned = [requeue(RunId) || RunId <- RunIds],
-                {ok, [R || {R, ok} <- Spawned]}
+                {ok, [R || {R, ok} <- Spawned], Page}
         catch
             _:Reason -> {error, Reason}
         end,
-    Requeued1 = case Result of {ok, Rs} -> Rs; _ -> [] end,
-    {Result, State#{last_scan_at := erlang:system_time(millisecond),
-                    last_requeued := Requeued1}}.
+    Requeued1 = case Result of {ok, Rs, _Page} -> Rs; _ -> [] end,
+    Cursor1 = case Result of
+                  {ok, _, #{has_more := true, next_cursor := Next}} -> Next;
+                  {ok, _, _} -> undefined;
+                  _ -> Cursor
+              end,
+    Reply = case Result of
+                {ok, Runs, _} -> {ok, Runs};
+                Error -> Error
+            end,
+    {Reply, State#{last_scan_at := erlang:system_time(millisecond),
+                   last_requeued := Requeued1,
+                   cursor := Cursor1}}.
 
 requeue(RunId) ->
     try

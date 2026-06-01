@@ -28,7 +28,7 @@ recovery metadata in the event history.
 - Step-version replay for recovery.
 - Lease fencing for dispatch and event writes, including heartbeat
   renewal while a step is running.
-- Background recovery scanner and worker supervisor.
+- Cursor-batched recovery scanner and worker supervisor.
 - Query view for events, attempts, snapshots, leases, recovery state,
   and telemetry counters.
 - Configurable storage adapter via the `beamtrail` application

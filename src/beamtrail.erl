@@ -3,7 +3,8 @@
 -export([start/0, stop/0]).
 -export([start_workflow/2, start_workflow/3, dispatch/1, dispatch/2, recover_unfinished/0]).
 -export([get_state/1, events/1, storage/0]).
--export([list_recoverable/0, mark_recovery_requeued/1, mark_recovery_requeued_with_lease/1]).
+-export([list_recoverable/0, list_recoverable/2,
+         mark_recovery_requeued/1, mark_recovery_requeued_with_lease/1]).
 
 -define(STORAGE_DEFAULT, beamtrail_memory_storage).
 -define(LEASE_TTL_MS, 30000).
@@ -465,6 +466,16 @@ list_recoverable() ->
     ok = ensure_storage(),
     [RunId || RunId <- (storage()):list_run_ids(),
               recoverable(get_state(RunId))].
+
+list_recoverable(Cursor, Limit) ->
+    ok = ensure_storage(),
+    case (storage()):list_run_ids(Cursor, Limit) of
+        {ok, #{run_ids := RunIds} = Page} ->
+            {ok, Page#{run_ids := [RunId || RunId <- RunIds,
+                                            recoverable(get_state(RunId))]}};
+        {error, _} = Error ->
+            Error
+    end.
 
 %% Acquires a lease (best-effort) and appends a durable `recovery.requeued'
 %% event to the log so the scanner's decision is observable in the inspector,

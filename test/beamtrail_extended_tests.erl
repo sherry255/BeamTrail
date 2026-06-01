@@ -9,10 +9,12 @@ extended_test_() ->
      [
       fun workflow_timeout_emits_workflow_failed/0,
       fun scanner_requeues_unknown_attempts/0,
+      fun scanner_scans_one_batch_at_a_time/0,
       fun query_describe_exposes_read_model/0,
       fun query_instance_current_step_matches_reducer/0,
       fun telemetry_counters_track_attempts/0,
       fun postgres_stub_is_loud_about_not_implemented/0,
+      fun storage_lists_run_ids_with_cursor/0,
       fun storage_rejects_expected_seq_conflict/0,
       fun storage_renews_current_lease_without_changing_fence/0,
       fun storage_refuses_to_renew_expired_lease/0,
@@ -79,6 +81,21 @@ scanner_requeues_unknown_attempts() ->
     Types = [maps:get(event_type, E) || E <- Events],
     ?assert(lists:member('recovery.requeued', Types)).
 
+scanner_scans_one_batch_at_a_time() ->
+    {ok, Run1} = beamtrail:start_workflow(
+                   bt_timeout_workflow,
+                   #{order_id => <<"o-batch-1">>},
+                   #{run_id => <<"batch-run-1">>, auto_dispatch => false}),
+    {ok, Run2} = beamtrail:start_workflow(
+                   bt_timeout_workflow,
+                   #{order_id => <<"o-batch-2">>},
+                   #{run_id => <<"batch-run-2">>, auto_dispatch => false}),
+    {ok, _Pid} = beamtrail_scanner:start_link(#{interval_ms => infinity,
+                                                auto_start => false,
+                                                batch_size => 1}),
+    ?assertEqual({ok, [Run1]}, beamtrail_scanner:scan_now()),
+    ?assertEqual({ok, [Run2]}, beamtrail_scanner:scan_now()).
+
 query_describe_exposes_read_model() ->
     Input = #{order_id => <<"o-q-1">>, test_pid => self()},
     {ok, RunId} = beamtrail:start_workflow(bt_success_workflow, Input),
@@ -139,6 +156,24 @@ postgres_stub_is_loud_about_not_implemented() ->
     ?assertEqual({error, not_implemented},
                  beamtrail_postgres_storage:events(<<"r">>)),
     ?assertEqual(not_found, beamtrail_postgres_storage:read_lease(<<"r">>)).
+
+storage_lists_run_ids_with_cursor() ->
+    {ok, _} = beamtrail:start_workflow(bt_timeout_workflow, #{order_id => <<"o-page-2">>},
+                                       #{run_id => <<"page-run-2">>, auto_dispatch => false}),
+    {ok, _} = beamtrail:start_workflow(bt_timeout_workflow, #{order_id => <<"o-page-1">>},
+                                       #{run_id => <<"page-run-1">>, auto_dispatch => false}),
+    {ok, _} = beamtrail:start_workflow(bt_timeout_workflow, #{order_id => <<"o-page-3">>},
+                                       #{run_id => <<"page-run-3">>, auto_dispatch => false}),
+    ?assertEqual(
+       {ok, #{run_ids => [<<"page-run-1">>, <<"page-run-2">>],
+              next_cursor => <<"page-run-2">>,
+              has_more => true}},
+       beamtrail_memory_storage:list_run_ids(undefined, 2)),
+    ?assertEqual(
+       {ok, #{run_ids => [<<"page-run-3">>],
+              next_cursor => <<"page-run-3">>,
+              has_more => false}},
+       beamtrail_memory_storage:list_run_ids(<<"page-run-2">>, 2)).
 
 storage_rejects_expected_seq_conflict() ->
     RunId = <<"cas-run-1">>,

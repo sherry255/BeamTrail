@@ -20,6 +20,10 @@
     {ok, map()} | {error, no_lease | stale_fence | term()}.
 -callback read_lease(RunId :: binary()) -> {ok, map()} | not_found.
 -callback list_run_ids() -> [binary()].
+-callback list_run_ids(Cursor :: binary() | undefined, Limit :: pos_integer()) ->
+    {ok, #{run_ids := [binary()],
+           next_cursor := binary() | undefined,
+           has_more := boolean()}}.
 
 %% Optional read-model accessors. Derived from the append-only event log,
 %% never written as the primary source of truth.

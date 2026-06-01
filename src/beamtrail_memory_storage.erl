@@ -3,7 +3,7 @@
 -behaviour(beamtrail_storage).
 
 -export([start_link/0, reset/0]).
--export([append_event/8, read_events/3, events/1, list_run_ids/0]).
+-export([append_event/8, read_events/3, events/1, list_run_ids/0, list_run_ids/2]).
 -export([write_snapshot/4, read_snapshot/1]).
 -export([acquire_lease/3, renew_lease/3, read_lease/1]).
 -export([read_instance/1, read_attempts/1, telemetry_counters/0]).
@@ -33,6 +33,9 @@ events(RunId) ->
 
 list_run_ids() ->
     gen_server:call(?MODULE, list_run_ids).
+
+list_run_ids(Cursor, Limit) ->
+    gen_server:call(?MODULE, {list_run_ids, Cursor, Limit}).
 
 write_snapshot(RunId, State, SnapshotSeq, SnapshotRevision) ->
     gen_server:call(?MODULE,
@@ -117,6 +120,22 @@ handle_call({read_events, RunId, FromSeq, Limit}, _From, State) ->
     {reply, {ok, Result}, State};
 handle_call(list_run_ids, _From, State) ->
     {reply, maps:keys(maps:get(events, State)), State};
+handle_call({list_run_ids, Cursor, Limit}, _From, State) ->
+    All = lists:sort(maps:keys(maps:get(events, State))),
+    AfterCursor = case Cursor of
+                      undefined -> All;
+                      _ -> [RunId || RunId <- All, RunId > Cursor]
+                  end,
+    Page = lists:sublist(AfterCursor, Limit),
+    HasMore = length(AfterCursor) > length(Page),
+    NextCursor = case Page of
+                     [] -> undefined;
+                     _ -> lists:last(Page)
+                 end,
+    {reply, {ok, #{run_ids => Page,
+                   next_cursor => NextCursor,
+                   has_more => HasMore}},
+     State};
 handle_call({write_snapshot, RunId, SnapshotState, SnapshotSeq, SnapshotRevision}, _From, State) ->
     Snapshot =
         #{run_id => RunId,
