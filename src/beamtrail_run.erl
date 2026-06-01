@@ -72,16 +72,15 @@ handle_event(info, {'EXIT', Pid, Reason}, _StateName,
                        clear_step_execution(Data));
 handle_event(info, {'EXIT', _Pid, _Reason}, _StateName, Data) ->
     {keep_state, Data};
-handle_event(info, {lease_heartbeat, Ref}, StateName,
-             #{heartbeat_timer := {Ref, _TRef, _DueAt}} = Data) ->
+handle_event({timeout, lease_heartbeat}, {lease_heartbeat, Ref}, StateName,
+             #{heartbeat_timer := {Ref, _DueAt}} = Data) ->
     renew_lease(StateName, Data#{heartbeat_timer := undefined});
-handle_event(info, {lease_heartbeat, _Ref}, _StateName, Data) ->
+handle_event({timeout, lease_heartbeat}, {lease_heartbeat, _Ref}, _StateName, Data) ->
     {keep_state, Data};
 handle_event(_, _, _StateName, Data) ->
     {keep_state, Data}.
 
 terminate(_, _, Data) ->
-    cancel_timer(maps:get(heartbeat_timer, Data, undefined)),
     cancel_dispatch(maps:get(dispatch, Data, undefined)),
     ok.
 
@@ -116,6 +115,7 @@ start_step_execution(Attempt, ExecSpec, Data0) ->
     Data2 = Data1#{dispatch := {Ref, Pid},
                    attempt := Attempt},
     {next_state, executing, Data2,
+     heartbeat_timeout_action(Data2) ++
      step_timeout_action(maps:get(timeout_ms, ExecSpec, infinity), Ref)}.
 
 handle_step_result(Result, #{run_id := RunId, lease := Lease, attempt := Attempt} = Data)
@@ -150,7 +150,8 @@ schedule_retry_or_dispatch(State, Data) ->
         NextRetryAt when is_integer(NextRetryAt), NextRetryAt > Now ->
             Data1 = set_retry_due(NextRetryAt, Data),
             Data2 = schedule_heartbeat(Data1),
-            {next_state, waiting_retry, Data2, retry_timeout_action(Data2)};
+            {next_state, waiting_retry, Data2,
+             heartbeat_timeout_action(Data2) ++ retry_timeout_action(Data2)};
         _ ->
             schedule_immediate(Data)
     end.
@@ -180,7 +181,8 @@ renew_lease(_StateName, #{run_id := RunId, lease := Lease} = Data)
            RunId, maps:get(fencing_token, Lease),
            beamtrail_lease_manager:default_ttl_ms()) of
         {ok, Renewed} ->
-            {keep_state, schedule_heartbeat(Data#{lease := Renewed})};
+            Data1 = schedule_heartbeat(Data#{lease := Renewed}),
+            {keep_state, Data1, heartbeat_timeout_action(Data1)};
         {error, _} ->
             {stop, normal, Data}
     end;
@@ -197,8 +199,7 @@ schedule_heartbeat(#{lease := Lease} = Data) when is_map(Lease) ->
     Ref = make_ref(),
     Delay = lease_heartbeat_interval_ms(),
     DueAt = erlang:system_time(millisecond) + Delay,
-    TRef = erlang:send_after(Delay, self(), {lease_heartbeat, Ref}),
-    Data1#{heartbeat_timer := {Ref, TRef, DueAt}}.
+    Data1#{heartbeat_timer := {Ref, DueAt}}.
 
 step_timeout_action(infinity, _Ref) ->
     [];
@@ -213,24 +214,20 @@ retry_timeout_action(#{retry_due_at := DueAt}) when is_integer(DueAt) ->
 retry_timeout_action(_Data) ->
     [].
 
+heartbeat_timeout_action(#{heartbeat_timer := {Ref, DueAt}}) when is_integer(DueAt) ->
+    Delay = max(0, DueAt - erlang:system_time(millisecond)),
+    [{{timeout, lease_heartbeat}, Delay, {lease_heartbeat, Ref}}];
+heartbeat_timeout_action(_Data) ->
+    [{{timeout, lease_heartbeat}, cancel}].
+
 clear_retry_due(Data) ->
     Data#{retry_due_at := undefined}.
 
 cancel_heartbeat_timer(Data) ->
-    cancel_timer(maps:get(heartbeat_timer, Data, undefined)),
     Data#{heartbeat_timer := undefined}.
 
 clear_step_execution(Data) ->
     Data#{dispatch := undefined}.
-
-cancel_timer(undefined) ->
-    ok;
-cancel_timer({_Ref, TRef}) ->
-    erlang:cancel_timer(TRef),
-    ok;
-cancel_timer({_Ref, TRef, _DueAt}) ->
-    erlang:cancel_timer(TRef),
-    ok.
 
 cancel_dispatch(undefined) ->
     ok;
@@ -259,12 +256,12 @@ lease_field(undefined, _Key) ->
 lease_field(Lease, Key) when is_map(Lease) ->
     maps:get(Key, Lease, undefined).
 
-timer_due_at({_Ref, _TRef, DueAt}) ->
+timer_due_at({_Ref, DueAt}) ->
     DueAt;
 timer_due_at(_) ->
     undefined.
 
-timer_due_in_ms({_Ref, _TRef, DueAt}) ->
+timer_due_in_ms({_Ref, DueAt}) ->
     max(0, DueAt - erlang:system_time(millisecond));
 timer_due_in_ms(_) ->
     undefined.
