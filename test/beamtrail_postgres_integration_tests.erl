@@ -13,7 +13,8 @@ postgres_integration_test_() ->
              [fun postgres_workflow_survives_application_restart/0,
               fun postgres_recovery_replays_unfinished_attempt_after_restart/0,
               fun postgres_append_locks_only_target_run/0,
-              fun postgres_expected_seq_conflict_is_per_run/0]}
+              fun postgres_expected_seq_conflict_is_per_run/0,
+              fun postgres_rejects_zombie_append_after_fence_takeover/0]}
     end.
 
 setup(Config) ->
@@ -96,6 +97,38 @@ postgres_expected_seq_conflict_is_per_run() ->
     {ok, _} = append_created_event(RunId),
     ?assertMatch({error, {conflict, #{expected_seq := 0, actual_seq := 1}}},
                  append_created_event(RunId)).
+
+postgres_rejects_zombie_append_after_fence_takeover() ->
+    RunId = unique_run_id("pg-zombie-fence"),
+    {ok, _} = beamtrail_postgres_storage:append_event(
+                RunId, 0, undefined,
+                'workflow.instance.created', undefined, undefined,
+                undefined,
+                #{workflow => bt_success_workflow, input => #{},
+                  steps => [charge]}),
+    {ok, Lease1} = beamtrail_postgres_storage:acquire_lease(RunId, worker_a, 30),
+    Fence1 = maps:get(fencing_token, Lease1),
+    {ok, _} = beamtrail_postgres_storage:append_event(
+                RunId, 1, Fence1,
+                'attempt.started', charge, 1,
+                {charge, RunId}, #{attempt => 1}),
+    timer:sleep(40),
+    {ok, Lease2} = beamtrail_postgres_storage:acquire_lease(RunId, worker_b, 1000),
+    Fence2 = maps:get(fencing_token, Lease2),
+    ?assert(Fence2 > Fence1),
+    {ok, _} = beamtrail_postgres_storage:append_event(
+                RunId, 2, Fence2,
+                'recovery.requeued', undefined, undefined,
+                undefined, #{requeued_at => erlang:system_time(millisecond)}),
+    ?assertEqual({error, stale_fence},
+                 beamtrail_postgres_storage:append_event(
+                   RunId, 3, Fence1,
+                   'step.succeeded', charge, 1,
+                   {charge, RunId}, #{result => zombie_late_success})),
+    {ok, Events} = beamtrail_postgres_storage:events(RunId),
+    ?assertEqual(3, length(Events)),
+    ?assertEqual(0, length([E || E <- Events,
+                            maps:get(event_type, E) =:= 'step.succeeded'])).
 
 restart_beamtrail() ->
     ok = stop_beamtrail_runtime(),

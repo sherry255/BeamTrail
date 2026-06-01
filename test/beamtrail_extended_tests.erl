@@ -25,6 +25,7 @@ extended_test_() ->
       fun load_state_ignores_obsolete_snapshot_revision/0,
       fun storage_lists_run_ids_with_cursor/0,
       fun storage_rejects_expected_seq_conflict/0,
+      fun storage_rejects_zombie_append_after_fence_takeover/0,
       fun storage_renews_current_lease_without_changing_fence/0,
       fun storage_refuses_to_renew_expired_lease/0,
       fun dispatch_refuses_when_run_is_leased/0,
@@ -316,6 +317,38 @@ storage_rejects_expected_seq_conflict() ->
                    RunId, 0, undefined,
                    'workflow.completed', undefined, undefined,
                    undefined, #{})).
+
+storage_rejects_zombie_append_after_fence_takeover() ->
+    RunId = <<"zombie-fence-run-1">>,
+    {ok, _} = beamtrail_memory_storage:append_event(
+                RunId, 0, undefined,
+                'workflow.instance.created', undefined, undefined,
+                undefined,
+                #{workflow => bt_success_workflow, input => #{},
+                  steps => [charge]}),
+    {ok, Lease1} = beamtrail_memory_storage:acquire_lease(RunId, worker_a, 30),
+    Fence1 = maps:get(fencing_token, Lease1),
+    {ok, _} = beamtrail_memory_storage:append_event(
+                RunId, 1, Fence1,
+                'attempt.started', charge, 1,
+                {charge, <<"zombie">>}, #{attempt => 1}),
+    timer:sleep(40),
+    {ok, Lease2} = beamtrail_memory_storage:acquire_lease(RunId, worker_b, 1000),
+    Fence2 = maps:get(fencing_token, Lease2),
+    ?assert(Fence2 > Fence1),
+    {ok, _} = beamtrail_memory_storage:append_event(
+                RunId, 2, Fence2,
+                'recovery.requeued', undefined, undefined,
+                undefined, #{requeued_at => erlang:system_time(millisecond)}),
+    ?assertEqual({error, stale_fence},
+                 beamtrail_memory_storage:append_event(
+                   RunId, 3, Fence1,
+                   'step.succeeded', charge, 1,
+                   {charge, <<"zombie">>}, #{result => zombie_late_success})),
+    {ok, Events} = beamtrail_memory_storage:events(RunId),
+    ?assertEqual(3, length(Events)),
+    ?assertEqual(0, length([E || E <- Events,
+                            maps:get(event_type, E) =:= 'step.succeeded'])).
 
 storage_renews_current_lease_without_changing_fence() ->
     RunId = <<"renew-run-1">>,
