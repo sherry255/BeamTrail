@@ -397,12 +397,12 @@ dispatch_refuses_stale_lease_before_replay() ->
                 undefined,
                 #{workflow => bt_success_workflow, input => Input,
                   steps => [charge]}),
-    {ok, Lease} = beamtrail_memory_storage:acquire_lease(RunId, stale_worker, 1),
+    {ok, Lease} = beamtrail_memory_storage:acquire_lease(RunId, stale_worker, 200),
     {ok, _} = beamtrail_memory_storage:append_event(
                 RunId, 1, maps:get(fencing_token, Lease),
                 'attempt.started', charge, 1,
                 {charge, <<"o-stale-lease-1">>}, #{attempt => 1}),
-    timer:sleep(2),
+    ok = wait_until_lease_expired(RunId, 1000),
     ?assertEqual({error, stale_lease}, beamtrail:dispatch(RunId, Lease)),
     ?assertEqual(timeout, receive_exec_short()),
     {ok, Events} = beamtrail:events(RunId),
@@ -699,6 +699,17 @@ wait_for_state(RunId, Target, Remaining) ->
         _ ->
             timer:sleep(20),
             wait_for_state(RunId, Target, Remaining - 20)
+    end.
+
+wait_until_lease_expired(_RunId, Remaining) when Remaining =< 0 ->
+    {error, timeout};
+wait_until_lease_expired(RunId, Remaining) ->
+    {ok, Lease} = beamtrail_memory_storage:read_lease(RunId),
+    case maps:get(lease_until, Lease) =< erlang:system_time(millisecond) of
+        true -> ok;
+        false ->
+            timer:sleep(20),
+            wait_until_lease_expired(RunId, Remaining - 20)
     end.
 
 wait_until_dead(_Pid, Remaining) when Remaining =< 0 ->
