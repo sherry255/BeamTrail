@@ -5,7 +5,7 @@
 %% runner per run on this BEAM node; storage leases and fencing remain the
 %% correctness boundary across node loss or split ownership.
 
--export([start_link/0, dispatch/1, dispatch/2, lookup/1]).
+-export([start_link/0, dispatch/1, dispatch/2, lookup/1, list/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
@@ -20,6 +20,9 @@ dispatch(RunId, Lease) ->
 
 lookup(RunId) ->
     gen_server:call(?MODULE, {lookup, RunId}).
+
+list() ->
+    gen_server:call(?MODULE, list).
 
 init([]) ->
     {ok, #{runs => #{}, refs => #{}}}.
@@ -37,9 +40,14 @@ handle_call({dispatch, RunId, Lease}, _From, State) ->
     end;
 handle_call({lookup, RunId}, _From, State) ->
     case find_live_runner(RunId, State) of
-        {ok, Pid, State1} -> {reply, {ok, Pid}, State1};
+        {ok, Pid, State1} -> {reply, {ok, runner_info(RunId, Pid)}, State1};
         not_found -> {reply, not_found, State}
     end;
+handle_call(list, _From, #{runs := Runs} = State) ->
+    Infos =
+        [runner_info(RunId, Pid) || {RunId, {Pid, _Ref}} <- maps:to_list(Runs),
+                                    is_process_alive(Pid)],
+    {reply, Infos, State};
 handle_call(_, _From, State) ->
     {reply, {error, unknown_call}, State}.
 
@@ -104,4 +112,12 @@ remove_ref(Ref, #{runs := Runs, refs := Refs} = State) ->
                    refs := maps:remove(Ref, Refs)};
         error ->
             State
+    end.
+
+runner_info(RunId, Pid) ->
+    try beamtrail_run:info(Pid) of
+        Info -> Info
+    catch
+        exit:_ ->
+            #{run_id => RunId, pid => Pid, status => unresponsive}
     end.

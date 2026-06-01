@@ -5,7 +5,7 @@
 %% source of truth; this process only keeps the hot path alive between dispatch
 %% calls and retry timers while holding a renewable storage lease.
 
--export([start_link/1, dispatch/1, dispatch/2]).
+-export([start_link/1, dispatch/1, dispatch/2, info/1]).
 -export([callback_mode/0, init/1, handle_event/4, terminate/3, code_change/4]).
 
 start_link(RunId) ->
@@ -18,6 +18,9 @@ dispatch(Pid, undefined) ->
     gen_statem:cast(Pid, dispatch);
 dispatch(Pid, Lease) when is_map(Lease) ->
     gen_statem:cast(Pid, {dispatch, Lease}).
+
+info(Pid) ->
+    gen_statem:call(Pid, info, 1000).
 
 callback_mode() ->
     handle_event_function.
@@ -32,15 +35,18 @@ handle_event(cast, dispatch, _StateName, Data) ->
     run_once(Data);
 handle_event(cast, {dispatch, Lease}, _StateName, Data) ->
     run_once(seed_lease(Lease, Data));
+handle_event({call, From}, info, StateName, Data) ->
+    {next_state, StateName, Data,
+     [{reply, From, info_map(StateName, Data)}]};
 handle_event(internal, dispatch_now, _StateName, Data) ->
     run_once(Data);
 handle_event(info, {retry_due, Ref}, _StateName,
-             #{retry_timer := {Ref, _TRef}} = Data) ->
+             #{retry_timer := {Ref, _TRef, _DueAt}} = Data) ->
     run_once(Data#{retry_timer := undefined});
 handle_event(info, {retry_due, _Ref}, StateName, Data) ->
     {next_state, StateName, Data};
 handle_event(info, {lease_heartbeat, Ref}, StateName,
-             #{heartbeat_timer := {Ref, _TRef}} = Data) ->
+             #{heartbeat_timer := {Ref, _TRef, _DueAt}} = Data) ->
     renew_lease(StateName, Data#{heartbeat_timer := undefined});
 handle_event(info, {lease_heartbeat, _Ref}, StateName, Data) ->
     {next_state, StateName, Data};
@@ -130,17 +136,20 @@ renew_lease(_StateName, Data) ->
 schedule_retry_timer(DelayMs, Data) ->
     Data1 = cancel_retry_timer(Data),
     Ref = make_ref(),
-    TRef = erlang:send_after(max(0, DelayMs), self(), {retry_due, Ref}),
-    Data1#{retry_timer := {Ref, TRef}}.
+    Delay = max(0, DelayMs),
+    DueAt = erlang:system_time(millisecond) + Delay,
+    TRef = erlang:send_after(Delay, self(), {retry_due, Ref}),
+    Data1#{retry_timer := {Ref, TRef, DueAt}}.
 
 schedule_heartbeat(#{lease := undefined} = Data) ->
     Data;
 schedule_heartbeat(#{lease := Lease} = Data) when is_map(Lease) ->
     Data1 = cancel_heartbeat_timer(Data),
     Ref = make_ref(),
-    TRef = erlang:send_after(lease_heartbeat_interval_ms(), self(),
-                             {lease_heartbeat, Ref}),
-    Data1#{heartbeat_timer := {Ref, TRef}}.
+    Delay = lease_heartbeat_interval_ms(),
+    DueAt = erlang:system_time(millisecond) + Delay,
+    TRef = erlang:send_after(Delay, self(), {lease_heartbeat, Ref}),
+    Data1#{heartbeat_timer := {Ref, TRef, DueAt}}.
 
 cancel_retry_timer(Data) ->
     cancel_timer(maps:get(retry_timer, Data, undefined)),
@@ -154,7 +163,37 @@ cancel_timer(undefined) ->
     ok;
 cancel_timer({_Ref, TRef}) ->
     erlang:cancel_timer(TRef),
+    ok;
+cancel_timer({_Ref, TRef, _DueAt}) ->
+    erlang:cancel_timer(TRef),
     ok.
 
 lease_heartbeat_interval_ms() ->
     max(1, min(5000, beamtrail_lease_manager:default_ttl_ms() div 3)).
+
+info_map(StateName, Data) ->
+    Lease = maps:get(lease, Data, undefined),
+    #{run_id => maps:get(run_id, Data),
+      pid => self(),
+      status => StateName,
+      fencing_token => lease_field(Lease, fencing_token),
+      lease_until => lease_field(Lease, lease_until),
+      retry_due_at => timer_due_at(maps:get(retry_timer, Data, undefined)),
+      retry_due_in_ms => timer_due_in_ms(maps:get(retry_timer, Data, undefined)),
+      heartbeat_due_at => timer_due_at(maps:get(heartbeat_timer, Data, undefined)),
+      heartbeat_due_in_ms => timer_due_in_ms(maps:get(heartbeat_timer, Data, undefined))}.
+
+lease_field(undefined, _Key) ->
+    undefined;
+lease_field(Lease, Key) when is_map(Lease) ->
+    maps:get(Key, Lease, undefined).
+
+timer_due_at({_Ref, _TRef, DueAt}) ->
+    DueAt;
+timer_due_at(_) ->
+    undefined.
+
+timer_due_in_ms({_Ref, _TRef, DueAt}) ->
+    max(0, DueAt - erlang:system_time(millisecond));
+timer_due_in_ms(_) ->
+    undefined.

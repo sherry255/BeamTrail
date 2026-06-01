@@ -35,6 +35,8 @@ extended_test_() ->
       fun active_runner_supervisor_rejects_when_pool_full/0,
       fun active_runner_crash_allows_scanner_takeover_after_lease_expiry/0,
       fun active_runner_stops_step_when_lease_heartbeat_fails/0,
+      fun active_runner_registry_exposes_live_state/0,
+      fun query_describe_exposes_active_runner/0,
       fun dispatch_refuses_version_mismatch_without_migration/0,
       fun retry_attempts_preserved_in_chronological_order/0,
       fun storage_adapter_is_application_configurable/0,
@@ -500,6 +502,54 @@ active_runner_stops_step_when_lease_heartbeat_fails() ->
     {ok, Events} = beamtrail:events(RunId),
     ?assertEqual(0, length([E || E <- Events,
                             maps:get(event_type, E) =:= 'step.succeeded'])).
+
+active_runner_registry_exposes_live_state() ->
+    {ok, Registry} = beamtrail_run_registry:start_link(),
+    unlink(Registry),
+    {ok, RunSup} = beamtrail_run_sup:start_link(),
+    unlink(RunSup),
+    Input = #{order_id => <<"o-active-inspect-1">>, test_pid => self()},
+    {ok, RunId} = beamtrail:start_workflow(bt_retry_long_backoff_workflow, Input,
+                                           #{run_id => <<"active-inspect-run-1">>,
+                                             auto_dispatch => false}),
+    {ok, Pid} = beamtrail_run_sup:dispatch(RunId),
+    ?assertMatch({retry_backoff_execute, 1, {charge, <<"o-active-inspect-1">>}},
+                 receive_exec()),
+    ok = wait_for_status(RunId, retrying, 1000),
+    ?assertMatch(
+       {ok, #{run_id := RunId,
+              pid := Pid,
+              status := waiting_retry,
+              fencing_token := 1,
+              retry_due_in_ms := _,
+              heartbeat_due_in_ms := _}},
+       beamtrail_run_registry:lookup(RunId)),
+    ActiveRuns = beamtrail_run_registry:list(),
+    ?assert(lists:any(fun(#{run_id := R}) -> R =:= RunId end, ActiveRuns)).
+
+query_describe_exposes_active_runner() ->
+    {ok, Registry} = beamtrail_run_registry:start_link(),
+    unlink(Registry),
+    {ok, RunSup} = beamtrail_run_sup:start_link(),
+    unlink(RunSup),
+    Input = #{order_id => <<"o-query-active-1">>, test_pid => self()},
+    {ok, RunId} = beamtrail:start_workflow(bt_retry_long_backoff_workflow, Input,
+                                           #{run_id => <<"query-active-run-1">>,
+                                             auto_dispatch => false}),
+    {ok, Pid} = beamtrail_run_sup:dispatch(RunId),
+    ?assertMatch({retry_backoff_execute, 1, {charge, <<"o-query-active-1">>}},
+                 receive_exec()),
+    ok = wait_for_status(RunId, retrying, 1000),
+    Q = beamtrail_query:describe(RunId),
+    ?assertMatch(#{status := waiting_retry,
+                   pid := Pid,
+                   fencing_token := 1,
+                   retry_due_in_ms := _},
+                 maps:get(active_runner, Q)),
+    exit(Pid, kill),
+    ok = wait_until_dead(Pid, 1000),
+    ?assertEqual(#{status => not_found},
+                 maps:get(active_runner, beamtrail_query:describe(RunId))).
 
 dispatch_refuses_version_mismatch_without_migration() ->
     RunId = <<"version-gate-run-1">>,

@@ -73,6 +73,7 @@ describe_loaded_events(RunId, Mod, State, Events) ->
       snapshots => list_snapshots(Snapshot),
       replay_tail_length => TailLen,
       lease => Lease,
+      active_runner => active_runner(RunId),
       recovered_in_ms => Recovered,
       events => Events,
       source_of_truth =>
@@ -122,6 +123,18 @@ snapshot_field(Snapshot, Key, Default) when is_map(Snapshot) ->
 lease_field(undefined, _, Default) -> Default;
 lease_field(Lease, Key, Default) when is_map(Lease) ->
     maps:get(Key, Lease, Default).
+
+active_runner(RunId) ->
+    case whereis(beamtrail_run_registry) of
+        undefined ->
+            #{status => not_found};
+        _ ->
+            case beamtrail_run_registry:lookup(RunId) of
+                {ok, Info} -> Info;
+                not_found -> #{status => not_found};
+                {error, Reason} -> #{status => unknown, error => Reason}
+            end
+    end.
 
 %% Latest-only: the memory adapter exposes a single current snapshot per
 %% run. Real adapters with snapshot history can extend the read model to
