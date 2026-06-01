@@ -103,9 +103,8 @@ ok = beamtrail_postgres_storage:init_schema().
 
 - Use PostgreSQL for durable storage. The memory adapter is useful for local
   development and tests, but it is still process memory.
-- PostgreSQL append uses expected sequence checks and fencing tokens. The
-  current adapter serializes appends with a table lock; narrowing that to
-  per-run contention is the next scalability improvement.
+- PostgreSQL append uses expected sequence checks, fencing tokens, and per-run
+  row locks so different runs can append concurrently.
 - External side effects must be idempotent at the workflow boundary. BeamTrail
   records stable idempotency keys but does not deduplicate calls to outside
   systems.

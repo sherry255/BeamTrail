@@ -13,9 +13,9 @@ append_event(RunId, ExpectedSeq, FencingToken,
              EventType, StepId, StepVersion, IdempotencyKey, Payload) ->
     transaction(
       fun(C) ->
-              append_event_locked(C, RunId, ExpectedSeq, FencingToken,
-                                  EventType, StepId, StepVersion,
-                                  IdempotencyKey, Payload)
+              append_event_with_run_lock(C, RunId, ExpectedSeq, FencingToken,
+                                         EventType, StepId, StepVersion,
+                                         IdempotencyKey, Payload)
       end).
 
 read_events(RunId, FromSeq, infinity) ->
@@ -235,9 +235,9 @@ connect() ->
             {error, postgres_not_configured}
     end.
 
-append_event_locked(C, RunId, ExpectedSeq, FencingToken,
-                    EventType, StepId, StepVersion, IdempotencyKey, Payload) ->
-    case lock_events(C) of
+append_event_with_run_lock(C, RunId, ExpectedSeq, FencingToken,
+                           EventType, StepId, StepVersion, IdempotencyKey, Payload) ->
+    case lock_run(C, RunId) of
         ok ->
             append_event_after_lock(C, RunId, ExpectedSeq, FencingToken,
                                     EventType, StepId, StepVersion,
@@ -279,15 +279,20 @@ append_event_at_expected_seq(C, RunId, ExpectedSeq, FencingToken,
                    "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
                    Params) of
                 {ok, 1} ->
-                    {ok, #{run_id => RunId,
-                           event_seq => EventSeq,
-                           event_type => EventType,
-                           step_id => StepId,
-                           step_version => StepVersion,
-                           idempotency_key => IdempotencyKey,
-                           fencing_token => FencingToken,
-                           payload => Payload,
-                           occurred_at => OccurredAt}};
+                    case touch_run(C, RunId, OccurredAt) of
+                        ok ->
+                            {ok, #{run_id => RunId,
+                                   event_seq => EventSeq,
+                                   event_type => EventType,
+                                   step_id => StepId,
+                                   step_version => StepVersion,
+                                   idempotency_key => IdempotencyKey,
+                                   fencing_token => FencingToken,
+                                   payload => Payload,
+                                   occurred_at => OccurredAt}};
+                        {error, _} = Error ->
+                            Error
+                    end;
                 {error, Reason} ->
                     {error, Reason}
             end;
@@ -295,9 +300,36 @@ append_event_at_expected_seq(C, RunId, ExpectedSeq, FencingToken,
             Error
     end.
 
-lock_events(C) ->
-    case epgsql:squery(C, "LOCK TABLE workflow_events IN EXCLUSIVE MODE") of
-        {ok, _, _} -> ok;
+lock_run(C, RunId) ->
+    Now = now_ms(),
+    case epgsql:equery(
+           C,
+           "INSERT INTO workflow_runs (run_id, created_at_ms, updated_at_ms) "
+           "VALUES ($1,$2,$2) ON CONFLICT (run_id) DO NOTHING",
+           [RunId, Now]) of
+        {ok, _Count} ->
+            select_run_for_update(C, RunId);
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+select_run_for_update(C, RunId) ->
+    case epgsql:equery(
+           C,
+           "SELECT run_id FROM workflow_runs WHERE run_id = $1 FOR UPDATE",
+           [RunId]) of
+        {ok, _Cols, [{RunId}]} -> ok;
+        {ok, _Cols, []} -> {error, run_lock_missing};
+        {error, Reason} -> {error, Reason}
+    end.
+
+touch_run(C, RunId, UpdatedAt) ->
+    case epgsql:equery(
+           C,
+           "UPDATE workflow_runs SET updated_at_ms = $2 WHERE run_id = $1",
+           [RunId, UpdatedAt]) of
+        {ok, 1} -> ok;
+        {ok, 0} -> {error, run_lock_missing};
         {error, Reason} -> {error, Reason}
     end.
 
