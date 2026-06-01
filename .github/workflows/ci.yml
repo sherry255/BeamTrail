@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  eunit:
+    name: EUnit
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Erlang/OTP
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: "28"
+          rebar3-version: "3.27.0"
+
+      - name: Run unit tests
+        run: rebar3 eunit
+
+  postgres:
+    name: PostgreSQL Integration
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: beamtrail
+          POSTGRES_PASSWORD: beamtrail
+          POSTGRES_DB: beamtrail
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U beamtrail -d beamtrail"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+
+    env:
+      BEAMTRAIL_PG_TEST: "1"
+      BEAMTRAIL_PG_HOST: localhost
+      BEAMTRAIL_PG_PORT: "5432"
+      BEAMTRAIL_PG_USER: beamtrail
+      BEAMTRAIL_PG_PASSWORD: beamtrail
+      BEAMTRAIL_PG_DATABASE: beamtrail
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Erlang/OTP
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: "28"
+          rebar3-version: "3.27.0"
+
+      - name: Run PostgreSQL integration tests
+        run: rebar3 eunit
