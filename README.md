@@ -28,7 +28,7 @@ recovery metadata in the event history.
 - Step-version replay for recovery.
 - Lease fencing for dispatch and event writes, including heartbeat
   renewal while a step is running.
-- Cursor-batched recovery scanner and worker supervisor.
+- Cursor-batched recovery scanner and bounded worker supervisor.
 - Query view for events, attempts, snapshots, leases, recovery state,
   and telemetry counters.
 - Configurable storage adapter via the `beamtrail` application
@@ -50,6 +50,14 @@ rebar3 eunit
 ```
 
 Build output is written under `_build/` and ignored by Git.
+
+## Runtime Configuration
+
+Set these application environment values before starting `beamtrail`:
+
+- `storage_adapter`: storage module, default `beamtrail_memory_storage`.
+- `scanner_interval_ms`: recovery scan interval, default `5000`.
+- `worker_max_children`: concurrent dispatch workers, default `64`.
 
 ## Workflow Module
 

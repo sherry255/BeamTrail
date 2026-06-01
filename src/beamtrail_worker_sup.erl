@@ -1,12 +1,14 @@
 -module(beamtrail_worker_sup).
 -behaviour(supervisor).
 
-%% Bounded worker pool for dispatching workflow runs off the scanner's
-%% process. simple_one_for_one: each dispatch spawns a transient
-%% worker that calls `beamtrail:dispatch' and exits. The scanner stays
-%% responsive even if a single run blocks.
+%% Bounded worker supervisor for dispatching workflow runs off the scanner's
+%% process. Each dispatch spawns a temporary worker that calls
+%% `beamtrail:dispatch' and exits. The scanner stays responsive even if a
+%% single run blocks.
 
 -export([start_link/0, init/1, dispatch_async/1, dispatch_async/2]).
+
+-define(DEFAULT_MAX_WORKERS, 64).
 
 start_link() ->
     supervisor:start_link({local, ?MODULE}, ?MODULE, []).
@@ -21,7 +23,20 @@ init([]) ->
     {ok, {{simple_one_for_one, 5, 10}, [Child]}}.
 
 dispatch_async(RunId) ->
-    supervisor:start_child(?MODULE, [RunId]).
+    start_child_bounded([RunId]).
 
 dispatch_async(RunId, Lease) ->
-    supervisor:start_child(?MODULE, [RunId, Lease]).
+    start_child_bounded([RunId, Lease]).
+
+start_child_bounded(Args) ->
+    Active = proplists:get_value(active, supervisor:count_children(?MODULE), 0),
+    case Active >= max_workers() of
+        true -> {error, worker_pool_full};
+        false -> supervisor:start_child(?MODULE, Args)
+    end.
+
+max_workers() ->
+    case application:get_env(beamtrail, worker_max_children) of
+        {ok, N} when is_integer(N), N > 0 -> N;
+        _ -> ?DEFAULT_MAX_WORKERS
+    end.

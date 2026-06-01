@@ -10,6 +10,7 @@ extended_test_() ->
       fun workflow_timeout_emits_workflow_failed/0,
       fun scanner_requeues_unknown_attempts/0,
       fun scanner_scans_one_batch_at_a_time/0,
+      fun worker_supervisor_rejects_when_pool_full/0,
       fun query_describe_exposes_read_model/0,
       fun query_instance_current_step_matches_reducer/0,
       fun telemetry_counters_track_attempts/0,
@@ -41,6 +42,13 @@ cleanup(_) ->
         undefined -> ok;
         _ -> beamtrail_scanner:stop()
     end,
+    case whereis(beamtrail_worker_sup) of
+        undefined -> ok;
+        Pid ->
+            unlink(Pid),
+            exit(Pid, shutdown)
+    end,
+    ok = application:unset_env(beamtrail, worker_max_children),
     ok = beamtrail_memory_storage:reset().
 
 workflow_timeout_emits_workflow_failed() ->
@@ -95,6 +103,25 @@ scanner_scans_one_batch_at_a_time() ->
                                                 batch_size => 1}),
     ?assertEqual({ok, [Run1]}, beamtrail_scanner:scan_now()),
     ?assertEqual({ok, [Run2]}, beamtrail_scanner:scan_now()).
+
+worker_supervisor_rejects_when_pool_full() ->
+    ok = application:set_env(beamtrail, worker_max_children, 1),
+    {ok, Sup} = beamtrail_worker_sup:start_link(),
+    unlink(Sup),
+    Input1 = #{order_id => <<"o-pool-1">>, test_pid => self(),
+               sleep_ms => 200},
+    Input2 = #{order_id => <<"o-pool-2">>, test_pid => self(),
+               sleep_ms => 200},
+    {ok, Run1} = beamtrail:start_workflow(bt_slow_success_workflow, Input1,
+                                          #{run_id => <<"pool-run-1">>,
+                                            auto_dispatch => false}),
+    {ok, Run2} = beamtrail:start_workflow(bt_slow_success_workflow, Input2,
+                                          #{run_id => <<"pool-run-2">>,
+                                            auto_dispatch => false}),
+    ?assertMatch({ok, _}, beamtrail_worker_sup:dispatch_async(Run1)),
+    ?assertEqual({error, worker_pool_full}, beamtrail_worker_sup:dispatch_async(Run2)),
+    ?assertMatch({slow_executed, slow}, receive_exec()),
+    ?assertEqual(timeout, receive_exec_short()).
 
 query_describe_exposes_read_model() ->
     Input = #{order_id => <<"o-q-1">>, test_pid => self()},
