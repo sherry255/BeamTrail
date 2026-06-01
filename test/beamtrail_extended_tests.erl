@@ -371,6 +371,7 @@ load_state_ignores_obsolete_snapshot_revision() ->
 snapshot_schema_contract_pins_revision_to_state_shape() ->
     Schema = beamtrail_state:snapshot_schema(),
     ?assertEqual(beamtrail_state:snapshot_revision(), maps:get(revision, Schema)),
+    ?assertEqual(1, maps:get(schema_version, Schema)),
     BaseKeys = maps:keys(beamtrail_reducer:new()),
     RuntimeKeys = [created_at, migration_required_for_version_change],
     ?assertEqual(lists:sort(BaseKeys ++ RuntimeKeys),

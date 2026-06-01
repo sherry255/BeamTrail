@@ -21,9 +21,14 @@ init([]) ->
                    shutdown => 5000,
                    type => worker,
                    modules => [beamtrail_memory_storage]}];
+            beamtrail_postgres_storage ->
+                [#{id => beamtrail_postgres_pool,
+                   start => {beamtrail_postgres_pool, start_link, []},
+                   restart => permanent,
+                   shutdown => 5000,
+                   type => worker,
+                   modules => [beamtrail_postgres_pool]}];
             _Other ->
-                %% Durable adapters wire their own connection pool /
-                %% supervision; we don't start them ad-hoc here.
                 []
         end,
     Children = StorageChild ++

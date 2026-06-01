@@ -1,8 +1,9 @@
 {application, beamtrail,
  [{description, "Durable workflow runtime for OTP"},
   {vsn, "0.1.0"},
-  {registered, [beamtrail_memory_storage, beamtrail_run_registry,
-                beamtrail_run_sup, beamtrail_scanner]},
+  {registered, [beamtrail_memory_storage, beamtrail_postgres_pool,
+                beamtrail_run_registry, beamtrail_run_sup,
+                beamtrail_scanner]},
   {applications, [kernel, stdlib, epgsql]},
   {mod, {beamtrail_app, []}},
   {env, []}]}.

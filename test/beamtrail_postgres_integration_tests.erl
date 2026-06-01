@@ -14,7 +14,9 @@ postgres_integration_test_() ->
               fun postgres_recovery_replays_unfinished_attempt_after_restart/0,
               fun postgres_append_locks_only_target_run/0,
               fun postgres_expected_seq_conflict_is_per_run/0,
-              fun postgres_rejects_zombie_append_after_fence_takeover/0]}
+              fun postgres_rejects_zombie_append_after_fence_takeover/0,
+              fun postgres_storage_uses_supervised_connection_pool/0,
+              fun postgres_pool_recovers_checked_out_connection_after_owner_death/0]}
     end.
 
 setup(Config) ->
@@ -23,6 +25,7 @@ setup(Config) ->
     ok = application:set_env(beamtrail, storage_adapter,
                              beamtrail_postgres_storage),
     ok = application:set_env(beamtrail, postgres, Config),
+    ok = application:set_env(beamtrail, postgres_pool_size, 2),
     ok = beamtrail_postgres_storage:init_schema(),
     ok = drop_slow_event_trigger(Config),
     ok = truncate_tables(Config),
@@ -33,7 +36,8 @@ cleanup(_) ->
     ok = stop_beamtrail_runtime(),
     ok = application:unset_env(beamtrail, worker_max_children),
     ok = application:unset_env(beamtrail, storage_adapter),
-    ok = application:unset_env(beamtrail, postgres).
+    ok = application:unset_env(beamtrail, postgres),
+    ok = application:unset_env(beamtrail, postgres_pool_size).
 
 postgres_workflow_survives_application_restart() ->
     RunId = unique_run_id("pg-complete"),
@@ -129,6 +133,41 @@ postgres_rejects_zombie_append_after_fence_takeover() ->
     ?assertEqual(3, length(Events)),
     ?assertEqual(0, length([E || E <- Events,
                             maps:get(event_type, E) =:= 'step.succeeded'])).
+
+postgres_storage_uses_supervised_connection_pool() ->
+    Info0 = beamtrail_postgres_pool:info(),
+    ?assertEqual(2, maps:get(size, Info0)),
+    RunId = unique_run_id("pg-pool"),
+    {ok, _} = append_created_event(RunId),
+    {ok, [_]} = beamtrail_postgres_storage:events(RunId),
+    Info1 = beamtrail_postgres_pool:info(),
+    ?assert(maps:get(checkouts, Info1) >= maps:get(checkouts, Info0) + 2),
+    ?assertEqual(2, maps:get(available, Info1)),
+    ?assertEqual(0, maps:get(busy, Info1)).
+
+postgres_pool_recovers_checked_out_connection_after_owner_death() ->
+    Parent = self(),
+    {Pid, Ref} =
+        spawn_monitor(
+          fun() ->
+                  {ok, _C} = beamtrail_postgres_pool:checkout(),
+                  Parent ! {checked_out, self()},
+                  receive stop -> ok end
+          end),
+    receive
+        {checked_out, Pid} -> ok
+    after 1000 ->
+            error(checkout_timeout)
+    end,
+    Info0 = beamtrail_postgres_pool:info(),
+    ?assertEqual(1, maps:get(busy, Info0)),
+    exit(Pid, kill),
+    receive
+        {'DOWN', Ref, process, Pid, killed} -> ok
+    after 1000 ->
+            error(owner_down_timeout)
+    end,
+    ?assertEqual(ok, wait_for_pool_idle(2, 1000)).
 
 restart_beamtrail() ->
     ok = stop_beamtrail_runtime(),
@@ -325,4 +364,15 @@ unique_run_id(Prefix) ->
 receive_exec() ->
     receive Message -> Message
     after 1000 -> timeout
+    end.
+
+wait_for_pool_idle(_Size, Remaining) when Remaining =< 0 ->
+    {error, timeout};
+wait_for_pool_idle(Size, Remaining) ->
+    Info = beamtrail_postgres_pool:info(),
+    case {maps:get(available, Info), maps:get(busy, Info)} of
+        {Size, 0} -> ok;
+        _ ->
+            timer:sleep(20),
+            wait_for_pool_idle(Size, Remaining - 20)
     end.

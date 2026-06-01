@@ -85,11 +85,16 @@ read_snapshot(RunId) ->
                   {ok, _Cols, []} ->
                       not_found;
                   {ok, _Cols, [{Seq, Revision, StateBin, WrittenAt}]} ->
-                      {ok, #{run_id => RunId,
-                             snapshot_seq => Seq,
-                             snapshot_revision => Revision,
-                             state => binary_to_term(StateBin),
-                             written_at => WrittenAt}};
+                      case decode_term(StateBin) of
+                          {ok, SnapshotState} ->
+                              {ok, #{run_id => RunId,
+                                     snapshot_seq => Seq,
+                                     snapshot_revision => Revision,
+                                     state => SnapshotState,
+                                     written_at => WrittenAt}};
+                          {error, _} = Error ->
+                              Error
+                      end;
                   {error, Reason} ->
                       {error, Reason}
               end
@@ -196,6 +201,25 @@ init_schema() ->
       end).
 
 with_connection(Fun) ->
+    case whereis(beamtrail_postgres_pool) of
+        undefined ->
+            with_direct_connection(Fun);
+        _Pid ->
+            with_pooled_connection(Fun)
+    end.
+
+with_pooled_connection(Fun) ->
+    case beamtrail_postgres_pool:checkout() of
+        {ok, C} ->
+            try Fun(C)
+            after
+                beamtrail_postgres_pool:checkin(C)
+            end;
+        {error, _} = Error ->
+            Error
+    end.
+
+with_direct_connection(Fun) ->
     case connect() of
         {ok, C} ->
             try Fun(C)
@@ -227,16 +251,11 @@ transaction(Fun) ->
       end).
 
 connect() ->
-    case application:get_env(beamtrail, postgres) of
-        {ok, Config0} when is_map(Config0) ->
-            Config = maps:merge(#{host => "localhost",
-                                  port => 5432,
-                                  ssl => false,
-                                  timeout => 5000},
-                                Config0),
+    case beamtrail_postgres_config:connection() of
+        {ok, Config} ->
             epgsql:connect(Config);
-        _ ->
-            {error, postgres_not_configured}
+        {error, _} = Error ->
+            Error
     end.
 
 append_event_with_run_lock(C, RunId, ExpectedSeq, FencingToken,
@@ -379,8 +398,13 @@ select_lease(C, RunId, Suffix) ->
         {ok, _Cols, []} ->
             not_found;
         {ok, _Cols, [{OwnerBin, Until, Fence, AcquiredAt, UpdatedAt}]} ->
-            {ok, lease_map(RunId, binary_to_term(OwnerBin), Until, Fence,
-                           AcquiredAt, UpdatedAt)};
+            case decode_term(OwnerBin) of
+                {ok, Owner} ->
+                    {ok, lease_map(RunId, Owner, Until, Fence,
+                                   AcquiredAt, UpdatedAt)};
+                {error, _} = Error ->
+                    Error
+            end;
         {error, Reason} ->
             {error, Reason}
     end.
@@ -427,21 +451,36 @@ lease_map(RunId, Owner, Until, Fence, AcquiredAt, UpdatedAt) ->
       updated_at => UpdatedAt}.
 
 decode_events({ok, _Cols, Rows}, RunId) ->
-    {ok, [decode_event(RunId, Row) || Row <- Rows]};
+    decode_event_rows(Rows, RunId, []);
 decode_events({error, Reason}, _RunId) ->
     {error, Reason}.
 
+decode_event_rows([], _RunId, Acc) ->
+    {ok, lists:reverse(Acc)};
+decode_event_rows([Row | Rest], RunId, Acc) ->
+    case decode_event(RunId, Row) of
+        {ok, Event} -> decode_event_rows(Rest, RunId, [Event | Acc]);
+        {error, _} = Error -> Error
+    end.
+
 decode_event(RunId, {Seq, TypeBin, StepBin, StepVersion,
                      IdempotencyBin, PayloadBin, Fence, OccurredAt}) ->
-    #{run_id => RunId,
-      event_seq => Seq,
-      event_type => binary_to_atom(TypeBin, utf8),
-      step_id => decode_atom(StepBin),
-      step_version => decode_null(StepVersion),
-      idempotency_key => decode_term(IdempotencyBin),
-      payload => binary_to_term(PayloadBin),
-      fencing_token => decode_null(Fence),
-      occurred_at => OccurredAt}.
+    case {decode_term(IdempotencyBin), decode_term(PayloadBin)} of
+        {{ok, IdempotencyKey}, {ok, Payload}} ->
+            {ok, #{run_id => RunId,
+                   event_seq => Seq,
+                   event_type => binary_to_atom(TypeBin, utf8),
+                   step_id => decode_atom(StepBin),
+                   step_version => decode_null(StepVersion),
+                   idempotency_key => IdempotencyKey,
+                   payload => Payload,
+                   fencing_token => decode_null(Fence),
+                   occurred_at => OccurredAt}};
+        {{error, _} = Error, _} ->
+            Error;
+        {_, {error, _} = Error} ->
+            Error
+    end.
 
 nullable_atom(undefined) -> null;
 nullable_atom(Atom) when is_atom(Atom) -> atom_to_binary(Atom, utf8).
@@ -458,8 +497,14 @@ decode_atom(Bin) when is_binary(Bin) -> binary_to_atom(Bin, utf8).
 decode_null(null) -> undefined;
 decode_null(Value) -> Value.
 
-decode_term(null) -> undefined;
-decode_term(Bin) when is_binary(Bin) -> binary_to_term(Bin).
+decode_term(null) ->
+    {ok, undefined};
+decode_term(Bin) when is_binary(Bin) ->
+    try binary_to_term(Bin, [safe]) of
+        Term -> {ok, Term}
+    catch
+        error:badarg -> {error, bad_external_term}
+    end.
 
 next_cursor([]) -> undefined;
 next_cursor(Page) -> lists:last(Page).

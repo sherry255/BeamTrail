@@ -35,6 +35,19 @@ Not in scope yet:
 - Built-in external side-effect deduplication
 - Exactly-once execution of workflow callbacks
 
+## Why BeamTrail
+
+BeamTrail is aimed at Erlang systems that want durable step execution without
+running a separate workflow service. Temporal and Cadence are broader systems:
+they provide service boundaries, SDKs, queues, visibility APIs, and richer
+workflow semantics. BeamTrail keeps the surface smaller and stays inside an OTP
+release.
+
+Oban is a durable job queue for Elixir. BeamTrail is lower level: each run is an
+event stream with replayed state, leases, fencing, snapshots, and supervised
+active runners. It is useful when the workflow history itself is the primary
+artifact, not only a queued job record.
+
 ## Guarantees
 
 With the PostgreSQL adapter, BeamTrail guarantees:
@@ -51,6 +64,12 @@ With the PostgreSQL adapter, BeamTrail guarantees:
 
 BeamTrail does not guarantee exactly-once side effects. Workflow code must use
 the idempotency key in the execution context when it calls external systems.
+
+Retry limits are enforced by persisted events, but they are not crash-atomic
+across the small window between recording `step.failed` and recording the next
+retry or terminal decision. If the VM or node dies in that window, recovery may
+re-enter the failed step. External side effects must therefore be idempotent
+against the stable idempotency key.
 
 ## Quickstart With PostgreSQL
 
@@ -81,6 +100,7 @@ application:set_env(beamtrail, postgres,
                       username => "beamtrail",
                       password => "beamtrail",
                       database => "beamtrail"}).
+application:set_env(beamtrail, postgres_pool_size, 5).
 
 {ok, _} = application:ensure_all_started(epgsql).
 ok = beamtrail_postgres_storage:init_schema().
@@ -170,6 +190,7 @@ Set application environment before starting `beamtrail`:
 
 - `storage_adapter`: storage module, default `beamtrail_memory_storage`
 - `postgres`: PostgreSQL connection map for `beamtrail_postgres_storage`
+- `postgres_pool_size`: supervised PostgreSQL connection pool size, default `5`
 - `scanner_interval_ms`: recovery scan interval, default `5000`
 - `worker_max_children`: concurrent dispatch workers, default `64`
 - `run_max_children`: concurrent active run processes, default `64`

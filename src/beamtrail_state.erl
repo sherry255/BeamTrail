@@ -6,6 +6,7 @@
          snapshot_revision_compatible/1]).
 
 -define(SNAPSHOT_EVERY, 5).
+-define(SNAPSHOT_SCHEMA_VERSION, 1).
 
 snapshot_policy() ->
     #{revision => snapshot_revision(),
@@ -16,7 +17,8 @@ snapshot_schema() ->
     (snapshot_schema_definition())#{revision => snapshot_revision()}.
 
 snapshot_schema_definition() ->
-    #{state_keys =>
+    #{schema_version => ?SNAPSHOT_SCHEMA_VERSION,
+      state_keys =>
           [attempt_counts,
            attempts,
            completed_steps,
@@ -46,7 +48,9 @@ snapshot_revision() ->
 
 snapshot_schema_fingerprint_term() ->
     Schema = snapshot_schema_definition(),
-    {maps:get(state_keys, Schema), maps:get(attempt_keys, Schema)}.
+    {maps:get(schema_version, Schema),
+     maps:get(state_keys, Schema),
+     maps:get(attempt_keys, Schema)}.
 
 load(RunId, Storage) ->
     case Storage:read_snapshot(RunId) of
