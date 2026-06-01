@@ -37,6 +37,7 @@ extended_test_() ->
       fun active_runner_stops_step_when_lease_heartbeat_fails/0,
       fun active_runner_registry_exposes_live_state/0,
       fun query_describe_exposes_active_runner/0,
+      fun active_runner_stays_inspectable_while_step_executes/0,
       fun dispatch_refuses_version_mismatch_without_migration/0,
       fun retry_attempts_preserved_in_chronological_order/0,
       fun storage_adapter_is_application_configurable/0,
@@ -496,7 +497,7 @@ active_runner_stops_step_when_lease_heartbeat_fails() ->
                                            #{run_id => <<"lease-lost-run-1">>,
                                              auto_dispatch => false}),
     {ok, Pid} = beamtrail_run_sup:dispatch(RunId),
-    ?assertMatch({blocking_started, _ExecPid, 1}, receive_exec()),
+    ?assertMatch({blocking_started, ExecPid, 1} when is_pid(ExecPid), receive_exec()),
     ok = wait_until_dead(Pid, 1000),
     ?assertEqual(timeout, receive_exec_short()),
     {ok, Events} = beamtrail:events(RunId),
@@ -550,6 +551,32 @@ query_describe_exposes_active_runner() ->
     ok = wait_until_dead(Pid, 1000),
     ?assertEqual(#{status => not_found},
                  maps:get(active_runner, beamtrail_query:describe(RunId))).
+
+active_runner_stays_inspectable_while_step_executes() ->
+    {ok, Registry} = beamtrail_run_registry:start_link(),
+    unlink(Registry),
+    {ok, RunSup} = beamtrail_run_sup:start_link(),
+    unlink(RunSup),
+    Gate = active_inspect_gate,
+    Input = #{order_id => <<"o-active-executing-1">>, test_pid => self(),
+              gate => Gate},
+    {ok, RunId} = beamtrail:start_workflow(bt_blocking_success_workflow, Input,
+                                           #{run_id => <<"active-executing-run-1">>,
+                                             auto_dispatch => false}),
+    {ok, Pid} = beamtrail_run_sup:dispatch(RunId),
+    {blocking_started, ExecPid, 1} = receive_exec(),
+    StartedAt = erlang:monotonic_time(millisecond),
+    ?assertMatch({ok, #{run_id := RunId,
+                        pid := Pid,
+                        status := executing,
+                        fencing_token := 1}},
+                 beamtrail_run_registry:lookup(RunId)),
+    ?assert(erlang:monotonic_time(millisecond) - StartedAt < 200),
+    Q = beamtrail_query:describe(RunId),
+    ?assertMatch(#{status := executing, pid := Pid},
+                 maps:get(active_runner, Q)),
+    ExecPid ! {Gate, continue},
+    ?assertMatch({ok, #{status := completed}}, wait_for_state(RunId, completed, 1000)).
 
 dispatch_refuses_version_mismatch_without_migration() ->
     RunId = <<"version-gate-run-1">>,
@@ -661,6 +688,17 @@ wait_for_status(RunId, Target, Remaining) ->
         _ ->
             timer:sleep(20),
             wait_for_status(RunId, Target, Remaining - 20)
+    end.
+
+wait_for_state(_RunId, _Target, Remaining) when Remaining =< 0 ->
+    {error, timeout};
+wait_for_state(RunId, Target, Remaining) ->
+    State = beamtrail:get_state(RunId),
+    case maps:get(status, State) of
+        Target -> {ok, State};
+        _ ->
+            timer:sleep(20),
+            wait_for_state(RunId, Target, Remaining - 20)
     end.
 
 wait_until_dead(_Pid, Remaining) when Remaining =< 0 ->

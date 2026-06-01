@@ -26,24 +26,45 @@ callback_mode() ->
     handle_event_function.
 
 init(RunId) ->
+    process_flag(trap_exit, true),
     {ok, idle, #{run_id => RunId,
                  lease => undefined,
                  retry_timer => undefined,
-                 heartbeat_timer => undefined}}.
+                 heartbeat_timer => undefined,
+                 dispatch => undefined}}.
 
+handle_event(cast, dispatch, executing, Data) ->
+    {next_state, executing, Data};
+handle_event(cast, {dispatch, _Lease}, executing, Data) ->
+    {next_state, executing, Data};
 handle_event(cast, dispatch, _StateName, Data) ->
-    run_once(Data);
+    start_dispatch(Data);
 handle_event(cast, {dispatch, Lease}, _StateName, Data) ->
-    run_once(seed_lease(Lease, Data));
+    start_dispatch(seed_lease(Lease, Data));
 handle_event({call, From}, info, StateName, Data) ->
     {next_state, StateName, Data,
      [{reply, From, info_map(StateName, Data)}]};
+handle_event(internal, dispatch_now, executing, Data) ->
+    {next_state, executing, Data};
 handle_event(internal, dispatch_now, _StateName, Data) ->
-    run_once(Data);
+    start_dispatch(Data);
 handle_event(info, {retry_due, Ref}, _StateName,
              #{retry_timer := {Ref, _TRef, _DueAt}} = Data) ->
-    run_once(Data#{retry_timer := undefined});
+    start_dispatch(Data#{retry_timer := undefined});
 handle_event(info, {retry_due, _Ref}, StateName, Data) ->
+    {next_state, StateName, Data};
+handle_event(info, {dispatch_result, Ref, Result}, _StateName,
+             #{dispatch := {Ref, _Pid}} = Data) ->
+    handle_dispatch_result(Result, Data#{dispatch := undefined});
+handle_event(info, {dispatch_result, _Ref, _Result}, StateName, Data) ->
+    {next_state, StateName, Data};
+handle_event(info, {'EXIT', Pid, normal}, StateName,
+             #{dispatch := {_Ref, Pid}} = Data) ->
+    {next_state, StateName, Data};
+handle_event(info, {'EXIT', Pid, _Reason}, _StateName,
+             #{dispatch := {_Ref, Pid}} = Data) ->
+    {stop, normal, Data#{dispatch := undefined}};
+handle_event(info, {'EXIT', _Pid, _Reason}, StateName, Data) ->
     {next_state, StateName, Data};
 handle_event(info, {lease_heartbeat, Ref}, StateName,
              #{heartbeat_timer := {Ref, _TRef, _DueAt}} = Data) ->
@@ -56,24 +77,32 @@ handle_event(_, _, StateName, Data) ->
 terminate(_, _, Data) ->
     cancel_timer(maps:get(retry_timer, Data, undefined)),
     cancel_timer(maps:get(heartbeat_timer, Data, undefined)),
+    cancel_dispatch(maps:get(dispatch, Data, undefined)),
     ok.
 
 code_change(_, StateName, Data, _) ->
     {ok, StateName, Data}.
 
-run_once(Data0) ->
-    Data1 = cancel_retry_timer(Data0),
+start_dispatch(Data0) ->
+    Data1 = cancel_heartbeat_timer(cancel_retry_timer(Data0)),
     case ensure_lease(Data1) of
         {ok, #{run_id := RunId, lease := Lease} = Data2} ->
-            case beamtrail:dispatch(RunId, Lease) of
-                {ok, State} ->
-                    after_dispatch(State, Data2);
-                {error, _Reason} ->
-                    {stop, normal, Data2}
-            end;
+            Ref = make_ref(),
+            Parent = self(),
+            Pid = spawn_link(
+                    fun() ->
+                            Parent ! {dispatch_result, Ref,
+                                      beamtrail:dispatch(RunId, Lease)}
+                    end),
+            {next_state, executing, Data2#{dispatch := {Ref, Pid}}};
         {error, _Reason} ->
             {stop, normal, Data1}
     end.
+
+handle_dispatch_result({ok, State}, Data) ->
+    after_dispatch(State, Data);
+handle_dispatch_result({error, _Reason}, Data) ->
+    {stop, normal, Data}.
 
 after_dispatch(State, Data) ->
     case maps:get(status, State, undefined) of
@@ -168,6 +197,12 @@ cancel_timer({_Ref, TRef, _DueAt}) ->
     erlang:cancel_timer(TRef),
     ok.
 
+cancel_dispatch(undefined) ->
+    ok;
+cancel_dispatch({_Ref, Pid}) when is_pid(Pid) ->
+    exit(Pid, kill),
+    ok.
+
 lease_heartbeat_interval_ms() ->
     max(1, min(5000, beamtrail_lease_manager:default_ttl_ms() div 3)).
 
@@ -178,6 +213,7 @@ info_map(StateName, Data) ->
       status => StateName,
       fencing_token => lease_field(Lease, fencing_token),
       lease_until => lease_field(Lease, lease_until),
+      dispatch_pid => dispatch_pid(maps:get(dispatch, Data, undefined)),
       retry_due_at => timer_due_at(maps:get(retry_timer, Data, undefined)),
       retry_due_in_ms => timer_due_in_ms(maps:get(retry_timer, Data, undefined)),
       heartbeat_due_at => timer_due_at(maps:get(heartbeat_timer, Data, undefined)),
@@ -196,4 +232,9 @@ timer_due_at(_) ->
 timer_due_in_ms({_Ref, _TRef, DueAt}) ->
     max(0, DueAt - erlang:system_time(millisecond));
 timer_due_in_ms(_) ->
+    undefined.
+
+dispatch_pid({_Ref, Pid}) ->
+    Pid;
+dispatch_pid(_) ->
     undefined.
