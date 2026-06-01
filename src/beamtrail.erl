@@ -52,24 +52,31 @@ start_workflow_dispatch(RunId, Options) ->
 
 dispatch(RunId) ->
     ok = ensure_storage(),
-    State = get_state(RunId),
-    case maps:get(status, State) of
-        completed ->
-            {ok, State};
-        failed ->
-            case maps:get(terminal, State, false) of
-                true -> {ok, State};
-                false -> dispatch_with_new_lease(RunId, State)
+    case load_state(RunId) of
+        {ok, State} ->
+            case maps:get(status, State) of
+                completed ->
+                    {ok, State};
+                failed ->
+                    case maps:get(terminal, State, false) of
+                        true -> {ok, State};
+                        false -> dispatch_with_new_lease(RunId, State)
+                    end;
+                retrying ->
+                    dispatch_retrying(RunId, State, none);
+                _ ->
+                    dispatch_with_new_lease(RunId, State)
             end;
-        retrying ->
-            dispatch_retrying(RunId, State, none);
-        _ ->
-            dispatch_with_new_lease(RunId, State)
+        {error, _} = Error ->
+            Error
     end.
 
 dispatch(RunId, Lease) when is_map(Lease) ->
     ok = ensure_storage(),
-    dispatch_locked(RunId, get_state(RunId), Lease).
+    case load_state(RunId) of
+        {ok, State} -> dispatch_locked(RunId, State, Lease);
+        {error, _} = Error -> Error
+    end.
 
 recover_unfinished() ->
     ok = ensure_storage(),
@@ -83,18 +90,34 @@ recover_unfinished() ->
     end.
 
 get_state(RunId) ->
+    case load_state(RunId) of
+        {ok, State} -> State;
+        {error, _} = Error -> Error
+    end.
+
+load_state(RunId) ->
     ok = ensure_storage(),
-    State =
-        case (storage()):read_snapshot(RunId) of
-            {ok, Snapshot} ->
-                SnapshotSeq = maps:get(snapshot_seq, Snapshot),
-                {ok, TailEvents} = (storage()):read_events(RunId, SnapshotSeq + 1, infinity),
-                beamtrail_reducer:from_snapshot_and_events(maps:get(state, Snapshot), TailEvents);
-            not_found ->
-                {ok, Events} = (storage()):events(RunId),
-                beamtrail_reducer:from_events(Events)
-        end,
-    enrich_version_migration(State).
+    case (storage()):read_snapshot(RunId) of
+        {ok, Snapshot} ->
+            SnapshotSeq = maps:get(snapshot_seq, Snapshot),
+            case (storage()):read_events(RunId, SnapshotSeq + 1, infinity) of
+                {ok, TailEvents} ->
+                    State = beamtrail_reducer:from_snapshot_and_events(
+                              maps:get(state, Snapshot), TailEvents),
+                    {ok, enrich_version_migration(State)};
+                {error, _} = Error ->
+                    Error
+            end;
+        not_found ->
+            case (storage()):events(RunId) of
+                {ok, Events} ->
+                    {ok, enrich_version_migration(beamtrail_reducer:from_events(Events))};
+                {error, _} = Error ->
+                    Error
+            end;
+        {error, _} = Error ->
+            Error
+    end.
 
 events(RunId) ->
     ok = ensure_storage(),
@@ -103,7 +126,10 @@ events(RunId) ->
 dispatch_with_new_lease(RunId, _State) ->
     case (storage()):acquire_lease(RunId, dispatch_owner(), ?LEASE_TTL_MS) of
         {ok, Lease} ->
-            dispatch_locked(RunId, get_state(RunId), Lease);
+            case load_state(RunId) of
+                {ok, State} -> dispatch_locked(RunId, State, Lease);
+                {error, _} = Error -> Error
+            end;
         {error, leased} ->
             {error, leased};
         {error, _} = Error ->

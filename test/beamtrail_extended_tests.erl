@@ -16,6 +16,9 @@ extended_test_() ->
       fun query_instance_current_step_matches_reducer/0,
       fun telemetry_counters_track_attempts/0,
       fun postgres_stub_is_loud_about_not_implemented/0,
+      fun get_state_returns_storage_error/0,
+      fun dispatch_returns_storage_error/0,
+      fun query_describe_returns_storage_error/0,
       fun recover_unfinished_returns_storage_error/0,
       fun recovery_marker_returns_storage_error/0,
       fun storage_lists_run_ids_with_cursor/0,
@@ -203,6 +206,24 @@ postgres_stub_is_loud_about_not_implemented() ->
     ?assertEqual({error, not_implemented},
                  beamtrail_postgres_storage:list_run_ids(undefined, 10)),
     ?assertEqual(not_found, beamtrail_postgres_storage:read_lease(<<"r">>)).
+
+get_state_returns_storage_error() ->
+    ok = application:set_env(beamtrail, storage_adapter,
+                             beamtrail_postgres_storage),
+    ?assertEqual({error, not_implemented},
+                 beamtrail:get_state(<<"state-error-run">>)).
+
+dispatch_returns_storage_error() ->
+    ok = application:set_env(beamtrail, storage_adapter,
+                             beamtrail_postgres_storage),
+    ?assertEqual({error, not_implemented},
+                 beamtrail:dispatch(<<"dispatch-error-run">>)).
+
+query_describe_returns_storage_error() ->
+    ok = application:set_env(beamtrail, storage_adapter,
+                             beamtrail_postgres_storage),
+    ?assertEqual({error, not_implemented},
+                 beamtrail_query:describe(<<"query-error-run">>)).
 
 recover_unfinished_returns_storage_error() ->
     ok = application:set_env(beamtrail, storage_adapter,

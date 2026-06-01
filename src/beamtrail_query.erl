@@ -23,12 +23,27 @@ telemetry() ->
 
 describe(RunId) ->
     Mod = beamtrail:storage(),
-    State = beamtrail:get_state(RunId),
-    {ok, Events} = beamtrail:events(RunId),
+    case beamtrail:get_state(RunId) of
+        {error, _} = Error ->
+            Error;
+        State ->
+            describe_loaded(RunId, Mod, State)
+    end.
+
+describe_loaded(RunId, Mod, State) ->
+    case beamtrail:events(RunId) of
+        {ok, Events} ->
+            describe_loaded_events(RunId, Mod, State, Events);
+        {error, _} = Error ->
+            Error
+    end.
+
+describe_loaded_events(RunId, Mod, State, Events) ->
     Snapshot =
         case Mod:read_snapshot(RunId) of
             {ok, S} -> S;
-            not_found -> undefined
+            not_found -> undefined;
+            {error, _} -> undefined
         end,
     Lease =
         case Mod:read_lease(RunId) of
