@@ -3,7 +3,7 @@
 -behaviour(beamtrail_storage).
 
 -export([start_link/0, reset/0]).
--export([append_event/6, read_events/3, events/1, list_run_ids/0]).
+-export([append_event/8, read_events/3, events/1, list_run_ids/0]).
 -export([write_snapshot/4, read_snapshot/1]).
 -export([acquire_lease/3, read_lease/1]).
 -export([read_instance/1, read_attempts/1, telemetry_counters/0]).
@@ -19,9 +19,11 @@ start_link() ->
 reset() ->
     gen_server:call(?MODULE, reset).
 
-append_event(RunId, EventType, StepId, StepVersion, IdempotencyKey, Payload) ->
+append_event(RunId, ExpectedSeq, FencingToken,
+             EventType, StepId, StepVersion, IdempotencyKey, Payload) ->
     gen_server:call(?MODULE,
-        {append_event, RunId, EventType, StepId, StepVersion, IdempotencyKey, Payload}).
+        {append_event, RunId, ExpectedSeq, FencingToken,
+         EventType, StepId, StepVersion, IdempotencyKey, Payload}).
 
 read_events(RunId, FromSeq, Limit) ->
     gen_server:call(?MODULE, {read_events, RunId, FromSeq, Limit}).
@@ -70,22 +72,37 @@ empty_state() ->
 
 handle_call(reset, _From, _State) ->
     {reply, ok, empty_state()};
-handle_call({append_event, RunId, EventType, StepId, StepVersion, IdempotencyKey, Payload}, _From, State) ->
+handle_call({append_event, RunId, ExpectedSeq, FencingToken,
+             EventType, StepId, StepVersion, IdempotencyKey, Payload}, _From, State) ->
     EventsByRun = maps:get(events, State),
     RunEvents = maps:get(RunId, EventsByRun, []),
-    EventSeq = length(RunEvents) + 1,
-    Event =
-        #{run_id => RunId,
-          event_seq => EventSeq,
-          event_type => EventType,
-          step_id => StepId,
-          step_version => StepVersion,
-          idempotency_key => IdempotencyKey,
-          payload => Payload,
-          occurred_at => erlang:system_time(millisecond)},
-    State1 = State#{events := maps:put(RunId, RunEvents ++ [Event], EventsByRun)},
-    State2 = project_event(State1, Event),
-    {reply, {ok, Event}, State2};
+    ActualSeq = length(RunEvents),
+    case ExpectedSeq =:= ActualSeq of
+        false ->
+            {reply, {error, {conflict, #{expected_seq => ExpectedSeq,
+                                         actual_seq => ActualSeq}}},
+             State};
+        true ->
+            case validate_fencing(RunId, EventType, FencingToken, State) of
+                ok ->
+                    EventSeq = ActualSeq + 1,
+                    Event =
+                        #{run_id => RunId,
+                          event_seq => EventSeq,
+                          event_type => EventType,
+                          step_id => StepId,
+                          step_version => StepVersion,
+                          idempotency_key => IdempotencyKey,
+                          fencing_token => FencingToken,
+                          payload => Payload,
+                          occurred_at => erlang:system_time(millisecond)},
+                    State1 = State#{events := maps:put(RunId, RunEvents ++ [Event], EventsByRun)},
+                    State2 = project_event(State1, Event),
+                    {reply, {ok, Event}, State2};
+                {error, _} = Error ->
+                    {reply, Error, State}
+            end
+    end;
 handle_call({read_events, RunId, FromSeq, Limit}, _From, State) ->
     RunEvents = maps:get(RunId, maps:get(events, State), []),
     Tail = [E || E <- RunEvents, maps:get(event_seq, E) >= FromSeq],
@@ -177,6 +194,28 @@ lease_available(Lease, Now) -> maps:get(lease_until, Lease) =< Now.
 
 next_fencing_token(undefined) -> 1;
 next_fencing_token(Lease) -> maps:get(fencing_token, Lease) + 1.
+
+validate_fencing(_RunId, 'workflow.instance.created', undefined, _State) ->
+    ok;
+validate_fencing(_RunId, 'recovery.skipped', undefined, _State) ->
+    ok;
+validate_fencing(RunId, _EventType, FencingToken, State) when is_integer(FencingToken) ->
+    Now = erlang:system_time(millisecond),
+    case maps:get(RunId, maps:get(leases, State), undefined) of
+        undefined ->
+            {error, no_lease};
+        #{lease_until := LeaseUntil} when LeaseUntil =< Now ->
+            {error, lease_expired};
+        #{fencing_token := FencingToken} ->
+            ok;
+        #{fencing_token := Current} when FencingToken < Current ->
+            {error, stale_fence};
+        #{fencing_token := Current} ->
+            {error, {invalid_fence, #{provided => FencingToken,
+                                      current => Current}}}
+    end;
+validate_fencing(_RunId, _EventType, undefined, _State) ->
+    {error, missing_fence}.
 
 %%% Read-model projection. Derived from events; never the primary write.
 project_event(State, Event) ->

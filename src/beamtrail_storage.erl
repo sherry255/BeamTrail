@@ -1,6 +1,8 @@
 -module(beamtrail_storage).
 
 -callback append_event(RunId :: binary(),
+                       ExpectedSeq :: non_neg_integer(),
+                       FencingToken :: pos_integer() | undefined,
                        EventType :: atom(),
                        StepId :: atom() | undefined,
                        StepVersion :: non_neg_integer() | undefined,

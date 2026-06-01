@@ -1,9 +1,9 @@
 -module(beamtrail).
 
 -export([start/0, stop/0]).
--export([start_workflow/2, start_workflow/3, dispatch/1, recover_unfinished/0]).
+-export([start_workflow/2, start_workflow/3, dispatch/1, dispatch/2, recover_unfinished/0]).
 -export([get_state/1, events/1, storage/0]).
--export([list_recoverable/0, mark_recovery_requeued/1]).
+-export([list_recoverable/0, mark_recovery_requeued/1, mark_recovery_requeued_with_lease/1]).
 
 -define(STORAGE_DEFAULT, beamtrail_memory_storage).
 -define(LEASE_TTL_MS, 30000).
@@ -25,6 +25,8 @@ start_workflow(Workflow, Input, Options) ->
     {ok, _Event} =
         (storage()):append_event(
           RunId,
+          0,
+          undefined,
           'workflow.instance.created',
           undefined,
           undefined,
@@ -48,13 +50,17 @@ dispatch(RunId) ->
         failed ->
             case maps:get(terminal, State, false) of
                 true -> {ok, State};
-                false -> dispatch_ready(RunId, State)
+                false -> dispatch_with_new_lease(RunId, State)
             end;
         retrying ->
-            dispatch_retrying(RunId, State);
+            dispatch_retrying(RunId, State, none);
         _ ->
-            dispatch_ready(RunId, State)
+            dispatch_with_new_lease(RunId, State)
     end.
+
+dispatch(RunId, Lease) when is_map(Lease) ->
+    ok = ensure_storage(),
+    dispatch_locked(RunId, get_state(RunId), Lease).
 
 recover_unfinished() ->
     ok = ensure_storage(),
@@ -81,23 +87,50 @@ events(RunId) ->
     ok = ensure_storage(),
     (storage()):events(RunId).
 
-dispatch_retrying(RunId, State) ->
+dispatch_with_new_lease(RunId, _State) ->
+    case (storage()):acquire_lease(RunId, dispatch_owner(), ?LEASE_TTL_MS) of
+        {ok, Lease} ->
+            dispatch_locked(RunId, get_state(RunId), Lease);
+        {error, leased} ->
+            {error, leased};
+        {error, _} = Error ->
+            Error
+    end.
+
+dispatch_locked(RunId, State, Lease) ->
+    case lease_current(RunId, Lease) of
+        false ->
+            {error, stale_lease};
+        true ->
+            case maps:get(migration_required_for_version_change, State, false) of
+                true ->
+                    {error, {migration_required, State}};
+                false ->
+                    dispatch_ready(RunId, State, Lease)
+            end
+    end.
+
+dispatch_retrying(RunId, State, Lease) ->
     Now = erlang:system_time(millisecond),
     case maps:get(next_retry_at, State, 0) =< Now of
-        true -> dispatch_ready(RunId, State);
+        true ->
+            case Lease of
+                none -> dispatch_with_new_lease(RunId, State);
+                _ -> dispatch_locked(RunId, State, Lease)
+            end;
         false -> {ok, State}
     end.
 
-dispatch_ready(RunId, State) ->
+dispatch_ready(RunId, State, Lease) ->
     case workflow_timeout_exceeded(State) of
         true ->
-            fail_workflow_with_timeout(RunId, State);
+            fail_workflow_with_timeout(RunId, State, Lease);
         false ->
             case maps:get(current_step, State) of
                 undefined ->
-                    complete_if_needed(RunId, State);
+                    complete_if_needed(RunId, State, Lease);
                 StepId ->
-                    run_step(RunId, State, StepId)
+                    run_step(RunId, State, StepId, Lease)
             end
     end.
 
@@ -126,77 +159,96 @@ workflow_timeout_ms(Workflow) ->
             infinity
     end.
 
-fail_workflow_with_timeout(RunId, State) ->
+fail_workflow_with_timeout(RunId, State, Lease) ->
     StepId = maps:get(current_step, State),
     Payload = #{reason => workflow_timeout,
                 class => workflow_timeout,
                 created_at => maps:get(created_at, State, undefined),
                 failed_at => erlang:system_time(millisecond)},
-    {ok, _} = (storage()):append_event(RunId, 'workflow.failed', StepId,
-                                    undefined, undefined, Payload),
-    maybe_snapshot(RunId, true),
-    {ok, get_state(RunId)}.
+    case append_event(RunId, maps:get(last_event_seq, State, 0), Lease,
+                      'workflow.failed', StepId, undefined, undefined, Payload) of
+        {ok, _} ->
+            maybe_snapshot(RunId, true),
+            {ok, get_state(RunId)};
+        {error, _} = Error ->
+            Error
+    end.
 
-complete_if_needed(RunId, State) ->
+complete_if_needed(RunId, State, Lease) ->
     case maps:get(status, State) of
         completed ->
             {ok, State};
         _ ->
-            {ok, _Event} =
-                (storage()):append_event(
-                  RunId,
-                  'workflow.completed',
-                  undefined,
-                  undefined,
-                  undefined,
-                  #{completed_at => erlang:system_time(millisecond)}),
-            maybe_snapshot(RunId, true),
-            {ok, get_state(RunId)}
+            case append_event(
+                   RunId,
+                   maps:get(last_event_seq, State, 0),
+                   Lease,
+                   'workflow.completed',
+                   undefined,
+                   undefined,
+                   undefined,
+                   #{completed_at => erlang:system_time(millisecond)}) of
+                {ok, _Event} ->
+                    maybe_snapshot(RunId, true),
+                    {ok, get_state(RunId)};
+                {error, _} = Error ->
+                    Error
+            end
     end.
 
-run_step(RunId, State, StepId) ->
+run_step(RunId, State, StepId, Lease) ->
     Workflow = maps:get(workflow, State),
     Input = maps:get(input, State),
-    {Attempt, StartedNow} = ensure_attempt_started(RunId, Workflow, Input, State, StepId),
-    case StartedNow of
-        true ->
-            beamtrail_telemetry:execute([beamtrail, attempt, started], #{count => 1},
-                                        #{run_id => RunId, step_id => StepId});
-        false ->
-            ok
-    end,
-    Result = execute_attempt(RunId, Workflow, Input, Attempt),
-    case Result of
-        {ok, Value} ->
-            handle_step_success(RunId, State, Attempt, Value);
-        {error, Reason} ->
-            handle_step_failure(RunId, State, Attempt, Reason)
+    case ensure_attempt_started(RunId, Workflow, Input, State, StepId, Lease) of
+        {ok, Attempt, StartedNow} ->
+            case StartedNow of
+                true ->
+                    beamtrail_telemetry:execute([beamtrail, attempt, started], #{count => 1},
+                                                #{run_id => RunId, step_id => StepId});
+                false ->
+                    ok
+            end,
+            Result = execute_attempt(RunId, Workflow, Input, Attempt),
+            case Result of
+                {ok, Value} ->
+                    handle_step_success(RunId, Attempt, Value, Lease);
+                {error, Reason} ->
+                    handle_step_failure(RunId, Attempt, Reason, Lease)
+            end;
+        {error, _} = Error ->
+            Error
     end.
 
-ensure_attempt_started(RunId, Workflow, Input, State, StepId) ->
+ensure_attempt_started(RunId, Workflow, Input, State, StepId, Lease) ->
     case maps:get(pending_attempt, State, undefined) of
         #{step_id := StepId} = Attempt ->
-            {Attempt, false};
+            {ok, Attempt, false};
         _ ->
             AttemptNo = maps:get(StepId, maps:get(attempt_counts, State), 0) + 1,
             StepVersion = Workflow:step_version(StepId),
             IdempotencyKey = Workflow:idempotency_key(RunId, StepId, Input),
-            {ok, Event} =
-                (storage()):append_event(
-                  RunId,
-                  'attempt.started',
-                  StepId,
-                  StepVersion,
-                  IdempotencyKey,
-                  #{attempt => AttemptNo, owner_node => node()}),
-            maybe_snapshot(RunId, false),
-            {#{step_id => StepId,
-               step_version => StepVersion,
-               idempotency_key => IdempotencyKey,
-               attempt => AttemptNo,
-               started_event_seq => maps:get(event_seq, Event),
-               status => unknown},
-             true}
+            case append_event(
+                   RunId,
+                   maps:get(last_event_seq, State, 0),
+                   Lease,
+                   'attempt.started',
+                   StepId,
+                   StepVersion,
+                   IdempotencyKey,
+                   #{attempt => AttemptNo, owner_node => dispatch_owner()}) of
+                {ok, Event} ->
+                    maybe_snapshot(RunId, false),
+                    {ok,
+                     #{step_id => StepId,
+                       step_version => StepVersion,
+                       idempotency_key => IdempotencyKey,
+                       attempt => AttemptNo,
+                       started_event_seq => maps:get(event_seq, Event),
+                       status => unknown},
+                     true};
+                {error, _} = Error ->
+                    Error
+            end
     end.
 
 execute_attempt(RunId, Workflow, Input, Attempt) ->
@@ -235,41 +287,64 @@ run_with_timeout(Fun, TimeoutMs) when is_integer(TimeoutMs), TimeoutMs >= 0 ->
         {error, timeout}
     end.
 
-handle_step_success(RunId, _State, Attempt, Value) ->
+handle_step_success(RunId, Attempt, Value, Lease) ->
     StepId = maps:get(step_id, Attempt),
-    {ok, _Event} =
-        (storage()):append_event(
-          RunId,
-          'step.succeeded',
-          StepId,
-          maps:get(step_version, Attempt),
-          maps:get(idempotency_key, Attempt),
-          #{result => Value}),
-    maybe_snapshot(RunId, false),
-    dispatch(RunId).
-
-handle_step_failure(RunId, State, Attempt, Reason) ->
-    StepId = maps:get(step_id, Attempt),
-    FailurePayload = #{reason => Reason, class => error_key(Reason), attempt => maps:get(attempt, Attempt)},
-    {ok, _FailedEvent} =
-        (storage()):append_event(
-          RunId,
-          'step.failed',
-          StepId,
-          maps:get(step_version, Attempt),
-          maps:get(idempotency_key, Attempt),
-          FailurePayload),
-    maybe_snapshot(RunId, false),
-    Workflow = maps:get(workflow, State),
-    Policy = Workflow:retry_policy(StepId),
-    case should_retry(Policy, Reason, maps:get(attempt, Attempt)) of
-        true ->
-            schedule_retry(RunId, State, Attempt, Reason, Policy);
-        false ->
-            fail_workflow(RunId, Attempt, FailurePayload)
+    case pending_attempt_expected_seq(RunId, Attempt) of
+        {ok, ExpectedSeq} ->
+            case append_event(
+                   RunId,
+                   ExpectedSeq,
+                   Lease,
+                   'step.succeeded',
+                   StepId,
+                   maps:get(step_version, Attempt),
+                   maps:get(idempotency_key, Attempt),
+                   #{result => Value}) of
+                {ok, _Event} ->
+                    maybe_snapshot(RunId, false),
+                    dispatch_locked(RunId, get_state(RunId), Lease);
+                {error, _} = Error ->
+                    Error
+            end;
+        {error, _} = Error ->
+            Error
     end.
 
-schedule_retry(RunId, _State, Attempt, Reason, Policy) ->
+handle_step_failure(RunId, Attempt, Reason, Lease) ->
+    StepId = maps:get(step_id, Attempt),
+    FailurePayload = #{reason => Reason, class => error_key(Reason), attempt => maps:get(attempt, Attempt)},
+    case pending_attempt_expected_seq(RunId, Attempt) of
+        {ok, ExpectedSeq} ->
+            case append_event(
+                   RunId,
+                   ExpectedSeq,
+                   Lease,
+                   'step.failed',
+                   StepId,
+                   maps:get(step_version, Attempt),
+                   maps:get(idempotency_key, Attempt),
+                   FailurePayload) of
+                {ok, FailedEvent} ->
+                    maybe_snapshot(RunId, false),
+                    State = get_state(RunId),
+                    Workflow = maps:get(workflow, State),
+                    Policy = Workflow:retry_policy(StepId),
+                    case should_retry(Policy, Reason, maps:get(attempt, Attempt)) of
+                        true ->
+                            schedule_retry(RunId, Attempt, Reason, Policy, Lease,
+                                           maps:get(event_seq, FailedEvent));
+                        false ->
+                            fail_workflow(RunId, Attempt, FailurePayload, Lease,
+                                          maps:get(event_seq, FailedEvent))
+                    end;
+                {error, _} = Error ->
+                    Error
+            end;
+        {error, _} = Error ->
+            Error
+    end.
+
+schedule_retry(RunId, Attempt, Reason, Policy, Lease, ExpectedSeq) ->
     StepId = maps:get(step_id, Attempt),
     BackoffMs = maps:get(backoff_ms, Policy, 0),
     NextRetryAt = erlang:system_time(millisecond) + BackoffMs,
@@ -278,33 +353,43 @@ schedule_retry(RunId, _State, Attempt, Reason, Policy) ->
           class => error_key(Reason),
           attempt => maps:get(attempt, Attempt),
           next_retry_at => NextRetryAt},
-    {ok, _RetryEvent} =
-        (storage()):append_event(
-          RunId,
-          'retry.scheduled',
-          StepId,
-          maps:get(step_version, Attempt),
-          maps:get(idempotency_key, Attempt),
-          Payload),
-    beamtrail_telemetry:execute([beamtrail, retry, scheduled], #{count => 1},
-                                #{run_id => RunId, step_id => StepId, next_retry_at => NextRetryAt}),
-    maybe_snapshot(RunId, false),
-    case BackoffMs of
-        0 -> dispatch(RunId);
-        _ -> {ok, get_state(RunId)}
+    case append_event(
+           RunId,
+           ExpectedSeq,
+           Lease,
+           'retry.scheduled',
+           StepId,
+           maps:get(step_version, Attempt),
+           maps:get(idempotency_key, Attempt),
+           Payload) of
+        {ok, _RetryEvent} ->
+            beamtrail_telemetry:execute([beamtrail, retry, scheduled], #{count => 1},
+                                        #{run_id => RunId, step_id => StepId, next_retry_at => NextRetryAt}),
+            maybe_snapshot(RunId, false),
+            case BackoffMs of
+                0 -> dispatch_retrying(RunId, get_state(RunId), Lease);
+                _ -> {ok, get_state(RunId)}
+            end;
+        {error, _} = Error ->
+            Error
     end.
 
-fail_workflow(RunId, Attempt, FailurePayload) ->
-    {ok, _FailedEvent} =
-        (storage()):append_event(
-          RunId,
-          'workflow.failed',
-          maps:get(step_id, Attempt),
-          maps:get(step_version, Attempt),
-          maps:get(idempotency_key, Attempt),
-          FailurePayload),
-    maybe_snapshot(RunId, true),
-    {ok, get_state(RunId)}.
+fail_workflow(RunId, Attempt, FailurePayload, Lease, ExpectedSeq) ->
+    case append_event(
+           RunId,
+           ExpectedSeq,
+           Lease,
+           'workflow.failed',
+           maps:get(step_id, Attempt),
+           maps:get(step_version, Attempt),
+           maps:get(idempotency_key, Attempt),
+           FailurePayload) of
+        {ok, _FailedEvent} ->
+            maybe_snapshot(RunId, true),
+            {ok, get_state(RunId)};
+        {error, _} = Error ->
+            Error
+    end.
 
 should_retry(Policy, Reason, AttemptNo) ->
     MaxAttempts = maps:get(max_attempts, Policy, 1),
@@ -322,11 +407,17 @@ recover_if_unfinished(RunId) ->
     State = get_state(RunId),
     case recoverable(State) of
         true ->
-            case mark_recovery_requeued(RunId) of
-                {ok, requeued} ->
-                    {ok, _RecoveredState} = dispatch(RunId),
-                    maybe_snapshot(RunId, true),
-                    true;
+            case mark_recovery_requeued_with_lease(RunId) of
+                {ok, {requeued, Lease}} ->
+                    case dispatch(RunId, Lease) of
+                        {ok, _RecoveredState} ->
+                            maybe_snapshot(RunId, true),
+                            true;
+                        {error, {migration_required, _}} ->
+                            false;
+                        {error, _} ->
+                            false
+                    end;
                 {ok, skipped} ->
                     false
             end;
@@ -343,10 +434,16 @@ list_recoverable() ->
 %% event to the log so the scanner's decision is observable in the inspector,
 %% not only via telemetry counters. Idempotent on lease contention.
 mark_recovery_requeued(RunId) ->
+    case mark_recovery_requeued_with_lease(RunId) of
+        {ok, {requeued, _Lease}} -> {ok, requeued};
+        Other -> Other
+    end.
+
+mark_recovery_requeued_with_lease(RunId) ->
     ok = ensure_storage(),
     Mod = storage(),
     {EventType, LeaseInfo} =
-        case Mod:acquire_lease(RunId, node(), ?LEASE_TTL_MS) of
+        case Mod:acquire_lease(RunId, dispatch_owner(), ?LEASE_TTL_MS) of
             {ok, Lease} -> {'recovery.requeued', Lease};
             {error, leased} ->
                 ExistingLease = case Mod:read_lease(RunId) of
@@ -356,23 +453,32 @@ mark_recovery_requeued(RunId) ->
                 {'recovery.skipped', ExistingLease}
         end,
     Now = erlang:system_time(millisecond),
+    ExpectedSeq = maps:get(last_event_seq, get_state(RunId), 0),
     RecoveredInMs = compute_recovered_in_ms(RunId, Now),
     Payload = #{requeued_at => Now,
-                owner_node => node(),
+                owner_node => dispatch_owner(),
                 lease => LeaseInfo,
                 recovered_in_ms => RecoveredInMs},
-    {ok, _} = Mod:append_event(RunId, EventType, undefined,
-                               undefined, undefined, Payload),
-    TelemetryEvent = case EventType of
-                         'recovery.requeued' -> [beamtrail, recovery, requeued];
-                         'recovery.skipped' -> [beamtrail, recovery, skipped]
-                     end,
-    beamtrail_telemetry:execute(TelemetryEvent,
-                                #{count => 1},
-                                #{run_id => RunId, lease => LeaseInfo}),
-    case EventType of
-        'recovery.requeued' -> {ok, requeued};
-        'recovery.skipped' -> {ok, skipped}
+    FencingToken = case EventType of
+                       'recovery.requeued' -> lease_fencing_token(LeaseInfo);
+                       'recovery.skipped' -> undefined
+                   end,
+    case Mod:append_event(RunId, ExpectedSeq, FencingToken, EventType, undefined,
+                          undefined, undefined, Payload) of
+        {ok, _} ->
+            TelemetryEvent = case EventType of
+                                 'recovery.requeued' -> [beamtrail, recovery, requeued];
+                                 'recovery.skipped' -> [beamtrail, recovery, skipped]
+                             end,
+            beamtrail_telemetry:execute(TelemetryEvent,
+                                        #{count => 1},
+                                        #{run_id => RunId, lease => LeaseInfo}),
+            case EventType of
+                'recovery.requeued' -> {ok, {requeued, LeaseInfo}};
+                'recovery.skipped' -> {ok, skipped}
+            end;
+        {error, _} ->
+            {ok, skipped}
     end.
 
 %% recovered_in_ms = wall-clock gap between the earliest still-open
@@ -458,6 +564,47 @@ current_step_version(Workflow, StepId) ->
         Version -> Version
     catch
         _:_ -> undefined
+    end.
+
+append_event(RunId, ExpectedSeq, Lease, EventType, StepId, StepVersion,
+             IdempotencyKey, Payload) ->
+    (storage()):append_event(RunId, ExpectedSeq, lease_fencing_token(Lease),
+                             EventType, StepId, StepVersion,
+                             IdempotencyKey, Payload).
+
+lease_fencing_token(Lease) when is_map(Lease) ->
+    maps:get(fencing_token, Lease, undefined);
+lease_fencing_token(_) ->
+    undefined.
+
+lease_current(RunId, Lease) ->
+    FencingToken = lease_fencing_token(Lease),
+    Now = erlang:system_time(millisecond),
+    case (storage()):read_lease(RunId) of
+        {ok, #{fencing_token := FencingToken, lease_until := LeaseUntil}}
+          when is_integer(FencingToken), LeaseUntil > Now ->
+            true;
+        _ ->
+            false
+    end.
+
+dispatch_owner() ->
+    #{node => node(), pid => self()}.
+
+pending_attempt_expected_seq(RunId, Attempt) ->
+    State = get_state(RunId),
+    case maps:get(pending_attempt, State, undefined) of
+        #{step_id := StepId,
+          attempt := AttemptNo,
+          started_event_seq := StartedSeq} ->
+            case StepId =:= maps:get(step_id, Attempt)
+                andalso AttemptNo =:= maps:get(attempt, Attempt)
+                andalso StartedSeq =:= maps:get(started_event_seq, Attempt) of
+                true -> {ok, maps:get(last_event_seq, State, 0)};
+                false -> {error, attempt_not_current}
+            end;
+        _ ->
+            {error, attempt_not_current}
     end.
 
 ensure_storage() ->

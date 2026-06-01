@@ -77,26 +77,32 @@ recovery_replays_unknown_attempt_with_recorded_step_version() ->
     {ok, _Created} =
         beamtrail_memory_storage:append_event(
           RunId,
+          0,
+          undefined,
           'workflow.instance.created',
           undefined,
           undefined,
           undefined,
-          #{workflow => bt_versioned_workflow, input => Input, steps => [charge]}),
+          #{workflow => bt_success_workflow, input => Input, steps => [charge]}),
+    {ok, Lease} = beamtrail_memory_storage:acquire_lease(RunId, stale_worker, 1),
     {ok, _Attempt} =
         beamtrail_memory_storage:append_event(
           RunId,
+          1,
+          maps:get(fencing_token, Lease),
           'attempt.started',
           charge,
           1,
           {charge, <<"order-3">>},
           #{attempt => 1}),
+    timer:sleep(2),
 
     {ok, [RunId]} = beamtrail:recover_unfinished(),
 
-    ?assertMatch({versioned_execute, 1, {charge, <<"order-3">>}}, receive_exec()),
+    ?assertMatch({executed, charge, 1, {charge, <<"order-3">>}}, receive_exec()),
     State = beamtrail:get_state(RunId),
     ?assertEqual(completed, maps:get(status, State)),
-    ?assertEqual(true, maps:get(migration_required_for_version_change, State)),
+    ?assertEqual(false, maps:get(migration_required_for_version_change, State)),
 
     {ok, Events} = beamtrail:events(RunId),
     ?assertEqual(1, length([Event || Event <- Events, maps:get(event_type, Event) =:= 'attempt.started'])).

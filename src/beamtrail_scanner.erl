@@ -91,14 +91,14 @@ do_scan(State) ->
 
 requeue(RunId) ->
     try
-        case beamtrail:mark_recovery_requeued(RunId) of
-            {ok, requeued} ->
+        case beamtrail:mark_recovery_requeued_with_lease(RunId) of
+            {ok, {requeued, Lease}} ->
                 Spawn = case whereis(beamtrail_worker_sup) of
                             undefined ->
-                                _ = proc_lib:spawn(beamtrail_worker, run, [RunId]),
+                                _ = proc_lib:spawn(beamtrail_worker, run, [RunId, Lease]),
                                 ok;
                             _Pid ->
-                                case beamtrail_worker_sup:dispatch_async(RunId) of
+                                case beamtrail_worker_sup:dispatch_async(RunId, Lease) of
                                     {ok, _} -> ok;
                                     {ok, _, _} -> ok;
                                     Other -> Other

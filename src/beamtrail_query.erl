@@ -97,7 +97,7 @@ describe(RunId) ->
       storage_adapter =>
           #{module => Mod,
             primary_writes =>
-                [<<"append_event(run_id, type, step_id, step_version, key, payload)">>,
+                [<<"append_event(run_id, expected_seq, fencing_token, type, step_id, step_version, key, payload)">>,
                  <<"write_snapshot(run_id, state, snapshot_seq, snapshot_revision)">>,
                  <<"acquire_lease(run_id, owner_node, ttl_ms)">>],
             query_path =>
