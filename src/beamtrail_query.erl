@@ -9,7 +9,10 @@
 
 list() ->
     Mod = beamtrail:storage(),
-    [describe(R) || R <- Mod:list_run_ids()].
+    case Mod:list_run_ids() of
+        {ok, RunIds} -> [describe(R) || R <- RunIds];
+        {error, _} = Error -> Error
+    end.
 
 telemetry() ->
     Mod = beamtrail:storage(),

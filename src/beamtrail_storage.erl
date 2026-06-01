@@ -15,11 +15,11 @@
                          SnapshotRevision :: pos_integer()) -> ok | {error, term()}.
 -callback read_snapshot(RunId :: binary()) -> {ok, map()} | not_found | {error, term()}.
 -callback acquire_lease(RunId :: binary(), Owner :: term(), TtlMs :: pos_integer()) ->
-    {ok, map()} | {error, leased}.
+    {ok, map()} | {error, term()}.
 -callback renew_lease(RunId :: binary(), FencingToken :: pos_integer(), TtlMs :: pos_integer()) ->
     {ok, map()} | {error, no_lease | stale_fence | term()}.
 -callback read_lease(RunId :: binary()) -> {ok, map()} | not_found.
--callback list_run_ids() -> [binary()].
+-callback list_run_ids() -> {ok, [binary()]} | {error, term()}.
 -callback list_run_ids(Cursor :: binary() | undefined, Limit :: pos_integer()) ->
     {ok, #{run_ids := [binary()],
            next_cursor := binary() | undefined,

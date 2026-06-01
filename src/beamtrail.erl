@@ -73,10 +73,14 @@ dispatch(RunId, Lease) when is_map(Lease) ->
 
 recover_unfinished() ->
     ok = ensure_storage(),
-    RunIds = (storage()):list_run_ids(),
-    Requeued =
-        [RunId || RunId <- RunIds, recover_if_unfinished(RunId)],
-    {ok, Requeued}.
+    case (storage()):list_run_ids() of
+        {ok, RunIds} ->
+            Requeued =
+                [RunId || RunId <- RunIds, recover_if_unfinished(RunId)],
+            {ok, Requeued};
+        {error, _} = Error ->
+            Error
+    end.
 
 get_state(RunId) ->
     ok = ensure_storage(),
@@ -472,8 +476,12 @@ recover_if_unfinished(RunId) ->
 
 list_recoverable() ->
     ok = ensure_storage(),
-    [RunId || RunId <- (storage()):list_run_ids(),
-              recoverable(get_state(RunId))].
+    case (storage()):list_run_ids() of
+        {ok, RunIds} ->
+            [RunId || RunId <- RunIds, recoverable(get_state(RunId))];
+        {error, _} = Error ->
+            Error
+    end.
 
 list_recoverable(Cursor, Limit) ->
     ok = ensure_storage(),

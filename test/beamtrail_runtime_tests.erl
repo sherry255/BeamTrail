@@ -84,7 +84,7 @@ recovery_replays_unknown_attempt_with_recorded_step_version() ->
           undefined,
           undefined,
           #{workflow => bt_success_workflow, input => Input, steps => [charge]}),
-    {ok, Lease} = beamtrail_memory_storage:acquire_lease(RunId, stale_worker, 1),
+    {ok, Lease} = beamtrail_memory_storage:acquire_lease(RunId, stale_worker, 100),
     {ok, _Attempt} =
         beamtrail_memory_storage:append_event(
           RunId,
@@ -95,7 +95,7 @@ recovery_replays_unknown_attempt_with_recorded_step_version() ->
           1,
           {charge, <<"order-3">>},
           #{attempt => 1}),
-    timer:sleep(2),
+    timer:sleep(120),
 
     {ok, [RunId]} = beamtrail:recover_unfinished(),
 

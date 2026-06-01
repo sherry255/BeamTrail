@@ -29,5 +29,5 @@ read_snapshot(_) -> {error, not_implemented}.
 acquire_lease(_, _, _) -> {error, not_implemented}.
 renew_lease(_, _, _) -> {error, not_implemented}.
 read_lease(_) -> not_found.
-list_run_ids() -> [].
+list_run_ids() -> {error, not_implemented}.
 list_run_ids(_, _) -> {error, not_implemented}.

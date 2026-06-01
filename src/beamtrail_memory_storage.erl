@@ -119,7 +119,7 @@ handle_call({read_events, RunId, FromSeq, Limit}, _From, State) ->
         end,
     {reply, {ok, Result}, State};
 handle_call(list_run_ids, _From, State) ->
-    {reply, maps:keys(maps:get(events, State)), State};
+    {reply, {ok, maps:keys(maps:get(events, State))}, State};
 handle_call({list_run_ids, Cursor, Limit}, _From, State) ->
     All = lists:sort(maps:keys(maps:get(events, State))),
     AfterCursor = case Cursor of
