@@ -95,8 +95,13 @@ maybe_snapshot(RunId, State, Force, Storage) ->
                                                 #{run_id => RunId,
                                                   snapshot_seq => Seq}),
                     ok;
-                {error, _} = Error ->
-                    Error
+                {error, Reason} ->
+                    beamtrail_telemetry:execute([beamtrail, snapshot, write_failed],
+                                                #{count => 1},
+                                                #{run_id => RunId,
+                                                  snapshot_seq => Seq,
+                                                  reason => Reason}),
+                    ok
             end;
         false ->
             ok

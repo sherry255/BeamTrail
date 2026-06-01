@@ -4,10 +4,10 @@
 %% Background recovery scanner. Periodically scans for unfinished runs and
 %% re-dispatches them via beamtrail_worker_sup. The append-only event log
 %% remains the only source of truth for run progress, but the scanner does
-%% append durable recovery.requeued / recovery.skipped markers (and acquires
-%% a lease) so each scan decision is observable in the inspector. Dispatch
-%% execution happens on a separate worker process, so a slow run cannot
-%% stall the scanner.
+%% appends durable recovery.requeued markers after acquiring a lease so
+%% recovery decisions are observable in the inspector. Dispatch execution
+%% happens on a separate worker process; the scan/requeue bookkeeping itself
+%% still runs on the scanner process.
 
 -export([start_link/0, start_link/1, scan_now/0, set_interval/1, last_scan/0, stop/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
@@ -54,9 +54,14 @@ handle_call(scan_now, _From, State) ->
     {Reply, State1} = do_scan(State),
     {reply, Reply, State1};
 handle_call({set_interval, Ms}, _From, State) ->
-    cancel_timer(State),
-    State1 = arm_timer(State#{interval_ms := Ms}),
-    {reply, ok, State1};
+    case valid_interval(Ms) of
+        true ->
+            cancel_timer(State),
+            State1 = arm_timer(State#{interval_ms := Ms}),
+            {reply, ok, State1};
+        false ->
+            {reply, {error, invalid_interval}, State}
+    end;
 handle_call(last_scan, _From, State) ->
     {reply, #{at => maps:get(last_scan_at, State),
               requeued => maps:get(last_requeued, State),
@@ -138,3 +143,7 @@ arm_timer(#{interval_ms := Ms} = State) when is_integer(Ms), Ms > 0 ->
 
 cancel_timer(#{timer := undefined}) -> ok;
 cancel_timer(#{timer := T}) -> erlang:cancel_timer(T), ok.
+
+valid_interval(infinity) -> true;
+valid_interval(Ms) when is_integer(Ms), Ms > 0 -> true;
+valid_interval(_) -> false.

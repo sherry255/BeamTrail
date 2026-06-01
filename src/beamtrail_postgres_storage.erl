@@ -1,6 +1,8 @@
 -module(beamtrail_postgres_storage).
 -behaviour(beamtrail_storage).
 
+-include_lib("epgsql/include/epgsql.hrl").
+
 %% PostgreSQL storage adapter. It stores Erlang payload/state/idempotency
 %% terms as external-term-format bytea values so replay semantics come before
 %% SQL-level inspection.
@@ -62,10 +64,12 @@ write_snapshot(RunId, State, SnapshotSeq, SnapshotRevision) ->
                      "snapshot_seq = EXCLUDED.snapshot_seq, "
                      "snapshot_revision = EXCLUDED.snapshot_revision, "
                      "state = EXCLUDED.state, "
-                     "written_at_ms = EXCLUDED.written_at_ms",
+                     "written_at_ms = EXCLUDED.written_at_ms "
+                     "WHERE workflow_snapshots.snapshot_seq < EXCLUDED.snapshot_seq",
                      [RunId, SnapshotSeq, SnapshotRevision,
                       term_to_binary(State), now_ms()]) of
                   {ok, 1} -> ok;
+                  {ok, 0} -> ok;
                   {error, Reason} -> {error, Reason}
               end
       end).
@@ -392,6 +396,7 @@ insert_lease(C, Lease) ->
            "VALUES ($1,$2,$3,$4,$5,$6)",
            Params) of
         {ok, 1} -> {ok, Lease};
+        {error, #error{codename = unique_violation}} -> {error, leased};
         {error, Reason} -> {error, Reason}
     end.
 

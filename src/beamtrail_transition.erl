@@ -296,17 +296,24 @@ handle_step_failure_state(RunId, State, Attempt, Reason, Lease, Options) ->
                     case maybe_snapshot_state(RunId, State1, false) of
                         ok ->
                             Workflow = maps:get(workflow, State1),
-                            Policy = Workflow:retry_policy(StepId),
-                            case should_retry(Policy, Reason, maps:get(attempt, Attempt)) of
-                                true ->
-                                    schedule_retry_state(RunId, State1, Attempt, Reason,
-                                                         Policy, Lease,
-                                                         maps:get(event_seq, FailedEvent),
-                                                         Options#{runner_state := State1});
-                                false ->
-                                    fail_workflow_state(RunId, State1, Attempt,
-                                                        FailurePayload, Lease,
-                                                        maps:get(event_seq, FailedEvent))
+                            case safe_retry_policy(Workflow, StepId) of
+                                {ok, Policy} ->
+                                    case should_retry(Policy, Reason, maps:get(attempt, Attempt)) of
+                                        true ->
+                                            schedule_retry_state(RunId, State1, Attempt,
+                                                                 Reason, Policy, Lease,
+                                                                 maps:get(event_seq, FailedEvent),
+                                                                 Options#{runner_state := State1});
+                                        false ->
+                                            fail_workflow_state(RunId, State1, Attempt,
+                                                                FailurePayload, Lease,
+                                                                maps:get(event_seq, FailedEvent))
+                                    end;
+                                {error, PolicyError} ->
+                                    fail_workflow_state(
+                                      RunId, State1, Attempt,
+                                      FailurePayload#{retry_policy_error => PolicyError},
+                                      Lease, maps:get(event_seq, FailedEvent))
                             end;
                         {error, _} = Error ->
                             Error
@@ -384,6 +391,17 @@ should_retry(Policy, Reason, AttemptNo) ->
     MaxAttempts = maps:get(max_attempts, Policy, 1),
     RetryableErrors = maps:get(retryable_errors, Policy, []),
     AttemptNo < MaxAttempts andalso lists:member(error_key(Reason), RetryableErrors).
+
+safe_retry_policy(Workflow, StepId) ->
+    try Workflow:retry_policy(StepId) of
+        Policy when is_map(Policy) ->
+            {ok, Policy};
+        Other ->
+            {error, #{callback => retry_policy, reason => {bad_return, Other}}}
+    catch
+        Class:Reason:_Stacktrace ->
+            {error, #{callback => retry_policy, class => Class, reason => Reason}}
+    end.
 
 error_key(Reason) when is_atom(Reason) ->
     Reason;

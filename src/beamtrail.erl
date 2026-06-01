@@ -162,7 +162,7 @@ dispatch_retrying(RunId, State, Lease, Options) ->
 
 recover_if_unfinished(RunId) ->
     State = get_state(RunId),
-    case recoverable(State) of
+    case recoverable(RunId, State) of
         true ->
             case mark_recovery_requeued_with_lease(RunId) of
                 {ok, {requeued, Lease}} ->
@@ -186,7 +186,7 @@ list_recoverable() ->
     ok = ensure_storage(),
     case (storage()):list_run_ids() of
         {ok, RunIds} ->
-            [RunId || RunId <- RunIds, recoverable(get_state(RunId))];
+            [RunId || RunId <- RunIds, recoverable(RunId, get_state(RunId))];
         {error, _} = Error ->
             Error
     end.
@@ -196,14 +196,15 @@ list_recoverable(Cursor, Limit) ->
     case (storage()):list_run_ids(Cursor, Limit) of
         {ok, #{run_ids := RunIds} = Page} ->
             {ok, Page#{run_ids := [RunId || RunId <- RunIds,
-                                            recoverable(get_state(RunId))]}};
+                                            recoverable(RunId, get_state(RunId))]}};
         {error, _} = Error ->
             Error
     end.
 
-%% Acquires a lease (best-effort) and appends a durable `recovery.requeued'
-%% event to the log so the scanner's decision is observable in the inspector,
-%% not only via telemetry counters. Idempotent on lease contention.
+%% Acquires a lease and appends a durable `recovery.requeued' event to the log
+%% so successful recovery decisions are observable in the inspector. Lease
+%% contention means another live owner is still responsible for the run and is
+%% intentionally not written as durable log noise.
 mark_recovery_requeued(RunId) ->
     case mark_recovery_requeued_with_lease(RunId) of
         {ok, {requeued, _Lease}} -> {ok, requeued};
@@ -218,11 +219,7 @@ mark_recovery_requeued_with_lease(RunId) ->
         {ok, Lease} ->
             append_recovery_marker(Mod, RunId, 'recovery.requeued', Lease);
         {error, leased} ->
-            ExistingLease = case Mod:read_lease(RunId) of
-                                {ok, L} -> L;
-                                _ -> undefined
-                            end,
-            append_recovery_marker(Mod, RunId, 'recovery.skipped', ExistingLease);
+            {ok, skipped};
         {error, _} = Error ->
             Error
     end.
@@ -253,8 +250,8 @@ append_recovery_marker(Mod, RunId, EventType, LeaseInfo) ->
                 'recovery.requeued' -> {ok, {requeued, LeaseInfo}};
                 'recovery.skipped' -> {ok, skipped}
             end;
-        {error, _} ->
-            {ok, skipped}
+        {error, _} = Error ->
+            Error
     end.
 
 %% recovered_in_ms = wall-clock gap between the earliest still-open
@@ -295,7 +292,10 @@ open_step_fold(#{event_type := Et}, _Acc)
     #{};
 open_step_fold(_, Acc) -> Acc.
 
-recoverable(State) ->
+recoverable(RunId, State) ->
+    recoverable_state(State) andalso lease_recoverable(RunId).
+
+recoverable_state(State) ->
     case maps:get(status, State) of
         completed ->
             false;
@@ -305,6 +305,17 @@ recoverable(State) ->
             maps:get(next_retry_at, State, 0) =< erlang:system_time(millisecond);
         _ ->
             true
+    end.
+
+lease_recoverable(RunId) ->
+    Now = erlang:system_time(millisecond),
+    case (storage()):read_lease(RunId) of
+        {ok, #{lease_until := LeaseUntil}} when is_integer(LeaseUntil) ->
+            LeaseUntil =< Now;
+        not_found ->
+            true;
+        {error, _} ->
+            false
     end.
 
 maybe_snapshot(RunId, Force) ->

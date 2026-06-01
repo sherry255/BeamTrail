@@ -21,7 +21,8 @@ extended_test_() ->
       fun query_describe_returns_storage_error/0,
       fun recover_unfinished_returns_storage_error/0,
       fun recovery_marker_returns_storage_error/0,
-      fun start_workflow_returns_snapshot_write_error/0,
+      fun recovery_marker_surfaces_append_error/0,
+      fun snapshot_write_failure_is_nonfatal/0,
       fun load_state_ignores_obsolete_snapshot_revision/0,
       fun snapshot_schema_contract_pins_revision_to_state_shape/0,
       fun storage_lists_run_ids_with_cursor/0,
@@ -32,6 +33,8 @@ extended_test_() ->
       fun dispatch_refuses_when_run_is_leased/0,
       fun dispatch_refuses_stale_lease_before_replay/0,
       fun dispatch_renews_lease_while_step_runs/0,
+      fun scanner_does_not_write_skipped_marker_for_live_lease/0,
+      fun scanner_rejects_invalid_interval/0,
       fun active_runner_wakes_retry_without_scanner_tick/0,
       fun active_runner_retry_timer_survives_heartbeat_and_lookup/0,
       fun active_runner_supervisor_rejects_when_pool_full/0,
@@ -43,6 +46,7 @@ extended_test_() ->
       fun active_runner_stays_inspectable_while_step_executes/0,
       fun active_runner_reuses_loaded_state_across_steps/0,
       fun dispatch_refuses_version_mismatch_without_migration/0,
+      fun retry_policy_failure_fails_terminally_without_retry_loop/0,
       fun retry_attempts_preserved_in_chronological_order/0,
       fun storage_adapter_is_application_configurable/0,
       fun query_describe_exposes_inspector_blocks/0,
@@ -265,16 +269,34 @@ recovery_marker_returns_storage_error() ->
     ?assertEqual({error, postgres_not_configured},
                  beamtrail:mark_recovery_requeued(<<"missing-run">>)).
 
-start_workflow_returns_snapshot_write_error() ->
+recovery_marker_surfaces_append_error() ->
+    ok = application:set_env(beamtrail, storage_adapter,
+                             bt_recovery_marker_fail_storage),
+    RunId = <<"recovery-marker-error-run-1">>,
+    {ok, _} = beamtrail_memory_storage:append_event(
+                RunId, 0, undefined,
+                'workflow.instance.created', undefined, undefined,
+                undefined,
+                #{workflow => bt_success_workflow, input => #{}, steps => [charge]}),
+    {ok, Lease} = beamtrail_memory_storage:acquire_lease(RunId, recovery_seed, 20),
+    {ok, _} = beamtrail_memory_storage:append_event(
+                RunId, 1, maps:get(fencing_token, Lease),
+                'attempt.started', charge, 1,
+                {charge, <<"recovery-marker-error">>}, #{attempt => 1}),
+    ok = wait_until_lease_expired(RunId, 1000),
+    ?assertEqual({error, recovery_marker_failed},
+                 beamtrail:mark_recovery_requeued(RunId)).
+
+snapshot_write_failure_is_nonfatal() ->
     ok = application:set_env(beamtrail, storage_adapter,
                              bt_snapshot_fail_storage),
     Input = #{order_id => <<"o-snapshot-fail-1">>, test_pid => self()},
-    ?assertMatch({error, {dispatch_failed, _, snapshot_write_failed}},
-                 beamtrail:start_workflow(bt_success_workflow, Input)),
+    {ok, RunId} = beamtrail:start_workflow(bt_success_workflow, Input),
     ?assertMatch({executed, charge, 1, {charge, <<"o-snapshot-fail-1">>}},
                  receive_exec()),
     ?assertMatch({executed, ship, 1, {ship, <<"o-snapshot-fail-1">>}},
-                 receive_exec()).
+                 receive_exec()),
+    ?assertEqual(completed, maps:get(status, beamtrail:get_state(RunId))).
 
 load_state_ignores_obsolete_snapshot_revision() ->
     RunId = <<"obsolete-snapshot-run-1">>,
@@ -439,6 +461,32 @@ dispatch_renews_lease_while_step_runs() ->
     ?assertEqual(maps:get(fencing_token, Lease),
                  maps:get(fencing_token, CurrentLease)),
     ?assert(maps:get(lease_until, CurrentLease) > maps:get(lease_until, Lease)).
+
+scanner_does_not_write_skipped_marker_for_live_lease() ->
+    RunId = <<"scanner-live-lease-run-1">>,
+    {ok, _} = beamtrail_memory_storage:append_event(
+                RunId, 0, undefined,
+                'workflow.instance.created', undefined, undefined,
+                undefined,
+                #{workflow => bt_success_workflow, input => #{},
+                  steps => [charge]}),
+    {ok, _Lease} = beamtrail_memory_storage:acquire_lease(
+                     RunId, live_runner, 30000),
+    {ok, _Pid} = beamtrail_scanner:start_link(#{interval_ms => infinity,
+                                                auto_start => false}),
+    ?assertEqual({ok, []}, beamtrail_scanner:scan_now()),
+    {ok, Events} = beamtrail:events(RunId),
+    ?assertEqual(0, length([E || E <- Events,
+                            maps:get(event_type, E) =:= 'recovery.skipped'])),
+    ?assertEqual(['workflow.instance.created'],
+                 [maps:get(event_type, E) || E <- Events]).
+
+scanner_rejects_invalid_interval() ->
+    {ok, _Pid} = beamtrail_scanner:start_link(#{interval_ms => infinity,
+                                                auto_start => false}),
+    ?assertEqual({error, invalid_interval}, beamtrail_scanner:set_interval(0)),
+    ?assertEqual({error, invalid_interval}, beamtrail_scanner:set_interval(-1)),
+    ?assertEqual(ok, beamtrail_scanner:set_interval(infinity)).
 
 active_runner_wakes_retry_without_scanner_tick() ->
     {ok, Registry} = beamtrail_run_registry:start_link(),
@@ -694,6 +742,27 @@ dispatch_refuses_version_mismatch_without_migration() ->
                             maps:get(event_type, E) =:= 'attempt.started'])),
     ?assertEqual(0, length([E || E <- Events,
                             maps:get(event_type, E) =:= 'step.succeeded'])).
+
+retry_policy_failure_fails_terminally_without_retry_loop() ->
+    RunId = <<"bad-retry-policy-run-1">>,
+    Input = #{order_id => <<"o-bad-retry-policy-1">>, test_pid => self()},
+    ?assertEqual({ok, RunId},
+                 beamtrail:start_workflow(bt_bad_retry_policy_workflow, Input,
+                                          #{run_id => RunId})),
+    ?assertEqual({bad_retry_execute, 1}, receive_exec()),
+    State = beamtrail:get_state(RunId),
+    ?assertEqual(failed, maps:get(status, State)),
+    ?assertEqual(true, maps:get(terminal, State)),
+    Failure = maps:get(failure, State),
+    ?assertMatch(#{retry_policy_error := #{callback := retry_policy}}, Failure),
+    {ok, Events} = beamtrail:events(RunId),
+    ?assertEqual(1, length([E || E <- Events,
+                            maps:get(event_type, E) =:= 'attempt.started'])),
+    ?assertEqual(0, length([E || E <- Events,
+                            maps:get(event_type, E) =:= 'retry.scheduled'])),
+    ?assertEqual({ok, []}, beamtrail:recover_unfinished()),
+    {ok, EventsAfterRecovery} = beamtrail:events(RunId),
+    ?assertEqual(length(Events), length(EventsAfterRecovery)).
 
 retry_attempts_preserved_in_chronological_order() ->
     Input = #{order_id => <<"o-ord-1">>, test_pid => self()},
