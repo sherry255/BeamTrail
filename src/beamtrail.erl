@@ -2,8 +2,6 @@
 
 -export([start/0, stop/0]).
 -export([start_workflow/2, start_workflow/3, dispatch/1, dispatch/2,
-         load_runner_state/1, next_runner_action/2, next_runner_action/3,
-         finish_runner_attempt/4, finish_runner_attempt/5,
          recover_unfinished/0]).
 -export([get_state/1, events/1, storage/0]).
 -export([list_recoverable/0, list_recoverable/2,
@@ -74,31 +72,6 @@ dispatch(RunId) ->
 
 dispatch(RunId, Lease) when is_map(Lease) ->
     dispatch_with_lease(RunId, Lease, #{lease_heartbeat => internal}).
-
-%% Runner-facing compatibility API. The active runner owns lease renewal,
-%% step process lifetime, and timeout handling.
-load_runner_state(RunId) ->
-    load_state(RunId).
-
-next_runner_action(RunId, Lease) when is_map(Lease) ->
-    case dispatch_with_lease(RunId, Lease, #{runner_mode => prepare}) of
-        {ok, {execute, Attempt, ExecSpec, _State}} ->
-            {ok, {execute, Attempt, ExecSpec}};
-        Other ->
-            Other
-    end.
-
-next_runner_action(RunId, Lease, State) when is_map(Lease), is_map(State) ->
-    beamtrail_transition:dispatch_locked(RunId, State, Lease,
-                                         #{runner_mode => prepare,
-                                           runner_state => State}).
-
-finish_runner_attempt(RunId, Lease, Attempt, Result) when is_map(Lease), is_map(Attempt) ->
-    beamtrail_transition:finish_attempt(RunId, Lease, Attempt, Result).
-
-finish_runner_attempt(RunId, Lease, Attempt, Result, State)
-  when is_map(Lease), is_map(Attempt), is_map(State) ->
-    beamtrail_transition:finish_attempt(RunId, Lease, Attempt, Result, State).
 
 dispatch_with_lease(RunId, Lease, Options) ->
     ok = ensure_storage(),
