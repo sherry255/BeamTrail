@@ -2,65 +2,59 @@
 
 [![CI](https://github.com/sherry255/BeamTrail/actions/workflows/ci.yml/badge.svg)](https://github.com/sherry255/BeamTrail/actions/workflows/ci.yml)
 
-BeamTrail is an Erlang/OTP durable workflow runtime built around
-event-sourced execution.
+BeamTrail is a PostgreSQL-backed durable workflow runtime for Erlang/OTP.
 
-It stores each workflow run as an append-only event stream, derives state by
-reducing events, and runs a static list of workflow steps with retry, timeout,
-lease, and recovery metadata recorded in the log.
+It records each workflow run as an append-only event stream, rebuilds state by
+reducing events, and executes a linear list of workflow steps with retries,
+timeouts, leases, fencing, snapshots, active runners, and scanner recovery.
 
-The in-memory adapter is the default for local development. A PostgreSQL
-adapter is included for durable event, snapshot, and lease storage.
+## Status
 
-## Current State
+BeamTrail is an MVP. The durable path is implemented through
+`beamtrail_postgres_storage`; the default `beamtrail_memory_storage` adapter is
+for local development and tests only.
 
-- `beamtrail_memory_storage` is the default adapter for local development and
-  tests. It is a single in-memory process and is not the production durability
-  path.
-- `beamtrail_postgres_storage` uses epgsql and the schema in
-  `priv/sql/postgres.sql`.
-- PostgreSQL payloads, idempotency keys, leases, and snapshots are stored as
-  Erlang external-term-format `bytea` values. This keeps replay exact; SQL-level
-  JSON inspection is not implemented yet.
-- Snapshot reads are revision-gated. If a stored snapshot uses an obsolete
-  revision, BeamTrail ignores it and replays from the append-only event stream.
-- Workflows are linear step lists. There is no branching, DAG execution, or
-  fan-out.
-- Idempotency keys are recorded and passed to workflow code. Deduplicating
-  external side effects is still the workflow's job.
-- There is no HTTP API or browser UI.
+Current scope:
 
-## What Works
+- Linear step lists
+- Durable event log and snapshots
+- Expected-sequence append checks
+- Per-run PostgreSQL append locking
+- Leases and fencing tokens
+- Supervised active run processes
+- Retry backoff and step/workflow timeouts
+- Scanner recovery for unfinished attempts
+- Version mismatch gating during replay
+- Inspector data through `beamtrail_query:describe/1`
 
-- Start a workflow from an Erlang module implementing `beamtrail_workflow`.
-- Append workflow events with expected-sequence checks and fencing tokens.
-- Rebuild run state from events and snapshots.
-- Retry failed steps according to a per-step retry policy.
-- Record step and workflow timeouts.
-- Recover unfinished in-flight attempts through the scanner.
-- Keep active runs in supervised per-run processes between retry timers.
-- Renew leases while a step is running.
-- Query a run's events, attempts, snapshot, lease, recovery metadata, and
-  telemetry counters.
+Not in scope yet:
 
-## Run
+- Branching, DAGs, or fan-out
+- HTTP API or browser UI
+- SQL-native JSON inspection
+- Built-in external side-effect deduplication
+- Exactly-once execution of workflow callbacks
 
-```sh
-rebar3 shell --apps beamtrail
-```
+## Guarantees
 
-The application starts the in-memory storage process and recovery scanner under
-the OTP supervision tree.
+With the PostgreSQL adapter, BeamTrail guarantees:
 
-## Test
+- Workflow history is stored as append-only events.
+- Appends are rejected when `expected_seq` is stale.
+- Appends are rejected when the fencing token is missing, expired, or stale.
+- Different runs can append concurrently; one run is serialized by a per-run
+  PostgreSQL lock.
+- Snapshots are only an optimization. If a snapshot revision is obsolete,
+  BeamTrail ignores it and replays from events.
+- Active runner processes are a fast path. PostgreSQL events, leases, fencing
+  tokens, and snapshots remain the recovery boundary.
 
-```sh
-rebar3 eunit
-```
+BeamTrail does not guarantee exactly-once side effects. Workflow code must use
+the idempotency key in the execution context when it calls external systems.
 
-Build output is written under `_build/` and ignored by Git.
+## Quickstart With PostgreSQL
 
-PostgreSQL integration tests are disabled by default. To run them locally:
+Start PostgreSQL:
 
 ```sh
 docker run --name beamtrail-pg-test \
@@ -69,50 +63,56 @@ docker run --name beamtrail-pg-test \
   -e POSTGRES_DB=beamtrail \
   -p 55432:5432 \
   -d postgres:16
-
-BEAMTRAIL_PG_TEST=1 BEAMTRAIL_PG_PORT=55432 rebar3 eunit
-
-docker rm -f beamtrail-pg-test
 ```
 
-GitHub Actions runs both the default EUnit suite and the PostgreSQL integration
-suite on every push to `main` and on pull requests.
+Start a shell:
 
-## Configuration
+```sh
+rebar3 shell
+```
 
-Set these application environment values before starting `beamtrail`:
-
-- `storage_adapter`: storage module, default `beamtrail_memory_storage`.
-- `scanner_interval_ms`: recovery scan interval, default `5000`.
-- `worker_max_children`: concurrent dispatch workers, default `64`.
-- `run_max_children`: concurrent active run processes, default `64`.
-- `lease_ttl_ms`: dispatch lease TTL, default `30000`.
-
-For PostgreSQL:
+Configure storage, install the schema, and start the application:
 
 ```erlang
 application:set_env(beamtrail, storage_adapter, beamtrail_postgres_storage),
 application:set_env(beamtrail, postgres,
                     #{host => "localhost",
-                      port => 5432,
+                      port => 55432,
                       username => "beamtrail",
                       password => "beamtrail",
                       database => "beamtrail"}).
 
+{ok, _} = application:ensure_all_started(epgsql).
 ok = beamtrail_postgres_storage:init_schema().
+{ok, _} = application:ensure_all_started(beamtrail).
 ```
 
-## Production Notes
+Run a workflow:
 
-- Use PostgreSQL for durable storage. The memory adapter is useful for local
-  development and tests, but it is still process memory.
-- PostgreSQL append uses expected sequence checks, fencing tokens, and per-run
-  row locks so different runs can append concurrently.
-- Active run processes are a fast path. PostgreSQL events, leases, fencing
-  tokens, and snapshots remain the recovery boundary.
-- External side effects must be idempotent at the workflow boundary. BeamTrail
-  records stable idempotency keys but does not deduplicate calls to outside
-  systems.
+```erlang
+{ok, RunId} = beamtrail:start_workflow(my_workflow,
+                                       #{order_id => <<"o-1">>}).
+
+State = beamtrail:get_state(RunId).
+View = beamtrail_query:describe(RunId).
+```
+
+Clean up the local container:
+
+```sh
+docker rm -f beamtrail-pg-test
+```
+
+## Memory Mode
+
+For local development without PostgreSQL:
+
+```sh
+rebar3 shell --apps beamtrail
+```
+
+The default storage adapter is `beamtrail_memory_storage`. It is a single
+in-memory process. It is not the durable storage path.
 
 ## Workflow Module
 
@@ -148,17 +148,65 @@ execute(StepId, StepVersion, Input, Ctx) ->
            input => Input}}.
 ```
 
-## Example
+`execute/4` should treat `Ctx.idempotency_key` as the key for any external
+side effect.
+
+## Querying
 
 ```erlang
-{ok, RunId} = beamtrail:start_workflow(my_workflow,
-                                       #{order_id => <<"o-1">>}).
-
 State = beamtrail:get_state(RunId).
-
 {ok, Events} = beamtrail:events(RunId).
-
 View = beamtrail_query:describe(RunId).
-
 {ok, Requeued} = beamtrail_scanner:scan_now().
 ```
+
+`beamtrail_query:describe/1` returns the current reduced state, attempts,
+snapshot metadata, replay tail length, lease/fencing metadata, active runner
+metadata, recovery metadata, and the event list.
+
+## Configuration
+
+Set application environment before starting `beamtrail`:
+
+- `storage_adapter`: storage module, default `beamtrail_memory_storage`
+- `postgres`: PostgreSQL connection map for `beamtrail_postgres_storage`
+- `scanner_interval_ms`: recovery scan interval, default `5000`
+- `worker_max_children`: concurrent dispatch workers, default `64`
+- `run_max_children`: concurrent active run processes, default `64`
+- `lease_ttl_ms`: dispatch lease TTL, default `30000`
+
+## Tests
+
+```sh
+rebar3 eunit
+```
+
+PostgreSQL integration tests:
+
+```sh
+docker run --name beamtrail-pg-test \
+  -e POSTGRES_USER=beamtrail \
+  -e POSTGRES_PASSWORD=beamtrail \
+  -e POSTGRES_DB=beamtrail \
+  -p 55432:5432 \
+  -d postgres:16
+
+BEAMTRAIL_PG_TEST=1 BEAMTRAIL_PG_PORT=55432 rebar3 eunit
+
+docker rm -f beamtrail-pg-test
+```
+
+GitHub Actions runs both the default EUnit suite and the PostgreSQL integration
+suite on every push to `main` and on pull requests.
+
+## Storage Format
+
+PostgreSQL stores payloads, idempotency keys, leases, and snapshots as Erlang
+external-term-format `bytea` values. Replay fidelity comes first; SQL-level
+inspection can be added later through read models.
+
+The schema lives in `priv/sql/postgres.sql`.
+
+## License
+
+MIT.
