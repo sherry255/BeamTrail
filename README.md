@@ -1,38 +1,39 @@
 # BeamTrail
 
-BeamTrail is an Erlang/OTP library for running workflows on top of an
-append-only event stream.
+BeamTrail is a small Erlang/OTP prototype for event-sourced workflow
+execution.
 
-The runtime records workflow events, derives read state by reducing
-events and snapshots, and keeps retry, timeout, idempotency, lease, and
-recovery metadata in the event history.
+It stores each workflow run as an append-only event stream, derives state by
+reducing events, and runs a static list of workflow steps with retry, timeout,
+lease, and recovery metadata recorded in the log.
 
-## Status
+This is not a production durable workflow runtime yet. The only working storage
+adapter is in-memory.
 
-- The in-memory storage adapter is the only working adapter.
-- `beamtrail_postgres_storage` is a stub and returns
-  `{error, not_implemented}`.
-- `priv/sql/postgres.sql` defines the intended PostgreSQL schema.
+## Current State
+
+- `beamtrail_memory_storage` is the only supported adapter.
+- `beamtrail_postgres_storage` is a stub and returns `{error, not_implemented}`.
+- `priv/sql/postgres.sql` sketches the intended PostgreSQL schema.
+- Workflows are linear step lists. There is no branching, DAG execution, or
+  fan-out.
+- Idempotency keys are recorded and passed to workflow code. Deduplicating
+  external side effects is still the workflow's job.
+- Lease/fencing is enforced in the in-memory adapter. Multi-node durable
+  takeover still needs a real storage backend.
 - There is no HTTP API or browser UI.
-- Lease and fencing tokens exist, but multi-node takeover is not
-  implemented.
 
-## Features
+## What Works
 
-- Append-only workflow event streams.
-- Snapshot plus tail replay.
-- Retry policies with stable idempotency keys. BeamTrail passes the key
-  to workflow code and records it in the event log; external side-effect
-  deduplication is still the workflow's responsibility.
-- Step and workflow timeouts.
-- Step-version replay for recovery.
-- Lease fencing for dispatch and event writes, including heartbeat
-  renewal while a step is running.
-- Cursor-batched recovery scanner and bounded worker supervisor.
-- Query view for events, attempts, snapshots, leases, recovery state,
-  and telemetry counters.
-- Configurable storage adapter via the `beamtrail` application
-  environment.
+- Start a workflow from an Erlang module implementing `beamtrail_workflow`.
+- Append workflow events with expected-sequence checks and fencing tokens.
+- Rebuild run state from events and snapshots.
+- Retry failed steps according to a per-step retry policy.
+- Record step and workflow timeouts.
+- Recover unfinished in-flight attempts through the scanner.
+- Renew leases while a step is running.
+- Query a run's events, attempts, snapshot, lease, recovery metadata, and
+  telemetry counters.
 
 ## Run
 
@@ -40,8 +41,8 @@ recovery metadata in the event history.
 rebar3 shell --apps beamtrail
 ```
 
-The application starts the in-memory storage process and recovery
-scanner under the OTP supervision tree.
+The application starts the in-memory storage process and recovery scanner under
+the OTP supervision tree.
 
 ## Test
 
@@ -51,7 +52,7 @@ rebar3 eunit
 
 Build output is written under `_build/` and ignored by Git.
 
-## Runtime Configuration
+## Configuration
 
 Set these application environment values before starting `beamtrail`:
 
@@ -98,6 +99,8 @@ execute(StepId, StepVersion, Input, Ctx) ->
 ```erlang
 {ok, RunId} = beamtrail:start_workflow(my_workflow,
                                        #{order_id => <<"o-1">>}).
+
+State = beamtrail:get_state(RunId).
 
 {ok, Events} = beamtrail:events(RunId).
 
