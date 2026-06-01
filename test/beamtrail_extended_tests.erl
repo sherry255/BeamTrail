@@ -17,6 +17,7 @@ extended_test_() ->
       fun telemetry_counters_track_attempts/0,
       fun postgres_stub_is_loud_about_not_implemented/0,
       fun recover_unfinished_returns_storage_error/0,
+      fun recovery_marker_returns_storage_error/0,
       fun storage_lists_run_ids_with_cursor/0,
       fun storage_rejects_expected_seq_conflict/0,
       fun storage_renews_current_lease_without_changing_fence/0,
@@ -207,6 +208,12 @@ recover_unfinished_returns_storage_error() ->
     ok = application:set_env(beamtrail, storage_adapter,
                              beamtrail_postgres_storage),
     ?assertEqual({error, not_implemented}, beamtrail:recover_unfinished()).
+
+recovery_marker_returns_storage_error() ->
+    ok = application:set_env(beamtrail, storage_adapter,
+                             beamtrail_postgres_storage),
+    ?assertEqual({error, not_implemented},
+                 beamtrail:mark_recovery_requeued(<<"missing-run">>)).
 
 storage_lists_run_ids_with_cursor() ->
     {ok, _} = beamtrail:start_workflow(bt_timeout_workflow, #{order_id => <<"o-page-2">>},

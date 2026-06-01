@@ -505,16 +505,20 @@ mark_recovery_requeued(RunId) ->
 mark_recovery_requeued_with_lease(RunId) ->
     ok = ensure_storage(),
     Mod = storage(),
-    {EventType, LeaseInfo} =
-        case Mod:acquire_lease(RunId, dispatch_owner(), ?LEASE_TTL_MS) of
-            {ok, Lease} -> {'recovery.requeued', Lease};
-            {error, leased} ->
-                ExistingLease = case Mod:read_lease(RunId) of
-                                    {ok, L} -> L;
-                                    _ -> undefined
-                                end,
-                {'recovery.skipped', ExistingLease}
-        end,
+    case Mod:acquire_lease(RunId, dispatch_owner(), ?LEASE_TTL_MS) of
+        {ok, Lease} ->
+            append_recovery_marker(Mod, RunId, 'recovery.requeued', Lease);
+        {error, leased} ->
+            ExistingLease = case Mod:read_lease(RunId) of
+                                {ok, L} -> L;
+                                _ -> undefined
+                            end,
+            append_recovery_marker(Mod, RunId, 'recovery.skipped', ExistingLease);
+        {error, _} = Error ->
+            Error
+    end.
+
+append_recovery_marker(Mod, RunId, EventType, LeaseInfo) ->
     Now = erlang:system_time(millisecond),
     ExpectedSeq = maps:get(last_event_seq, get_state(RunId), 0),
     RecoveredInMs = compute_recovered_in_ms(RunId, Now),
