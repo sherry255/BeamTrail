@@ -46,6 +46,8 @@ extended_test_() ->
       fun active_runner_stays_inspectable_while_step_executes/0,
       fun active_runner_reuses_loaded_state_across_steps/0,
       fun dispatch_refuses_version_mismatch_without_migration/0,
+      fun completed_step_version_change_does_not_block_next_step/0,
+      fun scanner_skips_migration_blocked_runs/0,
       fun retry_policy_failure_fails_terminally_without_retry_loop/0,
       fun retry_attempts_preserved_in_chronological_order/0,
       fun storage_adapter_is_application_configurable/0,
@@ -742,6 +744,57 @@ dispatch_refuses_version_mismatch_without_migration() ->
                             maps:get(event_type, E) =:= 'attempt.started'])),
     ?assertEqual(0, length([E || E <- Events,
                             maps:get(event_type, E) =:= 'step.succeeded'])).
+
+completed_step_version_change_does_not_block_next_step() ->
+    RunId = <<"completed-version-change-run-1">>,
+    Input = #{order_id => <<"o-completed-version-1">>, test_pid => self()},
+    {ok, _} = beamtrail_memory_storage:append_event(
+                RunId, 0, undefined,
+                'workflow.instance.created', undefined, undefined,
+                undefined,
+                #{workflow => bt_completed_version_change_workflow,
+                  input => Input, steps => [charge, ship]}),
+    {ok, Lease} = beamtrail_memory_storage:acquire_lease(RunId, old_worker, 1000),
+    {ok, _} = beamtrail_memory_storage:append_event(
+                RunId, 1, maps:get(fencing_token, Lease),
+                'attempt.started', charge, 1,
+                {charge, <<"o-completed-version-1">>}, #{attempt => 1}),
+    {ok, _} = beamtrail_memory_storage:append_event(
+                RunId, 2, maps:get(fencing_token, Lease),
+                'step.succeeded', charge, undefined,
+                undefined, #{result => #{step => charge}}),
+    State = beamtrail:get_state(RunId),
+    ?assertEqual(false, maps:get(migration_required_for_version_change, State)),
+    ?assertEqual(ship, maps:get(current_step, State)),
+    ?assertMatch({ok, #{status := completed}}, beamtrail:dispatch(RunId, Lease)),
+    ?assertEqual({completed_version_execute, ship, 1,
+                  {ship, <<"o-completed-version-1">>}},
+                 receive_exec()).
+
+scanner_skips_migration_blocked_runs() ->
+    RunId = <<"migration-blocked-scanner-run-1">>,
+    Input = #{order_id => <<"o-migration-blocked-1">>, test_pid => self()},
+    {ok, _} = beamtrail_memory_storage:append_event(
+                RunId, 0, undefined,
+                'workflow.instance.created', undefined, undefined,
+                undefined,
+                #{workflow => bt_versioned_workflow, input => Input,
+                  steps => [charge]}),
+    {ok, Lease} = beamtrail_memory_storage:acquire_lease(RunId, old_worker, 20),
+    {ok, _} = beamtrail_memory_storage:append_event(
+                RunId, 1, maps:get(fencing_token, Lease),
+                'attempt.started', charge, 1,
+                {charge, <<"o-migration-blocked-1">>}, #{attempt => 1}),
+    ok = wait_until_lease_expired(RunId, 1000),
+    State = beamtrail:get_state(RunId),
+    ?assertEqual(true, maps:get(migration_required_for_version_change, State)),
+    {ok, _Pid} = beamtrail_scanner:start_link(#{interval_ms => infinity,
+                                                auto_start => false}),
+    ?assertEqual({ok, []}, beamtrail_scanner:scan_now()),
+    {ok, Events} = beamtrail:events(RunId),
+    ?assertEqual(0, length([E || E <- Events,
+                            maps:get(event_type, E) =:= 'recovery.requeued'])),
+    ?assertEqual(timeout, receive_exec_short()).
 
 retry_policy_failure_fails_terminally_without_retry_loop() ->
     RunId = <<"bad-retry-policy-run-1">>,

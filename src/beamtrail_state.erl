@@ -113,16 +113,22 @@ apply_event(State, Event) ->
 enrich_version_migration(State = #{workflow := undefined}) ->
     State#{migration_required_for_version_change => false};
 enrich_version_migration(State) ->
+    %% Gate only the in-flight (pending) attempt: that is the one recovery
+    %% would re-execute at its recorded step_version, so a divergence from the
+    %% currently deployed code is the genuine migration hazard. Completed
+    %% attempts are never re-executed and their steps receive the original
+    %% workflow input (not prior results), so a version bump to a finished
+    %% step must not wedge an otherwise-progressable run. This matches the
+    %% documented replay policy ("recover and retry in-flight work with
+    %% recorded step_version").
     Workflow = maps:get(workflow, State),
-    Attempts = maps:get(attempts, State, []),
     MigrationRequired =
-        lists:any(
-          fun(Attempt) ->
-                  StepId = maps:get(step_id, Attempt),
-                  RecordedVersion = maps:get(step_version, Attempt),
-                  current_step_version(Workflow, StepId) =/= RecordedVersion
-          end,
-          Attempts),
+        case maps:get(pending_attempt, State, undefined) of
+            #{step_id := StepId, step_version := RecordedVersion} ->
+                current_step_version(Workflow, StepId) =/= RecordedVersion;
+            _ ->
+                false
+        end,
     State#{migration_required_for_version_change => MigrationRequired}.
 
 current_step_version(Workflow, StepId) ->

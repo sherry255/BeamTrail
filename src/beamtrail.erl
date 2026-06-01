@@ -296,6 +296,14 @@ recoverable(RunId, State) ->
     recoverable_state(State) andalso lease_recoverable(RunId).
 
 recoverable_state(State) ->
+    case maps:get(migration_required_for_version_change, State, false) of
+        true ->
+            false;
+        false ->
+            recoverable_by_status(State)
+    end.
+
+recoverable_by_status(State) ->
     case maps:get(status, State) of
         completed ->
             false;
