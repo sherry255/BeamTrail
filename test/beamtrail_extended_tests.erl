@@ -23,6 +23,7 @@ extended_test_() ->
       fun recovery_marker_returns_storage_error/0,
       fun start_workflow_returns_snapshot_write_error/0,
       fun load_state_ignores_obsolete_snapshot_revision/0,
+      fun snapshot_schema_contract_pins_revision_to_state_shape/0,
       fun storage_lists_run_ids_with_cursor/0,
       fun storage_rejects_expected_seq_conflict/0,
       fun storage_rejects_zombie_append_after_fence_takeover/0,
@@ -292,6 +293,25 @@ load_state_ignores_obsolete_snapshot_revision() ->
     State = beamtrail:get_state(RunId),
     ?assertEqual(completed, maps:get(status, State)),
     ?assertEqual(2, maps:get(last_event_seq, State)).
+
+snapshot_schema_contract_pins_revision_to_state_shape() ->
+    Schema = beamtrail_state:snapshot_schema(),
+    ?assertEqual(beamtrail_state:snapshot_revision(), maps:get(revision, Schema)),
+    BaseKeys = maps:keys(beamtrail_reducer:new()),
+    RuntimeKeys = [created_at, migration_required_for_version_change],
+    ?assertEqual(lists:sort(BaseKeys ++ RuntimeKeys),
+                 maps:get(state_keys, Schema)),
+    ?assertEqual([attempt,
+                  completed_event_seq,
+                  idempotency_key,
+                  reason,
+                  result,
+                  started_event_seq,
+                  status,
+                  step_id,
+                  step_version],
+                 maps:get(attempt_keys, Schema)),
+    ?assert(beamtrail_state:snapshot_revision() > 0).
 
 storage_lists_run_ids_with_cursor() ->
     {ok, _} = beamtrail:start_workflow(bt_timeout_workflow, #{order_id => <<"o-page-2">>},

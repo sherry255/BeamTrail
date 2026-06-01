@@ -2,21 +2,60 @@
 
 -export([load/2, maybe_snapshot/4, apply_event/2,
          snapshot_policy/0, snapshot_every/0, snapshot_revision/0,
+         snapshot_schema/0,
          snapshot_revision_compatible/1]).
 
 -define(SNAPSHOT_EVERY, 5).
--define(SNAPSHOT_REVISION, 1).
 
 snapshot_policy() ->
     #{revision => snapshot_revision(),
       every_events => snapshot_every(),
       forced_by => [terminal_transition, recovery_marker]}.
 
+snapshot_schema() ->
+    (snapshot_schema_definition())#{revision => snapshot_revision()}.
+
+snapshot_schema_definition() ->
+    #{state_keys =>
+          [attempt_counts,
+           attempts,
+           completed_steps,
+           created_at,
+           current_step,
+           failure,
+           input,
+           last_event_seq,
+           migration_required_for_version_change,
+           next_retry_at,
+           pending_attempt,
+           run_id,
+           status,
+           steps,
+           terminal,
+           workflow],
+      attempt_keys =>
+          [attempt,
+           completed_event_seq,
+           idempotency_key,
+           reason,
+           result,
+           started_event_seq,
+           status,
+           step_id,
+           step_version]}.
+
 snapshot_every() ->
     ?SNAPSHOT_EVERY.
 
 snapshot_revision() ->
-    ?SNAPSHOT_REVISION.
+    %% Derive the persisted revision from the explicit schema contract so
+    %% schema edits automatically invalidate older snapshots.
+    <<Raw:32, _/binary>> = erlang:md5(term_to_binary(snapshot_schema_fingerprint_term())),
+    (Raw band 16#7fffffff) + 1.
+
+snapshot_schema_fingerprint_term() ->
+    Schema = snapshot_schema_definition(),
+    {maps:get(state_keys, Schema), maps:get(attempt_keys, Schema)}.
 
 load(RunId, Storage) ->
     case Storage:read_snapshot(RunId) of
