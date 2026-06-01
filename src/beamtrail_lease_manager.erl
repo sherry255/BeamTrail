@@ -11,16 +11,16 @@ acquire(RunId, Owner) ->
     acquire(RunId, Owner, default_ttl_ms()).
 
 acquire(RunId, Owner, TtlMs) ->
-    (beamtrail:storage()):acquire_lease(RunId, Owner, TtlMs).
+    (beamtrail_config:storage()):acquire_lease(RunId, Owner, TtlMs).
 
 renew(RunId, FencingToken) ->
     renew(RunId, FencingToken, default_ttl_ms()).
 
 renew(RunId, FencingToken, TtlMs) ->
-    (beamtrail:storage()):renew_lease(RunId, FencingToken, TtlMs).
+    (beamtrail_config:storage()):renew_lease(RunId, FencingToken, TtlMs).
 
 read(RunId) ->
-    (beamtrail:storage()):read_lease(RunId).
+    (beamtrail_config:storage()):read_lease(RunId).
 
 default_ttl_ms() ->
     case application:get_env(beamtrail, lease_ttl_ms) of

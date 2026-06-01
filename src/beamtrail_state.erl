@@ -1,9 +1,22 @@
 -module(beamtrail_state).
 
--export([load/2, maybe_snapshot/4, apply_event/2]).
+-export([load/2, maybe_snapshot/4, apply_event/2,
+         snapshot_policy/0, snapshot_every/0, snapshot_revision/0,
+         snapshot_revision_compatible/1]).
 
 -define(SNAPSHOT_EVERY, 5).
 -define(SNAPSHOT_REVISION, 1).
+
+snapshot_policy() ->
+    #{revision => snapshot_revision(),
+      every_events => snapshot_every(),
+      forced_by => [terminal_transition, recovery_marker]}.
+
+snapshot_every() ->
+    ?SNAPSHOT_EVERY.
+
+snapshot_revision() ->
+    ?SNAPSHOT_REVISION.
 
 load(RunId, Storage) ->
     case Storage:read_snapshot(RunId) of
@@ -38,14 +51,14 @@ load_from_events(RunId, Storage) ->
     end.
 
 snapshot_revision_compatible(Snapshot) ->
-    maps:get(snapshot_revision, Snapshot, 0) =:= ?SNAPSHOT_REVISION.
+    maps:get(snapshot_revision, Snapshot, 0) =:= snapshot_revision().
 
 maybe_snapshot(RunId, State, Force, Storage) ->
     Seq = maps:get(last_event_seq, State, 0),
-    ShouldWrite = Force orelse (Seq > 0 andalso Seq rem ?SNAPSHOT_EVERY =:= 0),
+    ShouldWrite = Force orelse (Seq > 0 andalso Seq rem snapshot_every() =:= 0),
     case ShouldWrite of
         true ->
-            case Storage:write_snapshot(RunId, State, Seq, ?SNAPSHOT_REVISION) of
+            case Storage:write_snapshot(RunId, State, Seq, snapshot_revision()) of
                 ok ->
                     beamtrail_telemetry:execute([beamtrail, snapshot, written],
                                                 #{count => 1},

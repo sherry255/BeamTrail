@@ -206,7 +206,7 @@ execution_context(RunId, Attempt) ->
 execute_attempt(RunId, Workflow, Input, Attempt, Lease) ->
     StepId = maps:get(step_id, Attempt),
     ExecSpec = execution_spec(RunId, Workflow, StepId, Input, Attempt),
-    beamtrail_runner_transition:execute_attempt(RunId, Lease, ExecSpec).
+    beamtrail_executor:execute_attempt(RunId, Lease, ExecSpec).
 
 handle_step_success(RunId, Attempt, Value, Lease, Options) ->
     case maps:get(runner_state, Options, undefined) of
@@ -217,7 +217,7 @@ handle_step_success(RunId, Attempt, Value, Lease, Options) ->
     end.
 
 handle_step_success_reload(RunId, Attempt, Value, Lease, Options) ->
-    case beamtrail_state:load(RunId, beamtrail:storage()) of
+    case beamtrail_state:load(RunId, beamtrail_config:storage()) of
         {ok, State} ->
             handle_step_success_state(RunId, State, Attempt, Value, Lease,
                                       Options#{runner_state => State});
@@ -268,7 +268,7 @@ handle_step_failure(RunId, Attempt, Reason, Lease, Options) ->
     end.
 
 handle_step_failure_reload(RunId, Attempt, Reason, Lease, Options) ->
-    case beamtrail_state:load(RunId, beamtrail:storage()) of
+    case beamtrail_state:load(RunId, beamtrail_config:storage()) of
         {ok, State} ->
             handle_step_failure_state(RunId, State, Attempt, Reason, Lease,
                                       Options#{runner_state => State});
@@ -409,12 +409,12 @@ pending_attempt_expected_seq_from_state(State, Attempt) ->
 
 append_event(RunId, ExpectedSeq, Lease, EventType, StepId, StepVersion,
              IdempotencyKey, Payload) ->
-    (beamtrail:storage()):append_event(RunId, ExpectedSeq, lease_fencing_token(Lease),
-                                       EventType, StepId, StepVersion,
-                                       IdempotencyKey, Payload).
+    (beamtrail_config:storage()):append_event(RunId, ExpectedSeq, lease_fencing_token(Lease),
+                                              EventType, StepId, StepVersion,
+                                              IdempotencyKey, Payload).
 
 maybe_snapshot_state(RunId, State, Force) ->
-    beamtrail_state:maybe_snapshot(RunId, State, Force, beamtrail:storage()).
+    beamtrail_state:maybe_snapshot(RunId, State, Force, beamtrail_config:storage()).
 
 apply_runtime_event(State, Event) ->
     beamtrail_state:apply_event(State, Event).
@@ -422,7 +422,7 @@ apply_runtime_event(State, Event) ->
 lease_current(RunId, Lease) ->
     FencingToken = lease_fencing_token(Lease),
     Now = erlang:system_time(millisecond),
-    case (beamtrail:storage()):read_lease(RunId) of
+    case (beamtrail_config:storage()):read_lease(RunId) of
         {ok, #{fencing_token := FencingToken, lease_until := LeaseUntil}}
           when is_integer(FencingToken), LeaseUntil > Now ->
             true;

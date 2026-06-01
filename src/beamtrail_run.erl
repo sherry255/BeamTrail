@@ -116,7 +116,7 @@ start_step_execution(Attempt, ExecSpec, Data0) ->
     Pid = spawn_link(
             fun() ->
                     Parent ! {step_result, Ref,
-                              beamtrail_runner_transition:execute_attempt(ExecSpec)}
+                              beamtrail_executor:execute_attempt(ExecSpec)}
             end),
     Data1 = schedule_heartbeat(Data0),
     Data2 = Data1#{dispatch := {Ref, Pid},

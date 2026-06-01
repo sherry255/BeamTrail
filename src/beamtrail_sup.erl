@@ -13,7 +13,7 @@ init([]) ->
             undefined -> 5000
         end,
     StorageChild =
-        case beamtrail:storage() of
+        case beamtrail_config:storage() of
             beamtrail_memory_storage ->
                 [#{id => beamtrail_memory_storage,
                    start => {beamtrail_memory_storage, start_link, []},

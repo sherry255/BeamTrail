@@ -8,21 +8,21 @@
 -export([describe/1, list/0, telemetry/0]).
 
 list() ->
-    Mod = beamtrail:storage(),
+    Mod = beamtrail_config:storage(),
     case Mod:list_run_ids() of
         {ok, RunIds} -> [describe(R) || R <- RunIds];
         {error, _} = Error -> Error
     end.
 
 telemetry() ->
-    Mod = beamtrail:storage(),
+    Mod = beamtrail_config:storage(),
     case erlang:function_exported(Mod, telemetry_counters, 0) of
         true -> Mod:telemetry_counters();
         false -> #{adapter => Mod, note => <<"telemetry counters not implemented by adapter">>}
     end.
 
 describe(RunId) ->
-    Mod = beamtrail:storage(),
+    Mod = beamtrail_config:storage(),
     case beamtrail:get_state(RunId) of
         {error, _} = Error ->
             Error;
@@ -82,7 +82,7 @@ describe_loaded_events(RunId, Mod, State, Events) ->
             snapshot =>
                 #{snapshot_seq => snapshot_field(Snapshot, snapshot_seq, 0),
                   snapshot_revision => snapshot_field(Snapshot, snapshot_revision, 0),
-                  policy => <<"every_5_events_plus_terminal_and_recovery">>,
+                  policy => beamtrail_state:snapshot_policy(),
                   replay_tail_events => TailLen},
             read_models =>
                 [reducer_state,

@@ -9,8 +9,6 @@
 -export([list_recoverable/0, list_recoverable/2,
          mark_recovery_requeued/1, mark_recovery_requeued_with_lease/1]).
 
--define(STORAGE_DEFAULT, beamtrail_memory_storage).
-
 start() ->
     application:ensure_all_started(beamtrail).
 
@@ -318,29 +316,10 @@ maybe_snapshot(RunId, Force) ->
     end.
 
 ensure_storage() ->
-    Mod = storage(),
-    %% Only ad-hoc start for the in-memory adapter; durable adapters are
-    %% expected to be started under the supervision tree with their own
-    %% connection setup.
-    case Mod =:= ?STORAGE_DEFAULT of
-        true ->
-            case whereis(Mod) of
-                undefined ->
-                    case Mod:start_link() of
-                        {ok, _Pid} -> ok;
-                        {error, {already_started, _Pid}} -> ok
-                    end;
-                _Pid -> ok
-            end;
-        false ->
-            ok
-    end.
+    beamtrail_config:ensure_storage().
 
 storage() ->
-    case application:get_env(beamtrail, storage_adapter) of
-        {ok, M} when is_atom(M) -> M;
-        _ -> ?STORAGE_DEFAULT
-    end.
+    beamtrail_config:storage().
 
 new_run_id() ->
     iolist_to_binary(io_lib:format("run-~p-~p", [erlang:system_time(millisecond),

@@ -20,7 +20,7 @@ execute(EventName, Measurements, Metadata) ->
 %% if present, is always notified.
 bump_storage_counter(EventName, Measurements) ->
     Count = maps:get(count, Measurements, 1),
-    Mod = try beamtrail:storage()
+    Mod = try beamtrail_config:storage()
           catch _:_ -> beamtrail_memory_storage end,
     case erlang:function_exported(Mod, bump_counter, 2) of
         true ->
