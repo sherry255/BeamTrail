@@ -99,7 +99,8 @@ describe(RunId) ->
             primary_writes =>
                 [<<"append_event(run_id, expected_seq, fencing_token, type, step_id, step_version, key, payload)">>,
                  <<"write_snapshot(run_id, state, snapshot_seq, snapshot_revision)">>,
-                 <<"acquire_lease(run_id, owner_node, ttl_ms)">>],
+                 <<"acquire_lease(run_id, owner_node, ttl_ms)">>,
+                 <<"renew_lease(run_id, fencing_token, ttl_ms)">>],
             query_path =>
                 <<"read_snapshot + read_events(from_snapshot_seq + 1) + reduce tail">>},
       query => #{api => <<"beamtrail_query:describe/1">>,

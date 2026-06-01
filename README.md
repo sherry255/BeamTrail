@@ -21,9 +21,13 @@ recovery metadata in the event history.
 
 - Append-only workflow event streams.
 - Snapshot plus tail replay.
-- Retry policies with stable idempotency keys.
+- Retry policies with stable idempotency keys. BeamTrail passes the key
+  to workflow code and records it in the event log; external side-effect
+  deduplication is still the workflow's responsibility.
 - Step and workflow timeouts.
 - Step-version replay for recovery.
+- Lease fencing for dispatch and event writes, including heartbeat
+  renewal while a step is running.
 - Background recovery scanner and worker supervisor.
 - Query view for events, attempts, snapshots, leases, recovery state,
   and telemetry counters.

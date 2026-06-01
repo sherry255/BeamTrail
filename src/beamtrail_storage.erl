@@ -10,11 +10,14 @@
                        Payload :: map()) -> {ok, map()} | {error, term()}.
 -callback read_events(RunId :: binary(), FromSeq :: pos_integer(), Limit :: pos_integer() | infinity) ->
     {ok, [map()]} | {error, term()}.
+-callback events(RunId :: binary()) -> {ok, [map()]} | {error, term()}.
 -callback write_snapshot(RunId :: binary(), State :: map(), SnapshotSeq :: non_neg_integer(),
                          SnapshotRevision :: pos_integer()) -> ok | {error, term()}.
 -callback read_snapshot(RunId :: binary()) -> {ok, map()} | not_found | {error, term()}.
 -callback acquire_lease(RunId :: binary(), Owner :: term(), TtlMs :: pos_integer()) ->
     {ok, map()} | {error, leased}.
+-callback renew_lease(RunId :: binary(), FencingToken :: pos_integer(), TtlMs :: pos_integer()) ->
+    {ok, map()} | {error, no_lease | stale_fence | term()}.
 -callback read_lease(RunId :: binary()) -> {ok, map()} | not_found.
 -callback list_run_ids() -> [binary()].
 

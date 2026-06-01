@@ -10,11 +10,14 @@ extended_test_() ->
       fun workflow_timeout_emits_workflow_failed/0,
       fun scanner_requeues_unknown_attempts/0,
       fun query_describe_exposes_read_model/0,
+      fun query_instance_current_step_matches_reducer/0,
       fun telemetry_counters_track_attempts/0,
       fun postgres_stub_is_loud_about_not_implemented/0,
       fun storage_rejects_expected_seq_conflict/0,
+      fun storage_renews_current_lease_without_changing_fence/0,
       fun dispatch_refuses_when_run_is_leased/0,
       fun dispatch_refuses_stale_lease_before_replay/0,
+      fun dispatch_renews_lease_while_step_runs/0,
       fun dispatch_refuses_version_mismatch_without_migration/0,
       fun retry_attempts_preserved_in_chronological_order/0,
       fun storage_adapter_is_application_configurable/0,
@@ -92,6 +95,29 @@ query_describe_exposes_read_model() ->
                    run_id := RunId}, maps:get(query, Q)),
     ?assertEqual(false, maps:get(migration_required_for_version_change, Q)).
 
+query_instance_current_step_matches_reducer() ->
+    RunId = <<"query-step-run-1">>,
+    Input = #{order_id => <<"o-q-step-1">>},
+    {ok, _} = beamtrail_memory_storage:append_event(
+                RunId, 0, undefined,
+                'workflow.instance.created', undefined, undefined,
+                undefined,
+                #{workflow => bt_success_workflow, input => Input,
+                  steps => [charge, ship]}),
+    {ok, Lease} = beamtrail_memory_storage:acquire_lease(RunId, query_seed, 1000),
+    Fence = maps:get(fencing_token, Lease),
+    {ok, _} = beamtrail_memory_storage:append_event(
+                RunId, 1, Fence,
+                'attempt.started', charge, 1,
+                {charge, <<"o-q-step-1">>}, #{attempt => 1}),
+    {ok, _} = beamtrail_memory_storage:append_event(
+                RunId, 2, Fence,
+                'step.succeeded', charge, 1,
+                {charge, <<"o-q-step-1">>}, #{result => #{ok => true}}),
+    Q = beamtrail_query:describe(RunId),
+    ?assertEqual(ship, maps:get(current_step, Q)),
+    ?assertEqual(ship, maps:get(current_step, maps:get(instance, Q))).
+
 telemetry_counters_track_attempts() ->
     Input = #{order_id => <<"o-t-1">>, test_pid => self()},
     {ok, _RunId} = beamtrail:start_workflow(bt_success_workflow, Input),
@@ -109,6 +135,8 @@ postgres_stub_is_loud_about_not_implemented() ->
                    undefined, undefined, #{})),
     ?assertEqual({error, not_implemented},
                  beamtrail_postgres_storage:read_events(<<"r">>, 1, infinity)),
+    ?assertEqual({error, not_implemented},
+                 beamtrail_postgres_storage:events(<<"r">>)),
     ?assertEqual(not_found, beamtrail_postgres_storage:read_lease(<<"r">>)).
 
 storage_rejects_expected_seq_conflict() ->
@@ -123,6 +151,17 @@ storage_rejects_expected_seq_conflict() ->
                    RunId, 0, undefined,
                    'workflow.completed', undefined, undefined,
                    undefined, #{})).
+
+storage_renews_current_lease_without_changing_fence() ->
+    RunId = <<"renew-run-1">>,
+    {ok, Lease} = beamtrail_memory_storage:acquire_lease(RunId, worker_a, 10),
+    Fence = maps:get(fencing_token, Lease),
+    timer:sleep(2),
+    {ok, Renewed} = beamtrail_memory_storage:renew_lease(RunId, Fence, 100),
+    ?assertEqual(Fence, maps:get(fencing_token, Renewed)),
+    ?assert(maps:get(lease_until, Renewed) > maps:get(lease_until, Lease)),
+    ?assertEqual({error, stale_fence},
+                 beamtrail_memory_storage:renew_lease(RunId, Fence - 1, 100)).
 
 dispatch_refuses_when_run_is_leased() ->
     RunId = <<"leased-run-1">>,
@@ -160,6 +199,22 @@ dispatch_refuses_stale_lease_before_replay() ->
     {ok, Events} = beamtrail:events(RunId),
     ?assertEqual(['workflow.instance.created', 'attempt.started'],
                  [maps:get(event_type, E) || E <- Events]).
+
+dispatch_renews_lease_while_step_runs() ->
+    Input = #{order_id => <<"o-slow-lease-1">>, test_pid => self(),
+              sleep_ms => 160},
+    {ok, RunId} = beamtrail:start_workflow(bt_slow_success_workflow, Input,
+                                           #{auto_dispatch => false}),
+    {ok, Lease} = beamtrail_memory_storage:acquire_lease(RunId, slow_worker, 50),
+    ?assertMatch({ok, #{status := completed}}, beamtrail:dispatch(RunId, Lease)),
+    ?assertMatch({slow_executed, slow}, receive_exec()),
+    {ok, Events} = beamtrail:events(RunId),
+    ?assertEqual(1, length([E || E <- Events,
+                            maps:get(event_type, E) =:= 'step.succeeded'])),
+    {ok, CurrentLease} = beamtrail_memory_storage:read_lease(RunId),
+    ?assertEqual(maps:get(fencing_token, Lease),
+                 maps:get(fencing_token, CurrentLease)),
+    ?assert(maps:get(lease_until, CurrentLease) > maps:get(lease_until, Lease)).
 
 dispatch_refuses_version_mismatch_without_migration() ->
     RunId = <<"version-gate-run-1">>,

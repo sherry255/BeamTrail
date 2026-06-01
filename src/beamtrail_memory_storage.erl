@@ -5,7 +5,7 @@
 -export([start_link/0, reset/0]).
 -export([append_event/8, read_events/3, events/1, list_run_ids/0]).
 -export([write_snapshot/4, read_snapshot/1]).
--export([acquire_lease/3, read_lease/1]).
+-export([acquire_lease/3, renew_lease/3, read_lease/1]).
 -export([read_instance/1, read_attempts/1, telemetry_counters/0]).
 -export([bump_counter/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
@@ -43,6 +43,9 @@ read_snapshot(RunId) ->
 
 acquire_lease(RunId, Owner, TtlMs) ->
     gen_server:call(?MODULE, {acquire_lease, RunId, Owner, TtlMs}).
+
+renew_lease(RunId, FencingToken, TtlMs) ->
+    gen_server:call(?MODULE, {renew_lease, RunId, FencingToken, TtlMs}).
 
 read_lease(RunId) ->
     gen_server:call(?MODULE, {read_lease, RunId}).
@@ -147,6 +150,24 @@ handle_call({acquire_lease, RunId, Owner, TtlMs}, _From, State) ->
         false ->
             {reply, {error, leased}, State}
     end;
+handle_call({renew_lease, RunId, FencingToken, TtlMs}, _From, State) ->
+    Now = erlang:system_time(millisecond),
+    Leases = maps:get(leases, State),
+    case maps:get(RunId, Leases, undefined) of
+        undefined ->
+            {reply, {error, no_lease}, State};
+        #{fencing_token := FencingToken} = Current when is_integer(FencingToken) ->
+            Renewed = Current#{lease_until := Now + TtlMs,
+                               renewed_at => Now},
+            {reply, {ok, Renewed},
+             State#{leases := maps:put(RunId, Renewed, Leases)}};
+        #{fencing_token := CurrentFence} when FencingToken < CurrentFence ->
+            {reply, {error, stale_fence}, State};
+        #{fencing_token := CurrentFence} ->
+            {reply, {error, {invalid_fence, #{provided => FencingToken,
+                                              current => CurrentFence}}},
+             State}
+    end;
 handle_call({read_lease, RunId}, _From, State) ->
     Reply =
         case maps:find(RunId, maps:get(leases, State)) of
@@ -237,9 +258,12 @@ project_instance(State, Event) ->
 
 update_instance(Inst, #{event_type := 'workflow.instance.created'} = E) ->
     P = maps:get(payload, E),
+    Steps = maps:get(steps, P, []),
     Inst#{workflow => maps:get(workflow, P),
+          steps => Steps,
           status => running,
-          current_step => first_step(maps:get(steps, P, [])),
+          current_step => first_step(Steps),
+          completed_steps => 0,
           last_event_seq => maps:get(event_seq, E),
           created_at => maps:get(occurred_at, E)};
 update_instance(Inst, #{event_type := 'attempt.started'} = E) ->
@@ -248,7 +272,11 @@ update_instance(Inst, #{event_type := 'attempt.started'} = E) ->
           next_retry_at => undefined,
           last_event_seq => maps:get(event_seq, E)};
 update_instance(Inst, #{event_type := 'step.succeeded'} = E) ->
+    CompletedSteps = maps:get(completed_steps, Inst, 0) + 1,
+    Steps = maps:get(steps, Inst, []),
     Inst#{status => running,
+          current_step => next_step(Steps, CompletedSteps),
+          completed_steps => CompletedSteps,
           last_event_seq => maps:get(event_seq, E),
           failure => undefined};
 update_instance(Inst, #{event_type := 'step.failed'} = E) ->
@@ -267,6 +295,7 @@ update_instance(Inst, #{event_type := 'workflow.completed'} = E) ->
           completed_at => maps:get(occurred_at, E)};
 update_instance(Inst, #{event_type := 'workflow.failed'} = E) ->
     Inst#{status => failed,
+          current_step => undefined,
           last_event_seq => maps:get(event_seq, E),
           terminal => true,
           failure => maps:get(payload, E)};
@@ -330,3 +359,8 @@ mark_latest_attempt(Attempts, StepId, Status, Event) ->
 
 first_step([]) -> undefined;
 first_step([S | _]) -> S.
+
+next_step(Steps, CompletedSteps) when CompletedSteps >= length(Steps) ->
+    undefined;
+next_step(Steps, CompletedSteps) ->
+    lists:nth(CompletedSteps + 1, Steps).

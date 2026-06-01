@@ -208,7 +208,7 @@ run_step(RunId, State, StepId, Lease) ->
                 false ->
                     ok
             end,
-            Result = execute_attempt(RunId, Workflow, Input, Attempt),
+            Result = execute_attempt(RunId, Workflow, Input, Attempt, Lease),
             case Result of
                 {ok, Value} ->
                     handle_step_success(RunId, Attempt, Value, Lease);
@@ -251,7 +251,7 @@ ensure_attempt_started(RunId, Workflow, Input, State, StepId, Lease) ->
             end
     end.
 
-execute_attempt(RunId, Workflow, Input, Attempt) ->
+execute_attempt(RunId, Workflow, Input, Attempt, Lease) ->
     StepId = maps:get(step_id, Attempt),
     StepVersion = maps:get(step_version, Attempt),
     Context =
@@ -261,7 +261,13 @@ execute_attempt(RunId, Workflow, Input, Attempt) ->
           attempt => maps:get(attempt, Attempt),
           idempotency_key => maps:get(idempotency_key, Attempt)},
     Timeout = Workflow:timeout_ms(StepId),
-    run_with_timeout(fun() -> safe_execute(Workflow, StepId, StepVersion, Input, Context) end, Timeout).
+    with_lease_heartbeat(
+      RunId,
+      Lease,
+      fun() ->
+              run_with_timeout(fun() -> safe_execute(Workflow, StepId, StepVersion, Input, Context) end,
+                               Timeout)
+      end).
 
 safe_execute(Workflow, StepId, StepVersion, Input, Context) ->
     try Workflow:execute(StepId, StepVersion, Input, Context) of
@@ -285,6 +291,36 @@ run_with_timeout(Fun, TimeoutMs) when is_integer(TimeoutMs), TimeoutMs >= 0 ->
     after TimeoutMs ->
         exit(Pid, kill),
         {error, timeout}
+    end.
+
+with_lease_heartbeat(RunId, Lease, Fun) ->
+    StopRef = make_ref(),
+    Parent = self(),
+    Pid = spawn(fun() ->
+                        ParentRef = erlang:monitor(process, Parent),
+                        lease_heartbeat_loop(RunId, Lease, StopRef, ParentRef)
+                end),
+    try Fun()
+    after
+        Pid ! {StopRef, stop}
+    end.
+
+lease_heartbeat_loop(RunId, Lease, StopRef, ParentRef) ->
+    Interval = lease_heartbeat_interval_ms(Lease),
+    receive
+        {StopRef, stop} ->
+            erlang:demonitor(ParentRef, [flush]),
+            ok;
+        {'DOWN', ParentRef, process, _Pid, _Reason} ->
+            ok
+    after Interval ->
+        case (storage()):renew_lease(RunId, lease_fencing_token(Lease),
+                                     lease_ttl_ms(Lease)) of
+            {ok, _Renewed} ->
+                lease_heartbeat_loop(RunId, Lease, StopRef, ParentRef);
+            {error, _} ->
+                ok
+        end
     end.
 
 handle_step_success(RunId, Attempt, Value, Lease) ->
@@ -576,6 +612,17 @@ lease_fencing_token(Lease) when is_map(Lease) ->
     maps:get(fencing_token, Lease, undefined);
 lease_fencing_token(_) ->
     undefined.
+
+lease_ttl_ms(#{lease_until := Until, acquired_at := AcquiredAt})
+  when is_integer(Until), is_integer(AcquiredAt), Until > AcquiredAt ->
+    Until - AcquiredAt;
+lease_ttl_ms(#{lease_until := Until}) when is_integer(Until) ->
+    max(1, Until - erlang:system_time(millisecond));
+lease_ttl_ms(_) ->
+    ?LEASE_TTL_MS.
+
+lease_heartbeat_interval_ms(Lease) ->
+    max(1, min(5000, lease_ttl_ms(Lease) div 3)).
 
 lease_current(RunId, Lease) ->
     FencingToken = lease_fencing_token(Lease),

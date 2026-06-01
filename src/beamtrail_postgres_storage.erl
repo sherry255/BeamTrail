@@ -18,13 +18,15 @@
 %%%
 %%% Until then, the in-memory adapter is the only supported backend.
 
--export([append_event/8, read_events/3, write_snapshot/4, read_snapshot/1,
-         acquire_lease/3, read_lease/1, list_run_ids/0]).
+-export([append_event/8, read_events/3, events/1, write_snapshot/4, read_snapshot/1,
+         acquire_lease/3, renew_lease/3, read_lease/1, list_run_ids/0]).
 
 append_event(_, _, _, _, _, _, _, _) -> {error, not_implemented}.
 read_events(_, _, _) -> {error, not_implemented}.
+events(_) -> {error, not_implemented}.
 write_snapshot(_, _, _, _) -> {error, not_implemented}.
 read_snapshot(_) -> {error, not_implemented}.
 acquire_lease(_, _, _) -> {error, not_implemented}.
+renew_lease(_, _, _) -> {error, not_implemented}.
 read_lease(_) -> not_found.
 list_run_ids() -> [].
