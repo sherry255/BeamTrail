@@ -1,7 +1,8 @@
 -module(beamtrail).
 
 -export([start/0, stop/0]).
--export([start_workflow/2, start_workflow/3, dispatch/1, dispatch/2, recover_unfinished/0]).
+-export([start_workflow/2, start_workflow/3, dispatch/1, dispatch/2,
+         dispatch_from_runner/2, recover_unfinished/0]).
 -export([get_state/1, events/1, storage/0]).
 -export([list_recoverable/0, list_recoverable/2,
          mark_recovery_requeued/1, mark_recovery_requeued_with_lease/1]).
@@ -74,9 +75,17 @@ dispatch(RunId) ->
     end.
 
 dispatch(RunId, Lease) when is_map(Lease) ->
+    dispatch_with_lease(RunId, Lease, #{lease_heartbeat => internal}).
+
+%% Used by beamtrail_run: the active runner owns lease renewal while dispatch
+%% owns event transitions and step timeout handling.
+dispatch_from_runner(RunId, Lease) when is_map(Lease) ->
+    dispatch_with_lease(RunId, Lease, #{lease_heartbeat => external}).
+
+dispatch_with_lease(RunId, Lease, Options) ->
     ok = ensure_storage(),
     case load_state(RunId) of
-        {ok, State} -> dispatch_locked(RunId, State, Lease);
+        {ok, State} -> dispatch_locked(RunId, State, Lease, Options);
         {error, _} = Error -> Error
     end.
 
@@ -152,6 +161,9 @@ dispatch_with_new_lease(RunId, _State) ->
     end.
 
 dispatch_locked(RunId, State, Lease) ->
+    dispatch_locked(RunId, State, Lease, #{lease_heartbeat => internal}).
+
+dispatch_locked(RunId, State, Lease, Options) ->
     case lease_current(RunId, Lease) of
         false ->
             {error, stale_lease};
@@ -160,22 +172,25 @@ dispatch_locked(RunId, State, Lease) ->
                 true ->
                     {error, {migration_required, State}};
                 false ->
-                    dispatch_ready(RunId, State, Lease)
+                    dispatch_ready(RunId, State, Lease, Options)
             end
     end.
 
 dispatch_retrying(RunId, State, Lease) ->
+    dispatch_retrying(RunId, State, Lease, #{lease_heartbeat => internal}).
+
+dispatch_retrying(RunId, State, Lease, Options) ->
     Now = erlang:system_time(millisecond),
     case maps:get(next_retry_at, State, 0) =< Now of
         true ->
             case Lease of
                 none -> dispatch_with_new_lease(RunId, State);
-                _ -> dispatch_locked(RunId, State, Lease)
+                _ -> dispatch_locked(RunId, State, Lease, Options)
             end;
         false -> {ok, State}
     end.
 
-dispatch_ready(RunId, State, Lease) ->
+dispatch_ready(RunId, State, Lease, Options) ->
     case workflow_timeout_exceeded(State) of
         true ->
             fail_workflow_with_timeout(RunId, State, Lease);
@@ -184,7 +199,7 @@ dispatch_ready(RunId, State, Lease) ->
                 undefined ->
                     complete_if_needed(RunId, State, Lease);
                 StepId ->
-                    run_step(RunId, State, StepId, Lease)
+                    run_step(RunId, State, StepId, Lease, Options)
             end
     end.
 
@@ -248,7 +263,7 @@ complete_if_needed(RunId, State, Lease) ->
             end
     end.
 
-run_step(RunId, State, StepId, Lease) ->
+run_step(RunId, State, StepId, Lease, Options) ->
     Workflow = maps:get(workflow, State),
     Input = maps:get(input, State),
     case ensure_attempt_started(RunId, Workflow, Input, State, StepId, Lease) of
@@ -260,12 +275,12 @@ run_step(RunId, State, StepId, Lease) ->
                 false ->
                     ok
             end,
-            Result = execute_attempt(RunId, Workflow, Input, Attempt, Lease),
+            Result = execute_attempt(RunId, Workflow, Input, Attempt, Lease, Options),
             case Result of
                 {ok, Value} ->
-                    handle_step_success(RunId, Attempt, Value, Lease);
+                    handle_step_success(RunId, Attempt, Value, Lease, Options);
                 {error, Reason} ->
-                    handle_step_failure(RunId, Attempt, Reason, Lease)
+                    handle_step_failure(RunId, Attempt, Reason, Lease, Options)
             end;
         {error, _} = Error ->
             Error
@@ -307,7 +322,7 @@ ensure_attempt_started(RunId, Workflow, Input, State, StepId, Lease) ->
             end
     end.
 
-execute_attempt(RunId, Workflow, Input, Attempt, Lease) ->
+execute_attempt(RunId, Workflow, Input, Attempt, Lease, Options) ->
     StepId = maps:get(step_id, Attempt),
     StepVersion = maps:get(step_version, Attempt),
     Context =
@@ -317,11 +332,13 @@ execute_attempt(RunId, Workflow, Input, Attempt, Lease) ->
           attempt => maps:get(attempt, Attempt),
           idempotency_key => maps:get(idempotency_key, Attempt)},
     Timeout = Workflow:timeout_ms(StepId),
-    run_with_timeout_and_lease_heartbeat(
-      RunId,
-      Lease,
-      fun() -> safe_execute(Workflow, StepId, StepVersion, Input, Context) end,
-      Timeout).
+    Fun = fun() -> safe_execute(Workflow, StepId, StepVersion, Input, Context) end,
+    case maps:get(lease_heartbeat, Options, internal) of
+        external ->
+            run_with_timeout_linked(Fun, Timeout);
+        internal ->
+            run_with_timeout_and_lease_heartbeat(RunId, Lease, Fun, Timeout)
+    end.
 
 safe_execute(Workflow, StepId, StepVersion, Input, Context) ->
     try Workflow:execute(StepId, StepVersion, Input, Context) of
@@ -357,6 +374,34 @@ run_with_timeout_and_lease_heartbeat(RunId, Lease, Fun, TimeoutMs) ->
             cancel_attempt_timeout(TimeoutRef),
             exit(ExecPid, kill),
             {error, #{class => lease_lost, reason => Reason}}
+    end.
+
+run_with_timeout_linked(Fun, TimeoutMs) ->
+    Parent = self(),
+    ResultRef = make_ref(),
+    ExecPid = spawn_link(fun() -> Parent ! {ResultRef, execute, guarded_execute(Fun)} end),
+    TimeoutRef = arm_attempt_timeout(ResultRef, TimeoutMs),
+    receive
+        {ResultRef, execute, Result} ->
+            cancel_attempt_timeout(TimeoutRef),
+            unlink(ExecPid),
+            flush_exit(ExecPid),
+            Result;
+        {ResultRef, timeout} ->
+            unlink(ExecPid),
+            exit(ExecPid, kill),
+            flush_exit(ExecPid),
+            {error, timeout};
+        {'EXIT', ExecPid, Reason} ->
+            cancel_attempt_timeout(TimeoutRef),
+            {error, #{class => exit, reason => Reason}}
+    end.
+
+flush_exit(Pid) ->
+    receive
+        {'EXIT', Pid, _Reason} -> ok
+    after 0 ->
+        ok
     end.
 
 guarded_execute(Fun) ->
@@ -397,7 +442,7 @@ lease_heartbeat_loop(RunId, Lease, StopRef, ParentRef, Parent) ->
         end
     end.
 
-handle_step_success(RunId, Attempt, Value, Lease) ->
+handle_step_success(RunId, Attempt, Value, Lease, Options) ->
     StepId = maps:get(step_id, Attempt),
     case pending_attempt_expected_seq(RunId, Attempt) of
         {ok, ExpectedSeq} ->
@@ -414,7 +459,7 @@ handle_step_success(RunId, Attempt, Value, Lease) ->
                     with_snapshot(
                       RunId,
                       false,
-                      fun() -> dispatch_locked(RunId, get_state(RunId), Lease) end);
+                      fun() -> dispatch_locked(RunId, get_state(RunId), Lease, Options) end);
                 {error, _} = Error ->
                     Error
             end;
@@ -422,7 +467,7 @@ handle_step_success(RunId, Attempt, Value, Lease) ->
             Error
     end.
 
-handle_step_failure(RunId, Attempt, Reason, Lease) ->
+handle_step_failure(RunId, Attempt, Reason, Lease, Options) ->
     StepId = maps:get(step_id, Attempt),
     FailurePayload = #{reason => Reason, class => error_key(Reason), attempt => maps:get(attempt, Attempt)},
     case pending_attempt_expected_seq(RunId, Attempt) of
@@ -447,7 +492,7 @@ handle_step_failure(RunId, Attempt, Reason, Lease) ->
                               case should_retry(Policy, Reason, maps:get(attempt, Attempt)) of
                                   true ->
                                       schedule_retry(RunId, Attempt, Reason, Policy, Lease,
-                                                     maps:get(event_seq, FailedEvent));
+                                                     maps:get(event_seq, FailedEvent), Options);
                                   false ->
                                       fail_workflow(RunId, Attempt, FailurePayload, Lease,
                                                     maps:get(event_seq, FailedEvent))
@@ -460,7 +505,7 @@ handle_step_failure(RunId, Attempt, Reason, Lease) ->
             Error
     end.
 
-schedule_retry(RunId, Attempt, Reason, Policy, Lease, ExpectedSeq) ->
+schedule_retry(RunId, Attempt, Reason, Policy, Lease, ExpectedSeq, Options) ->
     StepId = maps:get(step_id, Attempt),
     BackoffMs = maps:get(backoff_ms, Policy, 0),
     NextRetryAt = erlang:system_time(millisecond) + BackoffMs,
@@ -486,7 +531,7 @@ schedule_retry(RunId, Attempt, Reason, Policy, Lease, ExpectedSeq) ->
               false,
               fun() ->
                       case BackoffMs of
-                          0 -> dispatch_retrying(RunId, get_state(RunId), Lease);
+                          0 -> dispatch_retrying(RunId, get_state(RunId), Lease, Options);
                           _ -> {ok, get_state(RunId)}
                       end
               end);

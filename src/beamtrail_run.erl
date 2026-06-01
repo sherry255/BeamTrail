@@ -89,12 +89,14 @@ start_dispatch(Data0) ->
         {ok, #{run_id := RunId, lease := Lease} = Data2} ->
             Ref = make_ref(),
             Parent = self(),
+            Data3 = schedule_heartbeat(Data2),
             Pid = spawn_link(
                     fun() ->
+                            process_flag(trap_exit, true),
                             Parent ! {dispatch_result, Ref,
-                                      beamtrail:dispatch(RunId, Lease)}
+                                      beamtrail:dispatch_from_runner(RunId, Lease)}
                     end),
-            {next_state, executing, Data2#{dispatch := {Ref, Pid}}};
+            {next_state, executing, Data3#{dispatch := {Ref, Pid}}};
         {error, _Reason} ->
             {stop, normal, Data1}
     end.

@@ -106,13 +106,13 @@ postgres_rejects_zombie_append_after_fence_takeover() ->
                 undefined,
                 #{workflow => bt_success_workflow, input => #{},
                   steps => [charge]}),
-    {ok, Lease1} = beamtrail_postgres_storage:acquire_lease(RunId, worker_a, 30),
+    {ok, Lease1} = beamtrail_postgres_storage:acquire_lease(RunId, worker_a, 200),
     Fence1 = maps:get(fencing_token, Lease1),
     {ok, _} = beamtrail_postgres_storage:append_event(
                 RunId, 1, Fence1,
                 'attempt.started', charge, 1,
                 {charge, RunId}, #{attempt => 1}),
-    timer:sleep(40),
+    ok = wait_until_pg_lease_expired(RunId, 1000),
     {ok, Lease2} = beamtrail_postgres_storage:acquire_lease(RunId, worker_b, 1000),
     Fence2 = maps:get(fencing_token, Lease2),
     ?assert(Fence2 > Fence1),
@@ -261,6 +261,17 @@ receive_slow_append(SlowPid, SlowRef) ->
             {error, {slow_append_down, Reason}}
     after 4000 ->
             {error, slow_append_timeout}
+    end.
+
+wait_until_pg_lease_expired(_RunId, Remaining) when Remaining =< 0 ->
+    {error, timeout};
+wait_until_pg_lease_expired(RunId, Remaining) ->
+    {ok, Lease} = beamtrail_postgres_storage:read_lease(RunId),
+    case maps:get(lease_until, Lease) =< erlang:system_time(millisecond) of
+        true -> ok;
+        false ->
+            timer:sleep(20),
+            wait_until_pg_lease_expired(RunId, Remaining - 20)
     end.
 
 with_pg(Config, Fun) ->
