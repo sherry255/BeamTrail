@@ -7,7 +7,6 @@
          mark_recovery_requeued/1, mark_recovery_requeued_with_lease/1]).
 
 -define(STORAGE_DEFAULT, beamtrail_memory_storage).
--define(LEASE_TTL_MS, 30000).
 -define(SNAPSHOT_EVERY, 5).
 -define(SNAPSHOT_REVISION, 1).
 
@@ -139,7 +138,8 @@ events(RunId) ->
     (storage()):events(RunId).
 
 dispatch_with_new_lease(RunId, _State) ->
-    case (storage()):acquire_lease(RunId, dispatch_owner(), ?LEASE_TTL_MS) of
+    case (storage()):acquire_lease(
+           RunId, dispatch_owner(), beamtrail_lease_manager:default_ttl_ms()) of
         {ok, Lease} ->
             case load_state(RunId) of
                 {ok, State} -> dispatch_locked(RunId, State, Lease);
@@ -557,7 +557,8 @@ mark_recovery_requeued(RunId) ->
 mark_recovery_requeued_with_lease(RunId) ->
     ok = ensure_storage(),
     Mod = storage(),
-    case Mod:acquire_lease(RunId, dispatch_owner(), ?LEASE_TTL_MS) of
+    case Mod:acquire_lease(
+           RunId, dispatch_owner(), beamtrail_lease_manager:default_ttl_ms()) of
         {ok, Lease} ->
             append_recovery_marker(Mod, RunId, 'recovery.requeued', Lease);
         {error, leased} ->
@@ -719,7 +720,7 @@ lease_ttl_ms(#{lease_until := Until, acquired_at := AcquiredAt})
 lease_ttl_ms(#{lease_until := Until}) when is_integer(Until) ->
     max(1, Until - erlang:system_time(millisecond));
 lease_ttl_ms(_) ->
-    ?LEASE_TTL_MS.
+    beamtrail_lease_manager:default_ttl_ms().
 
 lease_heartbeat_interval_ms(Lease) ->
     max(1, min(5000, lease_ttl_ms(Lease) div 3)).

@@ -8,13 +8,13 @@
 -define(DEFAULT_TTL_MS, 30000).
 
 acquire(RunId, Owner) ->
-    acquire(RunId, Owner, ?DEFAULT_TTL_MS).
+    acquire(RunId, Owner, default_ttl_ms()).
 
 acquire(RunId, Owner, TtlMs) ->
     (beamtrail:storage()):acquire_lease(RunId, Owner, TtlMs).
 
 renew(RunId, FencingToken) ->
-    renew(RunId, FencingToken, ?DEFAULT_TTL_MS).
+    renew(RunId, FencingToken, default_ttl_ms()).
 
 renew(RunId, FencingToken, TtlMs) ->
     (beamtrail:storage()):renew_lease(RunId, FencingToken, TtlMs).
@@ -22,4 +22,8 @@ renew(RunId, FencingToken, TtlMs) ->
 read(RunId) ->
     (beamtrail:storage()):read_lease(RunId).
 
-default_ttl_ms() -> ?DEFAULT_TTL_MS.
+default_ttl_ms() ->
+    case application:get_env(beamtrail, lease_ttl_ms) of
+        {ok, N} when is_integer(N), N > 0 -> N;
+        _ -> ?DEFAULT_TTL_MS
+    end.

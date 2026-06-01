@@ -86,6 +86,7 @@ Set these application environment values before starting `beamtrail`:
 - `scanner_interval_ms`: recovery scan interval, default `5000`.
 - `worker_max_children`: concurrent dispatch workers, default `64`.
 - `run_max_children`: concurrent active run processes, default `64`.
+- `lease_ttl_ms`: dispatch lease TTL, default `30000`.
 
 For PostgreSQL:
 

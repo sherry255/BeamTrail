@@ -32,6 +32,7 @@ extended_test_() ->
       fun dispatch_renews_lease_while_step_runs/0,
       fun active_runner_wakes_retry_without_scanner_tick/0,
       fun active_runner_supervisor_rejects_when_pool_full/0,
+      fun active_runner_crash_allows_scanner_takeover_after_lease_expiry/0,
       fun dispatch_refuses_version_mismatch_without_migration/0,
       fun retry_attempts_preserved_in_chronological_order/0,
       fun storage_adapter_is_application_configurable/0,
@@ -73,6 +74,7 @@ cleanup(_) ->
     end,
     ok = application:unset_env(beamtrail, worker_max_children),
     ok = application:unset_env(beamtrail, run_max_children),
+    ok = application:unset_env(beamtrail, lease_ttl_ms),
     ok = application:unset_env(beamtrail, storage_adapter),
     ok = beamtrail_memory_storage:reset().
 
@@ -421,6 +423,29 @@ active_runner_supervisor_rejects_when_pool_full() ->
     ?assertMatch({ok, _Pid}, beamtrail_run_sup:dispatch(Run1)),
     ?assertEqual({error, run_pool_full}, beamtrail_run_sup:dispatch(Run2)),
     ?assertMatch({slow_executed, slow}, receive_exec()).
+
+active_runner_crash_allows_scanner_takeover_after_lease_expiry() ->
+    ok = application:set_env(beamtrail, lease_ttl_ms, 80),
+    {ok, Registry} = beamtrail_run_registry:start_link(),
+    unlink(Registry),
+    {ok, RunSup} = beamtrail_run_sup:start_link(),
+    unlink(RunSup),
+    Input = #{order_id => <<"o-active-crash-1">>, test_pid => self()},
+    {ok, RunId} = beamtrail:start_workflow(bt_retry_backoff_workflow, Input,
+                                           #{run_id => <<"active-crash-run-1">>,
+                                             auto_dispatch => false}),
+    {ok, Pid} = beamtrail_run_sup:dispatch(RunId),
+    ?assertMatch({retry_backoff_execute, 1, {charge, <<"o-active-crash-1">>}},
+                 receive_exec()),
+    ok = wait_for_status(RunId, retrying, 1000),
+    exit(Pid, kill),
+    timer:sleep(140),
+    {ok, _Scanner} = beamtrail_scanner:start_link(#{interval_ms => infinity,
+                                                    auto_start => false}),
+    ?assertEqual({ok, [RunId]}, beamtrail_scanner:scan_now()),
+    ?assertMatch({retry_backoff_execute, 2, {charge, <<"o-active-crash-1">>}},
+                 receive_exec()),
+    ok = wait_for_status(RunId, completed, 1000).
 
 dispatch_refuses_version_mismatch_without_migration() ->
     RunId = <<"version-gate-run-1">>,
