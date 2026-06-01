@@ -97,7 +97,7 @@ start_dispatch(Data0) ->
     Data1 = cancel_step_timeout_timer(cancel_heartbeat_timer(cancel_retry_timer(Data0))),
     case ensure_lease(Data1) of
         {ok, #{run_id := RunId, lease := Lease} = Data2} ->
-            case beamtrail:next_runner_action(RunId, Lease) of
+            case beamtrail_runner_transition:next_action(RunId, Lease) of
                 {ok, {execute, Attempt, ExecSpec}} ->
                     start_step_execution(Attempt, ExecSpec, Data2);
                 {ok, State} ->
@@ -115,7 +115,7 @@ start_step_execution(Attempt, ExecSpec, Data0) ->
     Pid = spawn_link(
             fun() ->
                     Parent ! {step_result, Ref,
-                              beamtrail:execute_runner_attempt(ExecSpec)}
+                              beamtrail_runner_transition:execute_attempt(ExecSpec)}
             end),
     Data1 = schedule_heartbeat(Data0),
     Data2 = schedule_step_timeout(maps:get(timeout_ms, ExecSpec, infinity), Ref, Data1),
@@ -124,7 +124,7 @@ start_step_execution(Attempt, ExecSpec, Data0) ->
 
 handle_step_result(Result, #{run_id := RunId, lease := Lease, attempt := Attempt} = Data)
   when is_map(Attempt) ->
-    case beamtrail:finish_runner_attempt(RunId, Lease, Attempt, Result) of
+    case beamtrail_runner_transition:finish_attempt(RunId, Lease, Attempt, Result) of
         {ok, State} ->
             after_dispatch(State, Data#{attempt := undefined});
         {error, _Reason} ->

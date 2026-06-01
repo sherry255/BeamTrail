@@ -2,8 +2,7 @@
 
 -export([start/0, stop/0]).
 -export([start_workflow/2, start_workflow/3, dispatch/1, dispatch/2,
-         next_runner_action/2, execute_runner_attempt/1,
-         finish_runner_attempt/4, recover_unfinished/0]).
+         next_runner_action/2, finish_runner_attempt/4, recover_unfinished/0]).
 -export([get_state/1, events/1, storage/0]).
 -export([list_recoverable/0, list_recoverable/2,
          mark_recovery_requeued/1, mark_recovery_requeued_with_lease/1]).
@@ -82,14 +81,6 @@ dispatch(RunId, Lease) when is_map(Lease) ->
 %% lifetime, and timeout handling; this module still owns durable transitions.
 next_runner_action(RunId, Lease) when is_map(Lease) ->
     dispatch_with_lease(RunId, Lease, #{runner_mode => prepare}).
-
-execute_runner_attempt(ExecSpec) when is_map(ExecSpec) ->
-    Workflow = maps:get(workflow, ExecSpec),
-    safe_execute(Workflow,
-                 maps:get(step_id, ExecSpec),
-                 maps:get(step_version, ExecSpec),
-                 maps:get(input, ExecSpec),
-                 maps:get(context, ExecSpec)).
 
 finish_runner_attempt(RunId, Lease, Attempt, Result) when is_map(Lease), is_map(Attempt) ->
     Options = #{runner_mode => finish},
@@ -366,18 +357,8 @@ execute_attempt(RunId, Workflow, Input, Attempt, Lease, _Options) ->
     StepId = maps:get(step_id, Attempt),
     ExecSpec = execution_spec(RunId, Workflow, StepId, Input, Attempt),
     Timeout = maps:get(timeout_ms, ExecSpec),
-    Fun = fun() -> execute_runner_attempt(ExecSpec) end,
+    Fun = fun() -> beamtrail_runner_transition:execute_attempt(ExecSpec) end,
     run_with_timeout_and_lease_heartbeat(RunId, Lease, Fun, Timeout).
-
-safe_execute(Workflow, StepId, StepVersion, Input, Context) ->
-    try Workflow:execute(StepId, StepVersion, Input, Context) of
-        {ok, _Value} = Ok -> Ok;
-        {error, _Reason} = Error -> Error;
-        Other -> {error, {bad_return, Other}}
-    catch
-        Class:Reason:_Stacktrace ->
-            {error, #{class => Class, reason => Reason}}
-    end.
 
 run_with_timeout_and_lease_heartbeat(RunId, Lease, Fun, TimeoutMs) ->
     Parent = self(),
