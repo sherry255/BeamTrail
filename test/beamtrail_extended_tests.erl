@@ -40,6 +40,7 @@ extended_test_() ->
       fun active_runner_registry_exposes_live_state/0,
       fun query_describe_exposes_active_runner/0,
       fun active_runner_stays_inspectable_while_step_executes/0,
+      fun active_runner_reuses_loaded_state_across_steps/0,
       fun dispatch_refuses_version_mismatch_without_migration/0,
       fun retry_attempts_preserved_in_chronological_order/0,
       fun storage_adapter_is_application_configurable/0,
@@ -633,6 +634,29 @@ active_runner_stays_inspectable_while_step_executes() ->
                  maps:get(active_runner, Q)),
     ExecPid ! {Gate, continue},
     ?assertMatch({ok, #{status := completed}}, wait_for_state(RunId, completed, 1000)).
+
+active_runner_reuses_loaded_state_across_steps() ->
+    ok = application:set_env(beamtrail, storage_adapter, bt_counting_storage),
+    bt_counting_storage:reset_counts(),
+    {ok, Registry} = beamtrail_run_registry:start_link(),
+    unlink(Registry),
+    {ok, RunSup} = beamtrail_run_sup:start_link(),
+    unlink(RunSup),
+    Input = #{order_id => <<"o-active-state-cache-1">>, test_pid => self()},
+    {ok, RunId} = beamtrail:start_workflow(bt_success_workflow, Input,
+                                           #{run_id => <<"active-state-cache-run-1">>,
+                                             auto_dispatch => false}),
+    bt_counting_storage:reset_counts(),
+    {ok, Pid} = beamtrail_run_sup:dispatch(RunId),
+    ?assertMatch({executed, charge, 1, {charge, <<"o-active-state-cache-1">>}},
+                 receive_exec()),
+    ?assertMatch({executed, ship, 1, {ship, <<"o-active-state-cache-1">>}},
+                 receive_exec()),
+    ok = wait_until_dead(Pid, 1000),
+    Counts = bt_counting_storage:counts(),
+    ?assertEqual(1, maps:get(read_snapshot, Counts, 0)),
+    ?assertEqual(1, maps:get(events, Counts, 0)),
+    ?assertEqual(0, maps:get(read_events, Counts, 0)).
 
 dispatch_refuses_version_mismatch_without_migration() ->
     RunId = <<"version-gate-run-1">>,

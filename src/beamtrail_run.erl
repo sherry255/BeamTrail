@@ -29,6 +29,7 @@ init(RunId) ->
     process_flag(trap_exit, true),
     {ok, idle, #{run_id => RunId,
                  lease => undefined,
+                 state => undefined,
                  retry_due_at => undefined,
                  heartbeat_timer => undefined,
                  dispatch => undefined,
@@ -91,11 +92,17 @@ start_dispatch(Data0) ->
     Data1 = cancel_heartbeat_timer(clear_retry_due(Data0)),
     case ensure_lease(Data1) of
         {ok, #{run_id := RunId, lease := Lease} = Data2} ->
-            case beamtrail_runner_transition:next_action(RunId, Lease) of
-                {ok, {execute, Attempt, ExecSpec}} ->
-                    start_step_execution(Attempt, ExecSpec, Data2);
-                {ok, State} ->
-                    after_dispatch(State, Data2);
+            case ensure_runner_state(Data2) of
+                {ok, #{state := State} = Data3} ->
+                    case beamtrail_runner_transition:next_action(RunId, Lease, State) of
+                        {ok, {execute, Attempt, ExecSpec, State1}} ->
+                            start_step_execution(Attempt, ExecSpec,
+                                                 Data3#{state := State1});
+                        {ok, State1} ->
+                            after_dispatch(State1, Data3);
+                        {error, _Reason} ->
+                            {stop, normal, Data3}
+                    end;
                 {error, _Reason} ->
                     {stop, normal, Data2}
             end;
@@ -118,18 +125,20 @@ start_step_execution(Attempt, ExecSpec, Data0) ->
      heartbeat_timeout_action(Data2) ++
      step_timeout_action(maps:get(timeout_ms, ExecSpec, infinity), Ref)}.
 
-handle_step_result(Result, #{run_id := RunId, lease := Lease, attempt := Attempt} = Data)
+handle_step_result(Result, #{run_id := RunId, lease := Lease,
+                             state := State, attempt := Attempt} = Data)
   when is_map(Attempt) ->
-    case beamtrail_runner_transition:finish_attempt(RunId, Lease, Attempt, Result) of
-        {ok, State} ->
-            after_dispatch(State, Data#{attempt := undefined});
+    case beamtrail_runner_transition:finish_attempt(RunId, Lease, Attempt, Result, State) of
+        {ok, State1} ->
+            after_dispatch(State1, Data#{attempt := undefined});
         {error, _Reason} ->
             {stop, normal, Data#{attempt := undefined}}
     end;
 handle_step_result(_Result, Data) ->
     {stop, normal, Data}.
 
-after_dispatch(State, Data) ->
+after_dispatch(State, Data0) ->
+    Data = Data0#{state := State},
     case maps:get(status, State, undefined) of
         completed ->
             {stop, normal, Data};
@@ -166,6 +175,14 @@ ensure_lease(#{lease := undefined, run_id := RunId} = Data) ->
         {error, _} = Error -> Error
     end;
 ensure_lease(#{lease := _Lease} = Data) ->
+    {ok, Data}.
+
+ensure_runner_state(#{state := undefined, run_id := RunId} = Data) ->
+    case beamtrail_runner_transition:load_state(RunId) of
+        {ok, State} -> {ok, Data#{state := State}};
+        {error, _} = Error -> Error
+    end;
+ensure_runner_state(#{state := State} = Data) when is_map(State) ->
     {ok, Data}.
 
 seed_lease(undefined, Data) ->
