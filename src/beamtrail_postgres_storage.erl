@@ -348,8 +348,6 @@ current_event_seq(C, RunId) ->
 
 validate_fencing(_C, _RunId, 'workflow.instance.created', undefined) ->
     ok;
-validate_fencing(_C, _RunId, 'recovery.skipped', undefined) ->
-    ok;
 validate_fencing(C, RunId, _EventType, FencingToken) when is_integer(FencingToken) ->
     Now = now_ms(),
     case select_lease(C, RunId, "FOR UPDATE") of

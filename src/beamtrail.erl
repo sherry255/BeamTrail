@@ -224,32 +224,22 @@ mark_recovery_requeued_with_lease(RunId) ->
             Error
     end.
 
-append_recovery_marker(Mod, RunId, EventType, LeaseInfo) ->
+append_recovery_marker(Mod, RunId, 'recovery.requeued', Lease) ->
     Now = erlang:system_time(millisecond),
     ExpectedSeq = maps:get(last_event_seq, get_state(RunId), 0),
     RecoveredInMs = compute_recovered_in_ms(RunId, Now),
     Payload = #{requeued_at => Now,
                 owner_node => beamtrail_transition:owner(),
-                lease => LeaseInfo,
+                lease => Lease,
                 recovered_in_ms => RecoveredInMs},
-    FencingToken = case EventType of
-                       'recovery.requeued' -> beamtrail_transition:lease_fencing_token(LeaseInfo);
-                       'recovery.skipped' -> undefined
-                   end,
-    case Mod:append_event(RunId, ExpectedSeq, FencingToken, EventType, undefined,
-                          undefined, undefined, Payload) of
+    FencingToken = beamtrail_lease_manager:fencing_token(Lease),
+    case Mod:append_event(RunId, ExpectedSeq, FencingToken, 'recovery.requeued',
+                          undefined, undefined, undefined, Payload) of
         {ok, _} ->
-            TelemetryEvent = case EventType of
-                                 'recovery.requeued' -> [beamtrail, recovery, requeued];
-                                 'recovery.skipped' -> [beamtrail, recovery, skipped]
-                             end,
-            beamtrail_telemetry:execute(TelemetryEvent,
+            beamtrail_telemetry:execute([beamtrail, recovery, requeued],
                                         #{count => 1},
-                                        #{run_id => RunId, lease => LeaseInfo}),
-            case EventType of
-                'recovery.requeued' -> {ok, {requeued, LeaseInfo}};
-                'recovery.skipped' -> {ok, skipped}
-            end;
+                                        #{run_id => RunId, lease => Lease}),
+            {ok, {requeued, Lease}};
         {error, _} = Error ->
             Error
     end.

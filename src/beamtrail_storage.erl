@@ -25,9 +25,6 @@
            next_cursor := binary() | undefined,
            has_more := boolean()}}.
 
-%% Optional read-model accessors. Derived from the append-only event log,
-%% never written as the primary source of truth.
--optional_callbacks([read_instance/1, read_attempts/1, telemetry_counters/0]).
--callback read_instance(RunId :: binary()) -> {ok, map()} | not_found.
--callback read_attempts(RunId :: binary()) -> {ok, [map()]} | not_found.
+%% Optional observability accessors. Never part of the primary source of truth.
+-optional_callbacks([telemetry_counters/0]).
 -callback telemetry_counters() -> map().

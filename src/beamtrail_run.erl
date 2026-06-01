@@ -214,7 +214,7 @@ schedule_heartbeat(#{lease := undefined} = Data) ->
 schedule_heartbeat(#{lease := Lease} = Data) when is_map(Lease) ->
     Data1 = cancel_heartbeat_timer(Data),
     Ref = make_ref(),
-    Delay = lease_heartbeat_interval_ms(),
+    Delay = beamtrail_lease_manager:heartbeat_interval_ms(),
     DueAt = erlang:system_time(millisecond) + Delay,
     Data1#{heartbeat_timer := {Ref, DueAt}}.
 
@@ -251,9 +251,6 @@ cancel_dispatch(undefined) ->
 cancel_dispatch({_Ref, Pid}) when is_pid(Pid) ->
     exit(Pid, kill),
     ok.
-
-lease_heartbeat_interval_ms() ->
-    max(1, min(5000, beamtrail_lease_manager:default_ttl_ms() div 3)).
 
 info_map(StateName, Data) ->
     Lease = maps:get(lease, Data, undefined),

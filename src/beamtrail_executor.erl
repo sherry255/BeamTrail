@@ -71,7 +71,7 @@ cancel_attempt_timeout(TimeoutRef) ->
     ok.
 
 lease_heartbeat_loop(RunId, Lease, StopRef, ParentRef, Parent) ->
-    Interval = lease_heartbeat_interval_ms(Lease),
+    Interval = beamtrail_lease_manager:heartbeat_interval_ms(Lease),
     receive
         {StopRef, stop} ->
             erlang:demonitor(ParentRef, [flush]),
@@ -79,8 +79,10 @@ lease_heartbeat_loop(RunId, Lease, StopRef, ParentRef, Parent) ->
         {'DOWN', ParentRef, process, _Pid, _Reason} ->
             ok
     after Interval ->
-        case (beamtrail_config:storage()):renew_lease(RunId, lease_fencing_token(Lease),
-                                                      lease_ttl_ms(Lease)) of
+        case (beamtrail_config:storage()):renew_lease(
+               RunId,
+               beamtrail_lease_manager:fencing_token(Lease),
+               beamtrail_lease_manager:ttl_ms(Lease)) of
             {ok, _Renewed} ->
                 lease_heartbeat_loop(RunId, Lease, StopRef, ParentRef, Parent);
             {error, Reason} ->
@@ -88,19 +90,3 @@ lease_heartbeat_loop(RunId, Lease, StopRef, ParentRef, Parent) ->
                 ok
         end
     end.
-
-lease_fencing_token(Lease) when is_map(Lease) ->
-    maps:get(fencing_token, Lease, undefined);
-lease_fencing_token(_) ->
-    undefined.
-
-lease_ttl_ms(#{lease_until := Until, acquired_at := AcquiredAt})
-  when is_integer(Until), is_integer(AcquiredAt), Until > AcquiredAt ->
-    Until - AcquiredAt;
-lease_ttl_ms(#{lease_until := Until}) when is_integer(Until) ->
-    max(1, Until - erlang:system_time(millisecond));
-lease_ttl_ms(_) ->
-    beamtrail_lease_manager:default_ttl_ms().
-
-lease_heartbeat_interval_ms(Lease) ->
-    max(1, min(5000, lease_ttl_ms(Lease) div 3)).

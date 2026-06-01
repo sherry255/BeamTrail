@@ -1,7 +1,6 @@
 -module(beamtrail_transition).
 
--export([owner/0, lease_fencing_token/1,
-         dispatch_locked/3, dispatch_locked/4,
+-export([owner/0, dispatch_locked/3, dispatch_locked/4,
          dispatch_retrying/4,
          finish_attempt/4, finish_attempt/5]).
 
@@ -427,9 +426,9 @@ pending_attempt_expected_seq_from_state(State, Attempt) ->
 
 append_event(RunId, ExpectedSeq, Lease, EventType, StepId, StepVersion,
              IdempotencyKey, Payload) ->
-    (beamtrail_config:storage()):append_event(RunId, ExpectedSeq, lease_fencing_token(Lease),
-                                              EventType, StepId, StepVersion,
-                                              IdempotencyKey, Payload).
+    (beamtrail_config:storage()):append_event(
+      RunId, ExpectedSeq, beamtrail_lease_manager:fencing_token(Lease),
+      EventType, StepId, StepVersion, IdempotencyKey, Payload).
 
 maybe_snapshot_state(RunId, State, Force) ->
     beamtrail_state:maybe_snapshot(RunId, State, Force, beamtrail_config:storage()).
@@ -438,7 +437,7 @@ apply_runtime_event(State, Event) ->
     beamtrail_state:apply_event(State, Event).
 
 lease_current(RunId, Lease) ->
-    FencingToken = lease_fencing_token(Lease),
+    FencingToken = beamtrail_lease_manager:fencing_token(Lease),
     Now = erlang:system_time(millisecond),
     case (beamtrail_config:storage()):read_lease(RunId) of
         {ok, #{fencing_token := FencingToken, lease_until := LeaseUntil}}
@@ -450,8 +449,3 @@ lease_current(RunId, Lease) ->
 
 owner() ->
     #{node => node(), pid => self()}.
-
-lease_fencing_token(Lease) when is_map(Lease) ->
-    maps:get(fencing_token, Lease, undefined);
-lease_fencing_token(_) ->
-    undefined.

@@ -4,7 +4,7 @@
 -export([append_event/8, read_events/3, events/1, write_snapshot/4,
          read_snapshot/1, acquire_lease/3, renew_lease/3, read_lease/1,
          list_run_ids/0, list_run_ids/2]).
--export([read_instance/1, read_attempts/1, telemetry_counters/0]).
+-export([telemetry_counters/0]).
 
 append_event(RunId, ExpectedSeq, FencingToken, EventType, StepId,
              StepVersion, IdempotencyKey, Payload) ->
@@ -39,12 +39,6 @@ list_run_ids() ->
 
 list_run_ids(Cursor, Limit) ->
     beamtrail_memory_storage:list_run_ids(Cursor, Limit).
-
-read_instance(RunId) ->
-    beamtrail_memory_storage:read_instance(RunId).
-
-read_attempts(RunId) ->
-    beamtrail_memory_storage:read_attempts(RunId).
 
 telemetry_counters() ->
     beamtrail_memory_storage:telemetry_counters().
