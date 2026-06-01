@@ -21,6 +21,7 @@ extended_test_() ->
       fun query_describe_returns_storage_error/0,
       fun recover_unfinished_returns_storage_error/0,
       fun recovery_marker_returns_storage_error/0,
+      fun start_workflow_returns_snapshot_write_error/0,
       fun storage_lists_run_ids_with_cursor/0,
       fun storage_rejects_expected_seq_conflict/0,
       fun storage_renews_current_lease_without_changing_fence/0,
@@ -235,6 +236,17 @@ recovery_marker_returns_storage_error() ->
                              beamtrail_postgres_storage),
     ?assertEqual({error, not_implemented},
                  beamtrail:mark_recovery_requeued(<<"missing-run">>)).
+
+start_workflow_returns_snapshot_write_error() ->
+    ok = application:set_env(beamtrail, storage_adapter,
+                             bt_snapshot_fail_storage),
+    Input = #{order_id => <<"o-snapshot-fail-1">>, test_pid => self()},
+    ?assertMatch({error, {dispatch_failed, _, snapshot_write_failed}},
+                 beamtrail:start_workflow(bt_success_workflow, Input)),
+    ?assertMatch({executed, charge, 1, {charge, <<"o-snapshot-fail-1">>}},
+                 receive_exec()),
+    ?assertMatch({executed, ship, 1, {ship, <<"o-snapshot-fail-1">>}},
+                 receive_exec()).
 
 storage_lists_run_ids_with_cursor() ->
     {ok, _} = beamtrail:start_workflow(bt_timeout_workflow, #{order_id => <<"o-page-2">>},

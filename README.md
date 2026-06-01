@@ -1,14 +1,14 @@
 # BeamTrail
 
-BeamTrail is a small Erlang/OTP prototype for event-sourced workflow
-execution.
+BeamTrail is an Erlang/OTP durable workflow runtime built around
+event-sourced execution.
 
 It stores each workflow run as an append-only event stream, derives state by
 reducing events, and runs a static list of workflow steps with retry, timeout,
 lease, and recovery metadata recorded in the log.
 
-This is not a production durable workflow runtime yet. The only working storage
-adapter is in-memory.
+The current repository still has missing durable-storage work. The only
+working storage adapter is currently in-memory.
 
 ## Current State
 

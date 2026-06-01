@@ -33,8 +33,10 @@ start_workflow(Workflow, Input, Options) ->
            undefined,
            #{workflow => Workflow, input => Input, steps => Steps}) of
         {ok, _Event} ->
-            maybe_snapshot(RunId, false),
-            start_workflow_dispatch(RunId, Options);
+            case maybe_snapshot(RunId, false) of
+                ok -> start_workflow_dispatch(RunId, Options);
+                {error, Reason} -> {error, {create_failed, RunId, Reason}}
+            end;
         {error, Reason} ->
             {error, {create_failed, RunId, Reason}}
     end.
@@ -207,8 +209,7 @@ fail_workflow_with_timeout(RunId, State, Lease) ->
     case append_event(RunId, maps:get(last_event_seq, State, 0), Lease,
                       'workflow.failed', StepId, undefined, undefined, Payload) of
         {ok, _} ->
-            maybe_snapshot(RunId, true),
-            {ok, get_state(RunId)};
+            with_snapshot(RunId, true, fun() -> {ok, get_state(RunId)} end);
         {error, _} = Error ->
             Error
     end.
@@ -228,8 +229,7 @@ complete_if_needed(RunId, State, Lease) ->
                    undefined,
                    #{completed_at => erlang:system_time(millisecond)}) of
                 {ok, _Event} ->
-                    maybe_snapshot(RunId, true),
-                    {ok, get_state(RunId)};
+                    with_snapshot(RunId, true, fun() -> {ok, get_state(RunId)} end);
                 {error, _} = Error ->
                     Error
             end
@@ -276,15 +276,19 @@ ensure_attempt_started(RunId, Workflow, Input, State, StepId, Lease) ->
                    IdempotencyKey,
                    #{attempt => AttemptNo, owner_node => dispatch_owner()}) of
                 {ok, Event} ->
-                    maybe_snapshot(RunId, false),
-                    {ok,
-                     #{step_id => StepId,
-                       step_version => StepVersion,
-                       idempotency_key => IdempotencyKey,
-                       attempt => AttemptNo,
-                       started_event_seq => maps:get(event_seq, Event),
-                       status => unknown},
-                     true};
+                    with_snapshot(
+                      RunId,
+                      false,
+                      fun() ->
+                              {ok,
+                               #{step_id => StepId,
+                                 step_version => StepVersion,
+                                 idempotency_key => IdempotencyKey,
+                                 attempt => AttemptNo,
+                                 started_event_seq => maps:get(event_seq, Event),
+                                 status => unknown},
+                               true}
+                      end);
                 {error, _} = Error ->
                     Error
             end
@@ -376,8 +380,10 @@ handle_step_success(RunId, Attempt, Value, Lease) ->
                    maps:get(idempotency_key, Attempt),
                    #{result => Value}) of
                 {ok, _Event} ->
-                    maybe_snapshot(RunId, false),
-                    dispatch_locked(RunId, get_state(RunId), Lease);
+                    with_snapshot(
+                      RunId,
+                      false,
+                      fun() -> dispatch_locked(RunId, get_state(RunId), Lease) end);
                 {error, _} = Error ->
                     Error
             end;
@@ -400,18 +406,22 @@ handle_step_failure(RunId, Attempt, Reason, Lease) ->
                    maps:get(idempotency_key, Attempt),
                    FailurePayload) of
                 {ok, FailedEvent} ->
-                    maybe_snapshot(RunId, false),
-                    State = get_state(RunId),
-                    Workflow = maps:get(workflow, State),
-                    Policy = Workflow:retry_policy(StepId),
-                    case should_retry(Policy, Reason, maps:get(attempt, Attempt)) of
-                        true ->
-                            schedule_retry(RunId, Attempt, Reason, Policy, Lease,
-                                           maps:get(event_seq, FailedEvent));
-                        false ->
-                            fail_workflow(RunId, Attempt, FailurePayload, Lease,
-                                          maps:get(event_seq, FailedEvent))
-                    end;
+                    with_snapshot(
+                      RunId,
+                      false,
+                      fun() ->
+                              State = get_state(RunId),
+                              Workflow = maps:get(workflow, State),
+                              Policy = Workflow:retry_policy(StepId),
+                              case should_retry(Policy, Reason, maps:get(attempt, Attempt)) of
+                                  true ->
+                                      schedule_retry(RunId, Attempt, Reason, Policy, Lease,
+                                                     maps:get(event_seq, FailedEvent));
+                                  false ->
+                                      fail_workflow(RunId, Attempt, FailurePayload, Lease,
+                                                    maps:get(event_seq, FailedEvent))
+                              end
+                      end);
                 {error, _} = Error ->
                     Error
             end;
@@ -440,11 +450,15 @@ schedule_retry(RunId, Attempt, Reason, Policy, Lease, ExpectedSeq) ->
         {ok, _RetryEvent} ->
             beamtrail_telemetry:execute([beamtrail, retry, scheduled], #{count => 1},
                                         #{run_id => RunId, step_id => StepId, next_retry_at => NextRetryAt}),
-            maybe_snapshot(RunId, false),
-            case BackoffMs of
-                0 -> dispatch_retrying(RunId, get_state(RunId), Lease);
-                _ -> {ok, get_state(RunId)}
-            end;
+            with_snapshot(
+              RunId,
+              false,
+              fun() ->
+                      case BackoffMs of
+                          0 -> dispatch_retrying(RunId, get_state(RunId), Lease);
+                          _ -> {ok, get_state(RunId)}
+                      end
+              end);
         {error, _} = Error ->
             Error
     end.
@@ -460,8 +474,7 @@ fail_workflow(RunId, Attempt, FailurePayload, Lease, ExpectedSeq) ->
            maps:get(idempotency_key, Attempt),
            FailurePayload) of
         {ok, _FailedEvent} ->
-            maybe_snapshot(RunId, true),
-            {ok, get_state(RunId)};
+            with_snapshot(RunId, true, fun() -> {ok, get_state(RunId)} end);
         {error, _} = Error ->
             Error
     end.
@@ -486,7 +499,7 @@ recover_if_unfinished(RunId) ->
                 {ok, {requeued, Lease}} ->
                     case dispatch(RunId, Lease) of
                         {ok, _RecoveredState} ->
-                            maybe_snapshot(RunId, true),
+                            _ = maybe_snapshot(RunId, true),
                             true;
                         {error, {migration_required, _}} ->
                             false;
@@ -625,16 +638,33 @@ recoverable(State) ->
     end.
 
 maybe_snapshot(RunId, Force) ->
-    State = get_state(RunId),
-    Seq = maps:get(last_event_seq, State, 0),
-    ShouldWrite = Force orelse (Seq > 0 andalso Seq rem ?SNAPSHOT_EVERY =:= 0),
-    case ShouldWrite of
-        true ->
-            ok = (storage()):write_snapshot(RunId, State, Seq, 1),
-            beamtrail_telemetry:execute([beamtrail, snapshot, written], #{count => 1},
-                                        #{run_id => RunId, snapshot_seq => Seq});
-        false ->
-            ok
+    case load_state(RunId) of
+        {ok, State} ->
+            Seq = maps:get(last_event_seq, State, 0),
+            ShouldWrite = Force orelse (Seq > 0 andalso Seq rem ?SNAPSHOT_EVERY =:= 0),
+            case ShouldWrite of
+                true ->
+                    case (storage()):write_snapshot(RunId, State, Seq, 1) of
+                        ok ->
+                            beamtrail_telemetry:execute([beamtrail, snapshot, written],
+                                                        #{count => 1},
+                                                        #{run_id => RunId,
+                                                          snapshot_seq => Seq}),
+                            ok;
+                        {error, _} = Error ->
+                            Error
+                    end;
+                false ->
+                    ok
+            end;
+        {error, _} = Error ->
+            Error
+    end.
+
+with_snapshot(RunId, Force, Continue) ->
+    case maybe_snapshot(RunId, Force) of
+        ok -> Continue();
+        {error, _} = Error -> Error
     end.
 
 enrich_version_migration(State = #{workflow := undefined}) ->
