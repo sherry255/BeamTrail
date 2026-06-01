@@ -16,7 +16,8 @@ postgres_integration_test_() ->
               fun postgres_expected_seq_conflict_is_per_run/0,
               fun postgres_rejects_zombie_append_after_fence_takeover/0,
               fun postgres_storage_uses_supervised_connection_pool/0,
-              fun postgres_pool_recovers_checked_out_connection_after_owner_death/0]}
+              fun postgres_pool_recovers_checked_out_connection_after_owner_death/0,
+              fun postgres_pool_checkout_times_out_when_exhausted/0]}
     end.
 
 setup(Config) ->
@@ -26,6 +27,7 @@ setup(Config) ->
                              beamtrail_postgres_storage),
     ok = application:set_env(beamtrail, postgres, Config),
     ok = application:set_env(beamtrail, postgres_pool_size, 2),
+    ok = application:set_env(beamtrail, postgres_pool_checkout_timeout_ms, 50),
     ok = beamtrail_postgres_storage:init_schema(),
     ok = drop_slow_event_trigger(Config),
     ok = truncate_tables(Config),
@@ -37,7 +39,8 @@ cleanup(_) ->
     ok = application:unset_env(beamtrail, worker_max_children),
     ok = application:unset_env(beamtrail, storage_adapter),
     ok = application:unset_env(beamtrail, postgres),
-    ok = application:unset_env(beamtrail, postgres_pool_size).
+    ok = application:unset_env(beamtrail, postgres_pool_size),
+    ok = application:unset_env(beamtrail, postgres_pool_checkout_timeout_ms).
 
 postgres_workflow_survives_application_restart() ->
     RunId = unique_run_id("pg-complete"),
@@ -168,6 +171,33 @@ postgres_pool_recovers_checked_out_connection_after_owner_death() ->
             error(owner_down_timeout)
     end,
     ?assertEqual(ok, wait_for_pool_idle(2, 1000)).
+
+postgres_pool_checkout_times_out_when_exhausted() ->
+    {ok, C1} = beamtrail_postgres_pool:checkout(),
+    {ok, C2} = beamtrail_postgres_pool:checkout(),
+    Parent = self(),
+    {Pid, Ref} =
+        spawn_monitor(
+          fun() ->
+                  Parent ! {checkout_result, self(),
+                            beamtrail_postgres_pool:checkout()}
+          end),
+    Result =
+        receive
+            {checkout_result, Pid, CheckoutResult} ->
+                CheckoutResult
+        after 1000 ->
+                exit(Pid, kill),
+                timeout
+        end,
+    receive
+        {'DOWN', Ref, process, Pid, _Reason} -> ok
+    after 1000 ->
+            error(checkout_process_down_timeout)
+    end,
+    beamtrail_postgres_pool:checkin(C1),
+    beamtrail_postgres_pool:checkin(C2),
+    ?assertEqual({error, checkout_timeout}, Result).
 
 restart_beamtrail() ->
     ok = stop_beamtrail_runtime(),

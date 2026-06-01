@@ -101,6 +101,7 @@ application:set_env(beamtrail, postgres,
                       password => "beamtrail",
                       database => "beamtrail"}).
 application:set_env(beamtrail, postgres_pool_size, 5).
+application:set_env(beamtrail, workflow_modules, [my_workflow]).
 
 {ok, _} = application:ensure_all_started(epgsql).
 ok = beamtrail_postgres_storage:init_schema().
@@ -191,6 +192,12 @@ Set application environment before starting `beamtrail`:
 - `storage_adapter`: storage module, default `beamtrail_memory_storage`
 - `postgres`: PostgreSQL connection map for `beamtrail_postgres_storage`
 - `postgres_pool_size`: supervised PostgreSQL connection pool size, default `5`
+- `postgres_pool_checkout_timeout_ms`: checkout wait timeout, default `5000`
+- `postgres_pool_reconnect_interval_ms`: reconnect interval after a pooled
+  connection replacement fails, default `1000`
+- `workflow_modules`: workflow modules to preload on application start. This
+  keeps PostgreSQL's safe external-term decoding from failing on atoms whose
+  modules are present in the release but have not been loaded yet.
 - `scanner_interval_ms`: recovery scan interval, default `5000`
 - `worker_max_children`: concurrent dispatch workers, default `64`
 - `run_max_children`: concurrent active run processes, default `64`
@@ -225,6 +232,10 @@ suite on every push to `main` and on pull requests.
 PostgreSQL stores payloads, idempotency keys, leases, and snapshots as Erlang
 external-term-format `bytea` values. Replay fidelity comes first; SQL-level
 inspection can be added later through read models.
+
+BeamTrail decodes these terms with `binary_to_term/2` in safe mode. Configure
+`workflow_modules` in releases so workflow module atoms and step atoms are
+available before recovery scans replay old events.
 
 The schema lives in `priv/sql/postgres.sql`.
 

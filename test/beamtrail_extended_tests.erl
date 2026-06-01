@@ -54,6 +54,7 @@ extended_test_() ->
       fun retry_policy_failure_fails_terminally_without_retry_loop/0,
       fun malformed_retry_policy_map_fails_terminally_without_retry_loop/0,
       fun retry_attempts_preserved_in_chronological_order/0,
+      fun workflow_module_preload_accepts_configured_modules/0,
       fun storage_adapter_is_application_configurable/0,
       fun query_describe_exposes_inspector_blocks/0,
       fun recovery_requeued_records_recovered_in_ms/0,
@@ -97,6 +98,7 @@ cleanup(_) ->
     ok = application:unset_env(beamtrail, worker_max_children),
     ok = application:unset_env(beamtrail, run_max_children),
     ok = application:unset_env(beamtrail, lease_ttl_ms),
+    ok = application:unset_env(beamtrail, workflow_modules),
     ok = application:unset_env(beamtrail, storage_adapter),
     ok = beamtrail_memory_storage:reset().
 
@@ -922,6 +924,13 @@ retry_attempts_preserved_in_chronological_order() ->
             < maps:get(started_event_seq, A2)),
     ?assertEqual(failed, maps:get(status, A1)),
     ?assertEqual(succeeded, maps:get(status, A2)).
+
+workflow_module_preload_accepts_configured_modules() ->
+    ok = application:set_env(beamtrail, workflow_modules,
+                             [<<"bt_success_workflow">>,
+                              bt_retry_workflow,
+                              "bt_timeout_workflow"]),
+    ?assertEqual(ok, beamtrail_config:preload_workflows()).
 
 storage_adapter_is_application_configurable() ->
     ?assertEqual(beamtrail_memory_storage, beamtrail:storage()),

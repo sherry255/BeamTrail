@@ -27,6 +27,7 @@ init([]) ->
                    conn_refs => ConnRefs,
                    owners => #{},
                    waiting => queue:new(),
+                   reconnect_timer => undefined,
                    checkouts => 0}};
         {error, Reason} ->
             {stop, Reason}
@@ -39,7 +40,10 @@ handle_call(checkout, From, State) ->
                                        State#{available := Rest}),
             {reply, {ok, Connection}, State1};
         [] ->
-            Waiting = queue:in(From, maps:get(waiting, State)),
+            TimerRef = erlang:send_after(
+                         beamtrail_postgres_config:checkout_timeout_ms(),
+                         self(), {checkout_timeout, From}),
+            Waiting = queue:in({From, TimerRef}, maps:get(waiting, State)),
             {noreply, State#{waiting := Waiting}}
     end;
 handle_call(info, _From, State) ->
@@ -83,6 +87,16 @@ handle_info({'DOWN', Ref, process, _Pid, _Reason}, State) ->
                     {noreply, State}
             end
     end;
+handle_info({checkout_timeout, From}, State) ->
+    case take_waiting(From, maps:get(waiting, State)) of
+        {ok, _TimerRef, Waiting1} ->
+            gen_server:reply(From, {error, checkout_timeout}),
+            {noreply, State#{waiting := Waiting1}};
+        not_found ->
+            {noreply, State}
+    end;
+handle_info(reconnect, State) ->
+    {noreply, maybe_replace_connection(State#{reconnect_timer := undefined})};
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -123,7 +137,8 @@ connect_one() ->
 return_connection(Connection, State) ->
     {Busy, Owners} = remove_busy_connection(Connection, State),
     case queue:out(maps:get(waiting, State)) of
-        {{value, From}, Waiting1} ->
+        {{value, {From, TimerRef}}, Waiting1} ->
+            erlang:cancel_timer(TimerRef, [flush]),
             State1 = assign_connection(Connection, From,
                                        State#{busy := Busy,
                                               owners := Owners,
@@ -147,9 +162,9 @@ maybe_replace_connection(State) ->
                                     conn_refs := maps:put(Connection, Ref,
                                                          maps:get(conn_refs,
                                                                   State))},
-                    return_new_connection(Connection, State1);
+                    maybe_replace_connection(return_new_connection(Connection, State1));
                 {error, _Reason} ->
-                    State
+                    schedule_reconnect(State)
             end;
         false ->
             State
@@ -157,7 +172,8 @@ maybe_replace_connection(State) ->
 
 return_new_connection(Connection, State) ->
     case queue:out(maps:get(waiting, State)) of
-        {{value, From}, Waiting1} ->
+        {{value, {From, TimerRef}}, Waiting1} ->
+            erlang:cancel_timer(TimerRef, [flush]),
             State1 = assign_connection(Connection, From,
                                        State#{waiting := Waiting1}),
             gen_server:reply(From, {ok, Connection}),
@@ -166,6 +182,24 @@ return_new_connection(Connection, State) ->
             State#{waiting := Waiting1,
                    available := [Connection | maps:get(available, State)]}
     end.
+
+schedule_reconnect(State = #{reconnect_timer := undefined}) ->
+    TimerRef = erlang:send_after(
+                 beamtrail_postgres_config:reconnect_interval_ms(),
+                 self(), reconnect),
+    State#{reconnect_timer := TimerRef};
+schedule_reconnect(State) ->
+    State.
+
+take_waiting(From, Waiting) ->
+    take_waiting(From, queue:to_list(Waiting), []).
+
+take_waiting(_From, [], _Before) ->
+    not_found;
+take_waiting(From, [{From, TimerRef} | Rest], Before) ->
+    {ok, TimerRef, queue:from_list(lists:reverse(Before) ++ Rest)};
+take_waiting(From, [Entry | Rest], Before) ->
+    take_waiting(From, Rest, [Entry | Before]).
 
 assign_connection(Connection, From, State) ->
     OwnerRef = erlang:monitor(process, owner_pid(From)),

@@ -500,10 +500,24 @@ decode_null(Value) -> Value.
 decode_term(null) ->
     {ok, undefined};
 decode_term(Bin) when is_binary(Bin) ->
+    decode_term(Bin, false).
+
+decode_term(Bin, Retried) ->
     try binary_to_term(Bin, [safe]) of
         Term -> {ok, Term}
     catch
-        error:badarg -> {error, bad_external_term}
+        error:badarg ->
+            maybe_preload_and_decode_term(Bin, Retried)
+    end.
+
+maybe_preload_and_decode_term(_Bin, true) ->
+    {error, bad_external_term};
+maybe_preload_and_decode_term(Bin, false) ->
+    case beamtrail_config:preload_workflows() of
+        ok ->
+            decode_term(Bin, true);
+        {error, Reason} ->
+            {error, {bad_external_term, Reason}}
     end.
 
 next_cursor([]) -> undefined;
