@@ -1,5 +1,7 @@
 # Roadmap
 
+Last updated: 2026-06-03
+
 BeamTrail's long-term goal is to be the Erlang/OTP-native durable step runner:
 embedded in a BEAM release, backed by a durable event log, and shaped around OTP
 supervision instead of an external workflow service.
@@ -36,7 +38,7 @@ an Erlang library.
 - Add Hex package metadata and verify package contents.
 - Add `-spec` annotations on the public API and storage/workflow contracts.
 - Add Dialyzer to CI once the first useful specs are in place.
-- Add xref checks to catch unused exports and dependency cycles.
+- Keep xref checks in CI to catch undefined and deprecated calls.
 - Add coverage reporting for the reducer, transitions, and storage adapters.
 - Keep README, CHANGELOG, and ARCHITECTURE aligned with behavior changes.
 - Document the exact supported OTP/PostgreSQL version matrix.

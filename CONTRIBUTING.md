@@ -72,6 +72,7 @@ Before opening a pull request, run:
 
 ```sh
 rebar3 eunit
+rebar3 xref
 git diff --check
 ```
 

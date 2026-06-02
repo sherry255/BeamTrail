@@ -24,8 +24,8 @@ are pre-stable and may include breaking API or storage changes.
   run to reach a terminal state.
 - `beamtrail_query:describe/1` inspector data for state, attempts, snapshots,
   recovery, and active runner visibility.
-- GitHub Actions CI covering EUnit, PostgreSQL integration tests, and gitleaks
-  secret scanning.
+- GitHub Actions CI covering EUnit, xref, PostgreSQL integration tests, and
+  gitleaks secret scanning.
 
 ### Changed
 
@@ -73,5 +73,5 @@ are pre-stable and may include breaking API or storage changes.
 - Initial BeamTrail MVP with event-sourced workflow state, memory storage,
   retry handling, timeouts, leases, snapshots, and early PostgreSQL hardening.
 
-[0.2.0-pre.1]: https://github.com/sherry255/BeamTrail/compare/v0.1.0...HEAD
+[0.2.0-pre.1]: https://github.com/sherry255/BeamTrail/compare/v0.1.0...v0.2.0-pre.1
 [0.1.0]: https://github.com/sherry255/BeamTrail/releases/tag/v0.1.0
