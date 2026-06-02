@@ -7,6 +7,8 @@
 -export([list_recoverable/0, list_recoverable/2,
          mark_recovery_requeued/1, mark_recovery_requeued_with_lease/1]).
 
+-define(RECOVER_UNFINISHED_BATCH_SIZE, 100).
+
 start() ->
     application:ensure_all_started(beamtrail).
 
@@ -82,11 +84,19 @@ dispatch_with_lease(RunId, Lease, Options) ->
 
 recover_unfinished() ->
     ok = ensure_storage(),
-    case (storage()):list_run_ids() of
-        {ok, RunIds} ->
-            Requeued =
-                [RunId || RunId <- RunIds, recover_if_unfinished(RunId)],
-            {ok, Requeued};
+    recover_unfinished_pages(undefined, []).
+
+recover_unfinished_pages(Cursor, Acc) ->
+    case list_recoverable(Cursor, ?RECOVER_UNFINISHED_BATCH_SIZE) of
+        {ok, #{run_ids := RunIds,
+               has_more := HasMore,
+               next_cursor := NextCursor}} ->
+            Requeued = [RunId || RunId <- RunIds, recover_if_unfinished(RunId)],
+            Acc1 = Acc ++ Requeued,
+            case HasMore andalso NextCursor =/= undefined of
+                true -> recover_unfinished_pages(NextCursor, Acc1);
+                false -> {ok, Acc1}
+            end;
         {error, _} = Error ->
             Error
     end.
@@ -180,25 +190,47 @@ list_recoverable() ->
 
 list_recoverable(Cursor, Limit) ->
     ok = ensure_storage(),
-    case indexed_recoverable_page(storage(), Cursor, Limit) of
-        {ok, #{run_ids := RunIds} = Page} ->
-            {ok, Page#{run_ids := [RunId || RunId <- RunIds,
-                                            run_recoverable(RunId)]}};
-        {error, _} = Error ->
-            Error
-    end.
+    fill_recoverable_page(storage(), Cursor, Limit,
+                          erlang:system_time(millisecond), []).
 
 %% Prefer the storage adapter's indexed recovery scan when it offers one, so the
 %% scanner does not snapshot/replay every historical run. The page it returns is
 %% a coarse candidate set; run_recoverable/1 still applies the precise check
 %% (including the live-code migration gate) to each candidate. Adapters without
 %% the indexed scan fall back to paging every run id, preserving prior behavior.
-indexed_recoverable_page(Mod, Cursor, Limit) ->
+fill_recoverable_page(_Mod, _Cursor, Limit, _NowMs, Acc)
+  when length(Acc) >= Limit ->
+    {ok, #{run_ids => Acc, next_cursor => undefined, has_more => false}};
+fill_recoverable_page(Mod, Cursor, Limit, NowMs, Acc) ->
+    Need = Limit - length(Acc),
+    case indexed_recoverable_page(Mod, Cursor, Need, NowMs) of
+        {ok, #{run_ids := RunIds,
+               has_more := HasMore,
+               next_cursor := NextCursor}} ->
+            Acc1 = Acc ++ [RunId || RunId <- RunIds, run_recoverable(RunId)],
+            case length(Acc1) >= Limit of
+                true ->
+                    {ok, #{run_ids => Acc1,
+                           next_cursor => NextCursor,
+                           has_more => HasMore}};
+                false ->
+                    case HasMore andalso NextCursor =/= undefined of
+                        true -> fill_recoverable_page(Mod, NextCursor, Limit,
+                                                      NowMs, Acc1);
+                        false -> {ok, #{run_ids => Acc1,
+                                        next_cursor => NextCursor,
+                                        has_more => false}}
+                    end
+            end;
+        {error, _} = Error ->
+            Error
+    end.
+
+indexed_recoverable_page(Mod, Cursor, Limit, NowMs) ->
     _ = code:ensure_loaded(Mod),
     case erlang:function_exported(Mod, list_recoverable_run_ids, 3) of
         true ->
-            Mod:list_recoverable_run_ids(Cursor, Limit,
-                                         erlang:system_time(millisecond));
+            Mod:list_recoverable_run_ids(Cursor, Limit, NowMs);
         false ->
             Mod:list_run_ids(Cursor, Limit)
     end.

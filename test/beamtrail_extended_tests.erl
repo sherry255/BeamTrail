@@ -65,6 +65,8 @@ extended_test_() ->
       fun scanner_handles_recovery_budget_failure/0,
       fun repeated_recovery_requeued_keeps_open_attempt_metric/0,
       fun scanner_uses_indexed_recoverable_without_per_run_replay/0,
+      fun recover_unfinished_uses_index_without_full_replay/0,
+      fun list_recoverable_fills_page_after_filtered_candidates/0,
       fun list_recoverable_matches_recoverable_states/0
      ]}.
 
@@ -1157,9 +1159,8 @@ repeated_recovery_requeued_keeps_open_attempt_metric() ->
     ?assert(SecondRecovered >= FirstRecovered).
 
 scanner_uses_indexed_recoverable_without_per_run_replay() ->
-    %% A recovery scan must be O(recoverable runs), not O(all runs). With every
-    %% run already terminal, the scanner must not load (snapshot/replay) any run
-    %% state to discover there is nothing to recover.
+    %% With every run already terminal, the scanner must not load
+    %% (snapshot/replay) any run state to discover there is nothing to recover.
     ok = application:set_env(beamtrail, storage_adapter, bt_counting_storage),
     Complete =
         fun(N) ->
@@ -1180,6 +1181,43 @@ scanner_uses_indexed_recoverable_without_per_run_replay() ->
     ?assertEqual(0, maps:get(read_events, Counts, 0)),
     ?assertEqual(0, maps:get(events, Counts, 0)),
     ?assertEqual(0, maps:get(read_snapshot, Counts, 0)).
+
+recover_unfinished_uses_index_without_full_replay() ->
+    %% Manual recovery should use the same indexed path as the scanner instead
+    %% of falling back to the old full list_run_ids + per-run replay sweep.
+    ok = application:set_env(beamtrail, storage_adapter, bt_counting_storage),
+    Complete =
+        fun(N) ->
+                OrderId = iolist_to_binary(io_lib:format("o-rec-idx-~p", [N])),
+                Input = #{order_id => OrderId, test_pid => self()},
+                {ok, RunId} = beamtrail:start_workflow(bt_success_workflow, Input),
+                _ = receive_exec(), _ = receive_exec(),
+                ?assertEqual(completed,
+                             maps:get(status, beamtrail:get_state(RunId))),
+                RunId
+        end,
+    _ = [Complete(N) || N <- [1, 2, 3]],
+    bt_counting_storage:reset_counts(),
+    ?assertEqual({ok, []}, beamtrail:recover_unfinished()),
+    Counts = bt_counting_storage:counts(),
+    ?assertEqual(0, maps:get(read_events, Counts, 0)),
+    ?assertEqual(0, maps:get(events, Counts, 0)),
+    ?assertEqual(0, maps:get(read_snapshot, Counts, 0)).
+
+list_recoverable_fills_page_after_filtered_candidates() ->
+    %% The storage index returns coarse candidates. A migration-blocked run can
+    %% pass the indexed filter and then be rejected by recoverable/2. Public
+    %% pagination should still fill the final recoverable page before returning.
+    seed_migration_blocked(<<"p-fill-01-migration">>),
+    seed_created(<<"p-fill-02-running">>, bt_success_workflow, [charge]),
+    seed_created(<<"p-fill-03-running">>, bt_success_workflow, [charge]),
+    {ok, #{run_ids := FirstPage,
+           has_more := true,
+           next_cursor := Cursor1}} = beamtrail:list_recoverable(undefined, 1),
+    ?assertEqual([<<"p-fill-02-running">>], FirstPage),
+    {ok, #{run_ids := SecondPage,
+           has_more := false}} = beamtrail:list_recoverable(Cursor1, 1),
+    ?assertEqual([<<"p-fill-03-running">>], SecondPage).
 
 list_recoverable_matches_recoverable_states() ->
     %% The indexed candidate query is a coarse superset filtered by the precise
@@ -1227,6 +1265,15 @@ seed_created(RunId, Workflow, Steps) ->
                 #{workflow => Workflow, input => #{order_id => RunId},
                   steps => Steps}),
     ok.
+
+seed_migration_blocked(RunId) ->
+    seed_created(RunId, bt_versioned_workflow, [charge]),
+    {ok, Lease} = beamtrail_memory_storage:acquire_lease(RunId, mig_owner, 20),
+    {ok, _} = beamtrail_memory_storage:append_event(
+                RunId, 1, maps:get(fencing_token, Lease),
+                'attempt.started', charge, 1, {charge, RunId},
+                #{attempt => 1}),
+    ok = wait_until_lease_expired(RunId, 1000).
 
 seed_retrying(RunId, NextRetryAt) ->
     seed_created(RunId, bt_success_workflow, [charge]),
