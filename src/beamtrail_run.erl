@@ -196,7 +196,7 @@ renew_lease(_StateName, #{run_id := RunId, lease := Lease} = Data)
   when is_map(Lease) ->
     case beamtrail_lease_manager:renew(
            RunId, maps:get(fencing_token, Lease),
-           beamtrail_lease_manager:default_ttl_ms()) of
+           beamtrail_lease_manager:ttl_ms(Lease)) of
         {ok, Renewed} ->
             Data1 = schedule_heartbeat(Data#{lease := Renewed}),
             {keep_state, Data1, heartbeat_timeout_action(Data1)};

@@ -29,6 +29,20 @@
            next_cursor := binary() | undefined,
            has_more := boolean()}}.
 
+%% Optional indexed recovery scan. Returns a page of run ids that are coarse
+%% recovery candidates at NowMs: not terminal, not waiting on a future retry,
+%% and not currently leased. This avoids per-run snapshot/replay during scans;
+%% the event log remains the source of truth, and beamtrail:list_recoverable/2
+%% still applies the precise recoverable/2 check (including the live-code
+%% migration gate) to each returned candidate. Adapters that do not export it
+%% fall back to the replay-based scan in beamtrail.
+-callback list_recoverable_run_ids(Cursor :: binary() | undefined,
+                                   Limit :: pos_integer(),
+                                   NowMs :: integer()) ->
+    {ok, #{run_ids := [binary()],
+           next_cursor := binary() | undefined,
+           has_more := boolean()}} | {error, term()}.
+
 %% Optional observability accessors. Never part of the primary source of truth.
--optional_callbacks([telemetry_counters/0]).
+-optional_callbacks([list_recoverable_run_ids/3, telemetry_counters/0]).
 -callback telemetry_counters() -> map().

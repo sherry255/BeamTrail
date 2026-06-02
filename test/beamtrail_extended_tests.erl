@@ -63,7 +63,9 @@ extended_test_() ->
       fun recovery_requeued_records_recovered_in_ms/0,
       fun recovery_budget_exceeded_fails_open_attempt/0,
       fun scanner_handles_recovery_budget_failure/0,
-      fun repeated_recovery_requeued_keeps_open_attempt_metric/0
+      fun repeated_recovery_requeued_keeps_open_attempt_metric/0,
+      fun scanner_uses_indexed_recoverable_without_per_run_replay/0,
+      fun list_recoverable_matches_recoverable_states/0
      ]}.
 
 setup() ->
@@ -254,6 +256,8 @@ postgres_adapter_requires_config() ->
                  beamtrail_postgres_storage:list_run_ids()),
     ?assertEqual({error, postgres_not_configured},
                  beamtrail_postgres_storage:list_run_ids(undefined, 10)),
+    ?assertEqual({error, postgres_not_configured},
+                 beamtrail_postgres_storage:list_recoverable_run_ids(undefined, 10, 0)),
     ?assertEqual({error, postgres_not_configured},
                  beamtrail_postgres_storage:read_lease(<<"r">>)).
 
@@ -627,7 +631,8 @@ active_runner_heartbeat_uses_supplied_lease_ttl() ->
     ?assertMatch({slow_executed, slow}, receive_exec()),
     ok = wait_for_status(RunId, completed, 1000),
     {ok, CurrentLease} = beamtrail_memory_storage:read_lease(RunId),
-    ?assert(maps:get(lease_until, CurrentLease) > maps:get(lease_until, Lease)).
+    ?assert(maps:get(lease_until, CurrentLease) > maps:get(lease_until, Lease)),
+    ?assert(beamtrail_lease_manager:ttl_ms(CurrentLease) =< 200).
 
 active_runner_supervisor_rejects_when_pool_full() ->
     ok = application:set_env(beamtrail, run_max_children, 1),
@@ -1150,6 +1155,114 @@ repeated_recovery_requeued_keeps_open_attempt_metric() ->
     ?assert(is_integer(FirstRecovered)),
     ?assert(is_integer(SecondRecovered)),
     ?assert(SecondRecovered >= FirstRecovered).
+
+scanner_uses_indexed_recoverable_without_per_run_replay() ->
+    %% A recovery scan must be O(recoverable runs), not O(all runs). With every
+    %% run already terminal, the scanner must not load (snapshot/replay) any run
+    %% state to discover there is nothing to recover.
+    ok = application:set_env(beamtrail, storage_adapter, bt_counting_storage),
+    Complete =
+        fun(N) ->
+                OrderId = iolist_to_binary(io_lib:format("o-idx-~p", [N])),
+                Input = #{order_id => OrderId, test_pid => self()},
+                {ok, RunId} = beamtrail:start_workflow(bt_success_workflow, Input),
+                _ = receive_exec(), _ = receive_exec(),
+                ?assertEqual(completed,
+                             maps:get(status, beamtrail:get_state(RunId))),
+                RunId
+        end,
+    _ = [Complete(N) || N <- [1, 2, 3]],
+    bt_counting_storage:reset_counts(),
+    {ok, _Pid} = beamtrail_scanner:start_link(#{interval_ms => infinity,
+                                                auto_start => false}),
+    ?assertEqual({ok, []}, beamtrail_scanner:scan_now()),
+    Counts = bt_counting_storage:counts(),
+    ?assertEqual(0, maps:get(read_events, Counts, 0)),
+    ?assertEqual(0, maps:get(events, Counts, 0)),
+    ?assertEqual(0, maps:get(read_snapshot, Counts, 0)).
+
+list_recoverable_matches_recoverable_states() ->
+    %% The indexed candidate query is a coarse superset filtered by the precise
+    %% recoverable/2 check (including the live-code migration gate). The final
+    %% set must equal the genuinely recoverable runs across every reachable
+    %% (status, terminal, next_retry_at, lease, migration) combination.
+    Now = erlang:system_time(millisecond),
+    %% completed -> terminal -> not recoverable
+    seed_created(<<"p-completed">>, bt_success_workflow, []),
+    {ok, CompletedLease} =
+        beamtrail_memory_storage:acquire_lease(<<"p-completed">>, seed, 1000),
+    {ok, _} = beamtrail_memory_storage:append_event(
+                <<"p-completed">>, 1, maps:get(fencing_token, CompletedLease),
+                'workflow.completed', undefined, undefined, undefined, #{}),
+    %% running, no lease -> recoverable
+    seed_created(<<"p-running-nolease">>, bt_success_workflow, [charge]),
+    %% running, live lease -> not recoverable (owned)
+    seed_created(<<"p-running-livelease">>, bt_success_workflow, [charge]),
+    {ok, _} = beamtrail_memory_storage:acquire_lease(
+                <<"p-running-livelease">>, live_owner, 30000),
+    %% retrying, next_retry in the future -> not recoverable yet
+    seed_retrying(<<"p-retry-future">>, Now + 60000),
+    %% retrying, next_retry in the past, lease expired -> recoverable
+    seed_retrying(<<"p-retry-due">>, Now - 1000),
+    ok = wait_until_lease_expired(<<"p-retry-due">>, 1000),
+    %% terminal failure -> not recoverable
+    seed_terminal_failed(<<"p-terminal-failed">>),
+    %% open attempt whose step_version diverges from deployed code -> migration
+    %% blocked. It passes the coarse projection filter but recoverable/2 rejects.
+    seed_created(<<"p-migration">>, bt_versioned_workflow, [charge]),
+    {ok, MigLease} =
+        beamtrail_memory_storage:acquire_lease(<<"p-migration">>, mig_owner, 20),
+    {ok, _} = beamtrail_memory_storage:append_event(
+                <<"p-migration">>, 1, maps:get(fencing_token, MigLease),
+                'attempt.started', charge, 1, {charge, <<"p-migration">>},
+                #{attempt => 1}),
+    ok = wait_until_lease_expired(<<"p-migration">>, 1000),
+    {ok, #{run_ids := Recoverable}} = beamtrail:list_recoverable(undefined, 100),
+    ?assertEqual([<<"p-retry-due">>, <<"p-running-nolease">>], Recoverable).
+
+seed_created(RunId, Workflow, Steps) ->
+    {ok, _} = beamtrail_memory_storage:append_event(
+                RunId, 0, undefined,
+                'workflow.instance.created', undefined, undefined, undefined,
+                #{workflow => Workflow, input => #{order_id => RunId},
+                  steps => Steps}),
+    ok.
+
+seed_retrying(RunId, NextRetryAt) ->
+    seed_created(RunId, bt_success_workflow, [charge]),
+    {ok, Lease} = beamtrail_memory_storage:acquire_lease(RunId, retry_owner, 20),
+    Fence = maps:get(fencing_token, Lease),
+    {ok, _} = beamtrail_memory_storage:append_event(
+                RunId, 1, Fence, 'attempt.started', charge, 1,
+                {charge, RunId}, #{attempt => 1}),
+    {ok, _} = beamtrail_memory_storage:append_events(
+                RunId, 2, Fence,
+                [#{event_type => 'step.failed', step_id => charge,
+                   step_version => 1, idempotency_key => {charge, RunId},
+                   payload => #{reason => transient, class => transient,
+                                attempt => 1}},
+                 #{event_type => 'retry.scheduled', step_id => charge,
+                   step_version => 1, idempotency_key => {charge, RunId},
+                   payload => #{reason => transient, class => transient,
+                                attempt => 1, next_retry_at => NextRetryAt}}]),
+    ok.
+
+seed_terminal_failed(RunId) ->
+    seed_created(RunId, bt_success_workflow, [charge]),
+    {ok, Lease} = beamtrail_memory_storage:acquire_lease(RunId, fail_owner, 1000),
+    Fence = maps:get(fencing_token, Lease),
+    {ok, _} = beamtrail_memory_storage:append_event(
+                RunId, 1, Fence, 'attempt.started', charge, 1,
+                {charge, RunId}, #{attempt => 1}),
+    {ok, _} = beamtrail_memory_storage:append_events(
+                RunId, 2, Fence,
+                [#{event_type => 'step.failed', step_id => charge,
+                   step_version => 1, idempotency_key => {charge, RunId},
+                   payload => #{reason => fatal, class => fatal, attempt => 1}},
+                 #{event_type => 'workflow.failed', step_id => charge,
+                   step_version => 1, idempotency_key => {charge, RunId},
+                   payload => #{reason => fatal, class => fatal, attempt => 1}}]),
+    ok.
 
 receive_exec() ->
     receive Message -> Message

@@ -180,12 +180,27 @@ list_recoverable() ->
 
 list_recoverable(Cursor, Limit) ->
     ok = ensure_storage(),
-    case (storage()):list_run_ids(Cursor, Limit) of
+    case indexed_recoverable_page(storage(), Cursor, Limit) of
         {ok, #{run_ids := RunIds} = Page} ->
             {ok, Page#{run_ids := [RunId || RunId <- RunIds,
                                             run_recoverable(RunId)]}};
         {error, _} = Error ->
             Error
+    end.
+
+%% Prefer the storage adapter's indexed recovery scan when it offers one, so the
+%% scanner does not snapshot/replay every historical run. The page it returns is
+%% a coarse candidate set; run_recoverable/1 still applies the precise check
+%% (including the live-code migration gate) to each candidate. Adapters without
+%% the indexed scan fall back to paging every run id, preserving prior behavior.
+indexed_recoverable_page(Mod, Cursor, Limit) ->
+    _ = code:ensure_loaded(Mod),
+    case erlang:function_exported(Mod, list_recoverable_run_ids, 3) of
+        true ->
+            Mod:list_recoverable_run_ids(Cursor, Limit,
+                                         erlang:system_time(millisecond));
+        false ->
+            Mod:list_run_ids(Cursor, Limit)
     end.
 
 run_recoverable(RunId) ->

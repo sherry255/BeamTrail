@@ -239,12 +239,16 @@ suite on every push to `main` and on pull requests.
 ## Storage Format
 
 PostgreSQL stores payloads, idempotency keys, leases, and snapshots as Erlang
-external-term-format `bytea` values. Replay fidelity comes first; SQL-level
-inspection can be added later through read models.
+external-term-format `bytea` values. Replay fidelity comes first. Operational
+projections that the engine needs to query — the recovery-scan index columns
+(`status`, `terminal`, `next_retry_at_ms`) on `workflow_runs` — are kept as
+structured columns derived from the reducer, never by inspecting payload blobs.
 
 BeamTrail decodes these terms with `binary_to_term/2` in safe mode. Configure
 `workflow_modules` in releases so workflow module atoms and step atoms are
-available before recovery scans replay old events.
+available before recovery scans replay old events. Historical workflow modules
+and step atoms are a replay compatibility boundary: do not remove or rename them
+while runs that reference them may still be recovered.
 
 The schema lives in `priv/sql/postgres.sql`.
 

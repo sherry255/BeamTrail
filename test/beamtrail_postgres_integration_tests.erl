@@ -13,6 +13,10 @@ postgres_integration_test_() ->
              [fun postgres_workflow_survives_application_restart/0,
               fun postgres_recovery_replays_unfinished_attempt_after_restart/0,
               fun postgres_recovery_budget_exceeded_fails_open_attempt/0,
+              fun postgres_list_recoverable_uses_indexed_projection/0,
+              fun postgres_backfill_reports_per_run_load_errors/0,
+              fun postgres_transaction_rolls_back_on_internal_exception/0,
+              fun postgres_decode_rejects_unknown_atoms/0,
               fun postgres_append_locks_only_target_run/0,
               fun postgres_append_events_writes_adjacent_events/0,
               fun postgres_expected_seq_conflict_is_per_run/0,
@@ -84,7 +88,7 @@ postgres_recovery_replays_unfinished_attempt_after_restart() ->
     ?assertMatch({executed, charge, 1, {charge, RunId}}, receive_exec()).
 
 postgres_recovery_budget_exceeded_fails_open_attempt() ->
-    ok = application:set_env(beamtrail, lease_ttl_ms, 20),
+    ok = application:set_env(beamtrail, lease_ttl_ms, 100),
     ok = application:set_env(beamtrail, max_recoveries_per_attempt, 1),
     RunId = unique_run_id("pg-recovery-budget"),
     Input = #{order_id => RunId},
@@ -94,7 +98,7 @@ postgres_recovery_budget_exceeded_fails_open_attempt() ->
           'workflow.instance.created', undefined, undefined,
           undefined,
           #{workflow => bt_success_workflow, input => Input, steps => [charge]}),
-    {ok, Lease} = beamtrail_postgres_storage:acquire_lease(RunId, stale_worker, 20),
+    {ok, Lease} = beamtrail_postgres_storage:acquire_lease(RunId, stale_worker, 100),
     {ok, _} =
         beamtrail_postgres_storage:append_event(
           RunId, 1, maps:get(fencing_token, Lease),
@@ -114,6 +118,73 @@ postgres_recovery_budget_exceeded_fails_open_attempt() ->
     {ok, Events} = beamtrail_postgres_storage:events(RunId),
     ?assertEqual(1, length([E || E <- Events,
                             maps:get(event_type, E) =:= 'workflow.failed'])).
+
+postgres_list_recoverable_uses_indexed_projection() ->
+    {ok, Config} = application:get_env(beamtrail, postgres),
+    Now = erlang:system_time(millisecond),
+    %% running, no lease -> recoverable
+    seed_created_pg(<<"pg-rec-1-running">>, [charge]),
+    %% completed -> terminal -> not recoverable
+    seed_created_pg(<<"pg-rec-2-completed">>, []),
+    {ok, L2} = beamtrail_postgres_storage:acquire_lease(
+                 <<"pg-rec-2-completed">>, seed, 1000),
+    {ok, _} = beamtrail_postgres_storage:append_event(
+                <<"pg-rec-2-completed">>, 1, maps:get(fencing_token, L2),
+                'workflow.completed', undefined, undefined, undefined, #{}),
+    %% running, live lease -> not recoverable (owned)
+    seed_created_pg(<<"pg-rec-3-livelease">>, [charge]),
+    {ok, _} = beamtrail_postgres_storage:acquire_lease(
+                <<"pg-rec-3-livelease">>, live_owner, 30000),
+    %% retrying, next_retry in the future -> not recoverable yet
+    seed_retry_pg(<<"pg-rec-4-retry-future">>, Now + 60000),
+    %% retrying, next_retry past, lease expired -> recoverable
+    seed_retry_pg(<<"pg-rec-5-retry-due">>, Now - 1000),
+    ok = wait_until_pg_lease_expired(<<"pg-rec-5-retry-due">>, 1000),
+    %% terminal failure -> not recoverable
+    seed_terminal_failed_pg(<<"pg-rec-6-terminal-failed">>),
+    {ok, #{run_ids := Recoverable}} = beamtrail:list_recoverable(undefined, 100),
+    ?assertEqual([<<"pg-rec-1-running">>, <<"pg-rec-5-retry-due">>], Recoverable),
+    %% Projection columns mirror the reduced state derived by the reducer.
+    ?assertEqual({<<"completed">>, true, null},
+                 run_projection_row(Config, <<"pg-rec-2-completed">>)),
+    ?assertMatch({<<"retrying">>, false, NextRetry} when is_integer(NextRetry),
+                 run_projection_row(Config, <<"pg-rec-4-retry-future">>)),
+    ?assertEqual({<<"failed">>, true, null},
+                 run_projection_row(Config, <<"pg-rec-6-terminal-failed">>)).
+
+postgres_backfill_reports_per_run_load_errors() ->
+    {ok, Config} = application:get_env(beamtrail, postgres),
+    RunId = <<"pg-backfill-corrupt-run">>,
+    ok = insert_corrupt_backfill_run(Config, RunId),
+    ?assertMatch(
+       {error, {backfill_failed,
+                [#{run_id := RunId, reason := bad_external_term}]}},
+       beamtrail_postgres_storage:backfill_run_projections()).
+
+postgres_transaction_rolls_back_on_internal_exception() ->
+    ok = application:set_env(beamtrail, postgres_pool_size, 1),
+    ok = restart_beamtrail(),
+    RunId = <<"pg-transaction-exception-run">>,
+    ?assertMatch(
+       {error, {transaction_failed, error, {badkey, event_type}}},
+       beamtrail_postgres_storage:append_events(RunId, 0, undefined, [#{}])),
+    ?assertMatch({ok, #{event_seq := 1}}, append_created_event(RunId)),
+    {ok, #{run_ids := RunIds}} = beamtrail_postgres_storage:list_run_ids(undefined, 10),
+    ?assertEqual([RunId], RunIds).
+
+postgres_decode_rejects_unknown_atoms() ->
+    {ok, Config} = application:get_env(beamtrail, postgres),
+    UnknownTypeRun = <<"pg-unknown-event-type-run">>,
+    UnknownStepRun = <<"pg-unknown-step-run">>,
+    ok = insert_raw_event(Config, UnknownTypeRun, <<"made.up.event">>, null),
+    ok = insert_raw_event(Config, UnknownStepRun, <<"attempt.started">>,
+                          <<"step_atom_that_should_not_exist_987654">>),
+    ?assertEqual({error, {unknown_event_type, <<"made.up.event">>}},
+                 beamtrail_postgres_storage:events(UnknownTypeRun)),
+    ?assertEqual({error,
+                  {unknown_step_id,
+                   <<"step_atom_that_should_not_exist_987654">>}},
+                 beamtrail_postgres_storage:events(UnknownStepRun)).
 
 postgres_append_locks_only_target_run() ->
     {ok, Config} = application:get_env(beamtrail, postgres),
@@ -302,6 +373,110 @@ append_created_event(RunId) ->
       'workflow.instance.created', undefined, undefined,
       undefined,
       #{workflow => bt_success_workflow, input => #{}, steps => []}).
+
+seed_created_pg(RunId, Steps) ->
+    {ok, _} = beamtrail_postgres_storage:append_event(
+                RunId, 0, undefined,
+                'workflow.instance.created', undefined, undefined, undefined,
+                #{workflow => bt_success_workflow,
+                  input => #{order_id => RunId}, steps => Steps}),
+    ok.
+
+seed_retry_pg(RunId, NextRetryAt) ->
+    seed_created_pg(RunId, [charge]),
+    {ok, Lease} = beamtrail_postgres_storage:acquire_lease(RunId, retry_owner, 100),
+    Fence = maps:get(fencing_token, Lease),
+    {ok, _} = beamtrail_postgres_storage:append_event(
+                RunId, 1, Fence, 'attempt.started', charge, 1,
+                {charge, RunId}, #{attempt => 1}),
+    {ok, _} = beamtrail_postgres_storage:append_events(
+                RunId, 2, Fence,
+                [#{event_type => 'step.failed', step_id => charge,
+                   step_version => 1, idempotency_key => {charge, RunId},
+                   payload => #{reason => transient, class => transient,
+                                attempt => 1}},
+                 #{event_type => 'retry.scheduled', step_id => charge,
+                   step_version => 1, idempotency_key => {charge, RunId},
+                   payload => #{reason => transient, class => transient,
+                                attempt => 1, next_retry_at => NextRetryAt}}]),
+    ok.
+
+seed_terminal_failed_pg(RunId) ->
+    seed_created_pg(RunId, [charge]),
+    {ok, Lease} = beamtrail_postgres_storage:acquire_lease(RunId, fail_owner, 1000),
+    Fence = maps:get(fencing_token, Lease),
+    {ok, _} = beamtrail_postgres_storage:append_event(
+                RunId, 1, Fence, 'attempt.started', charge, 1,
+                {charge, RunId}, #{attempt => 1}),
+    {ok, _} = beamtrail_postgres_storage:append_events(
+                RunId, 2, Fence,
+                [#{event_type => 'step.failed', step_id => charge,
+                   step_version => 1, idempotency_key => {charge, RunId},
+                   payload => #{reason => fatal, class => fatal, attempt => 1}},
+                 #{event_type => 'workflow.failed', step_id => charge,
+                   step_version => 1, idempotency_key => {charge, RunId},
+                   payload => #{reason => fatal, class => fatal, attempt => 1}}]),
+    ok.
+
+run_projection_row(Config, RunId) ->
+    with_pg(Config,
+            fun(C) ->
+                    {ok, _Cols, [Row]} =
+                        epgsql:equery(
+                          C,
+                          "SELECT status, terminal, next_retry_at_ms "
+                          "FROM workflow_runs WHERE run_id = $1",
+                          [RunId]),
+                    Row
+            end).
+
+insert_corrupt_backfill_run(Config, RunId) ->
+    Now = erlang:system_time(millisecond),
+    with_pg(Config,
+            fun(C) ->
+                    {ok, 1} =
+                        epgsql:equery(
+                          C,
+                          "INSERT INTO workflow_runs "
+                          "(run_id, created_at_ms, updated_at_ms) "
+                          "VALUES ($1,$2,$2)",
+                          [RunId, Now]),
+                    {ok, 1} =
+                        epgsql:equery(
+                          C,
+                          "INSERT INTO workflow_events "
+                          "(run_id, event_seq, event_type, step_id, "
+                          "step_version, idempotency_key, payload, "
+                          "fencing_token, occurred_at_ms) "
+                          "VALUES ($1,1,'workflow.instance.created',"
+                          "NULL,NULL,NULL,$2,NULL,$3)",
+                          [RunId, <<"not-an-external-term">>, Now]),
+                    ok
+            end).
+
+insert_raw_event(Config, RunId, EventType, StepId) ->
+    Now = erlang:system_time(millisecond),
+    Payload = term_to_binary(#{}),
+    with_pg(Config,
+            fun(C) ->
+                    {ok, 1} =
+                        epgsql:equery(
+                          C,
+                          "INSERT INTO workflow_runs "
+                          "(run_id, created_at_ms, updated_at_ms) "
+                          "VALUES ($1,$2,$2)",
+                          [RunId, Now]),
+                    {ok, 1} =
+                        epgsql:equery(
+                          C,
+                          "INSERT INTO workflow_events "
+                          "(run_id, event_seq, event_type, step_id, "
+                          "step_version, idempotency_key, payload, "
+                          "fencing_token, occurred_at_ms) "
+                          "VALUES ($1,1,$2,$3,NULL,NULL,$4,NULL,$5)",
+                          [RunId, EventType, StepId, Payload, Now]),
+                    ok
+            end).
 
 truncate_tables(Config) ->
     case epgsql:connect(Config) of

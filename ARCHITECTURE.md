@@ -110,6 +110,17 @@ The scanner does not execute workflow code itself. It identifies a recoverable
 run, acquires a lease, appends `recovery.requeued`, and hands the run to a worker
 or active runner path. The worker can then replay the event stream and continue.
 
+To find recoverable runs without replaying every run, storage maintains a
+`run projection` index: per-run `status`, `terminal`, and `next_retry_at`,
+derived from the reducer and kept beside the run row. A scan queries that index
+for coarse candidates (not terminal, not waiting on a future retry, not currently
+leased) and pages over them. The lease is read live (a join, never denormalized,
+since leases are written in a separate transaction). The projection is a scan
+optimization in the same tier as snapshots: the event log stays authoritative,
+and the precise `recoverable/2` check is still applied to each candidate before a
+takeover. Because the index can only over-approximate (it omits the migration
+gate, which depends on live code), it never hides a genuinely recoverable run.
+
 An open `attempt.started` without a closing event is retried as the same attempt
 number with the same idempotency key. That preserves the attempt budget, but it
 means callback execution is at-least-once.
@@ -149,11 +160,21 @@ BeamTrail currently supports linear step lists. It does not yet support dynamic
 workflow control flow, branching, DAGs, fan-out/fan-in, child workflows, signals,
 or step-result dataflow into later steps.
 
-The scanner currently pages through run ids and loads reduced state to decide
-recoverability. This is correct at MVP scale, but it is not the final scalable
-shape. A production-oriented version should maintain indexed run projections
-such as status, current step, lease deadline, and failure class in PostgreSQL.
+The recovery scan is driven by the `run projection` index (see Recovery), so it
+avoids snapshot/replay work for every historical run. The PostgreSQL adapter
+keeps `status`, `terminal`, and `next_retry_at_ms` columns on `workflow_runs`,
+updated in the same transaction as the append, with a partial index on
+non-terminal runs and an index on lease expiry. Adapters that do not implement
+the optional
+`list_recoverable_run_ids/3` callback fall back to paging all run ids and
+replaying each, which is still correct. Runs created before the projection
+columns existed default to a safe over-approximating state and can be normalized
+once with `beamtrail_postgres_storage:backfill_run_projections/0`.
+
+The projection is deliberately limited to the fields the scan filters on.
+Migration-required is not projected: it is recomputed from live deployed code at
+load time, so it stays a per-candidate check rather than a stored column.
 
 The PostgreSQL payload format uses Erlang external term format for replay
-fidelity. Operational projections should be added as structured columns or read
-models rather than by querying payload blobs directly.
+fidelity. Operational projections are added as structured columns, never by
+querying payload blobs directly.

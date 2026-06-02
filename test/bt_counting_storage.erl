@@ -4,7 +4,7 @@
 -export([reset_counts/0, counts/0]).
 -export([append_event/8, append_events/4, read_events/3, events/1, write_snapshot/4,
          read_snapshot/1, acquire_lease/3, renew_lease/3, read_lease/1,
-         list_run_ids/0, list_run_ids/2]).
+         list_run_ids/0, list_run_ids/2, list_recoverable_run_ids/3]).
 -export([telemetry_counters/0]).
 
 -define(TABLE, bt_counting_storage_counts).
@@ -58,6 +58,9 @@ list_run_ids() ->
 
 list_run_ids(Cursor, Limit) ->
     beamtrail_memory_storage:list_run_ids(Cursor, Limit).
+
+list_recoverable_run_ids(Cursor, Limit, NowMs) ->
+    beamtrail_memory_storage:list_recoverable_run_ids(Cursor, Limit, NowMs).
 
 telemetry_counters() ->
     beamtrail_memory_storage:telemetry_counters().

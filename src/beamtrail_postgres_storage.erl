@@ -7,9 +7,10 @@
 %% terms as external-term-format bytea values so replay semantics come before
 %% SQL-level inspection.
 
--export([init_schema/0]).
+-export([init_schema/0, backfill_run_projections/0]).
 -export([append_event/8, append_events/4, read_events/3, events/1, write_snapshot/4, read_snapshot/1,
-         acquire_lease/3, renew_lease/3, read_lease/1, list_run_ids/0, list_run_ids/2]).
+         acquire_lease/3, renew_lease/3, read_lease/1, list_run_ids/0, list_run_ids/2,
+         list_recoverable_run_ids/3]).
 
 append_event(RunId, ExpectedSeq, FencingToken,
              EventType, StepId, StepVersion, IdempotencyKey, Payload) ->
@@ -195,6 +196,45 @@ list_run_ids(Cursor, Limit) ->
               end
       end).
 
+list_recoverable_run_ids(Cursor, Limit, NowMs) ->
+    with_connection(
+      fun(C) ->
+              {Sql, Params} = recoverable_query(Cursor, Limit, NowMs),
+              case epgsql:equery(C, Sql, Params) of
+                  {ok, _Cols, Rows} ->
+                      All = [RunId || {RunId} <- Rows],
+                      Page = lists:sublist(All, Limit),
+                      {ok, #{run_ids => Page,
+                             next_cursor => next_cursor(Page),
+                             has_more => length(All) > Limit}};
+                  {error, Reason} ->
+                      {error, Reason}
+              end
+      end).
+
+%% Coarse recovery candidates at NowMs: not terminal, not waiting on a future
+%% retry, and not currently leased. The lease is read live via LEFT JOIN (never
+%% denormalized into workflow_runs, which is updated in a different transaction).
+%% Mirrors beamtrail:recoverable_by_status/1 + lease_recoverable/1, minus the
+%% migration gate, which beamtrail re-checks per candidate from live code.
+recoverable_query(undefined, Limit, NowMs) ->
+    {"SELECT r.run_id FROM workflow_runs r "
+     "LEFT JOIN workflow_leases l ON l.run_id = r.run_id "
+     "WHERE r.terminal = false "
+     "AND (r.status <> 'retrying' OR r.next_retry_at_ms <= $1) "
+     "AND (l.lease_until_ms IS NULL OR l.lease_until_ms <= $1) "
+     "ORDER BY r.run_id LIMIT $2",
+     [NowMs, Limit + 1]};
+recoverable_query(Cursor, Limit, NowMs) ->
+    {"SELECT r.run_id FROM workflow_runs r "
+     "LEFT JOIN workflow_leases l ON l.run_id = r.run_id "
+     "WHERE r.terminal = false "
+     "AND (r.status <> 'retrying' OR r.next_retry_at_ms <= $1) "
+     "AND (l.lease_until_ms IS NULL OR l.lease_until_ms <= $1) "
+     "AND r.run_id > $2 "
+     "ORDER BY r.run_id LIMIT $3",
+     [NowMs, Cursor, Limit + 1]}.
+
 init_schema() ->
     with_connection(
       fun(C) ->
@@ -245,20 +285,27 @@ transaction(Fun) ->
       fun(C) ->
               case epgsql:squery(C, "BEGIN") of
                   {ok, _, _} ->
-                      case Fun(C) of
-                          {error, _} = Error ->
-                              _ = epgsql:squery(C, "ROLLBACK"),
-                              Error;
-                          Other ->
-                              case epgsql:squery(C, "COMMIT") of
-                                  {ok, _, _} -> Other;
-                                  {error, Reason} -> {error, Reason}
-                              end
-                      end;
+                      run_transaction_body(C, Fun);
                   {error, Reason} ->
                       {error, Reason}
               end
       end).
+
+run_transaction_body(C, Fun) ->
+    try Fun(C) of
+        {error, _} = Error ->
+            _ = epgsql:squery(C, "ROLLBACK"),
+            Error;
+        Other ->
+            case epgsql:squery(C, "COMMIT") of
+                {ok, _, _} -> Other;
+                {error, Reason} -> {error, Reason}
+            end
+    catch
+        Class:Reason:_Stacktrace ->
+            _ = epgsql:squery(C, "ROLLBACK"),
+            {error, {transaction_failed, Class, Reason}}
+    end.
 
 connect() ->
     case beamtrail_postgres_config:connection() of
@@ -312,7 +359,7 @@ validate_fencing_for_specs(C, RunId, FencingToken, [Spec | Rest]) ->
 append_event_specs(C, RunId, _Seq, _FencingToken, [], Acc) ->
     Events = lists:reverse(Acc),
     Last = lists:last(Events),
-    case touch_run(C, RunId, maps:get(occurred_at, Last)) of
+    case update_run_after_append(C, RunId, Events, maps:get(occurred_at, Last)) of
         ok -> {ok, Events};
         {error, _} = Error -> Error
     end;
@@ -392,6 +439,120 @@ touch_run(C, RunId, UpdatedAt) ->
         {ok, 1} -> ok;
         {ok, 0} -> {error, run_lock_missing};
         {error, Reason} -> {error, Reason}
+    end.
+
+%% Maintain the recovery-scan projection in the same transaction as the append,
+%% so the index can never disagree with a committed decision. Marker-only
+%% batches (recovery.requeued) leave the projection unchanged, matching the
+%% reducer's no-op for unrecognized events; they still bump updated_at_ms.
+update_run_after_append(C, RunId, Events, UpdatedAt) ->
+    case run_projection(Events) of
+        no_change ->
+            touch_run(C, RunId, UpdatedAt);
+        #{status := Status, terminal := Terminal, next_retry_at := NextRetry} ->
+            case epgsql:equery(
+                   C,
+                   "UPDATE workflow_runs SET updated_at_ms = $2, status = $3, "
+                   "terminal = $4, next_retry_at_ms = $5 WHERE run_id = $1",
+                   [RunId, UpdatedAt, Status, Terminal, NextRetry]) of
+                {ok, 1} -> ok;
+                {ok, 0} -> {error, run_lock_missing};
+                {error, Reason} -> {error, Reason}
+            end
+    end.
+
+%% Derive the (status, terminal, next_retry_at) projection from a committed
+%% batch. The reducer is the authority for run state (see beamtrail_reducer);
+%% this mirrors only the columns the scan filters on. The parity assertion in
+%% the PostgreSQL integration test guards against drift from the reducer.
+run_projection(Events) ->
+    lists:foldl(fun project_event/2, no_change, Events).
+
+project_event(#{event_type := 'workflow.instance.created'}, _Acc) ->
+    #{status => <<"running">>, terminal => false, next_retry_at => null};
+project_event(#{event_type := 'attempt.started'}, _Acc) ->
+    #{status => <<"running">>, terminal => false, next_retry_at => null};
+project_event(#{event_type := 'step.succeeded'}, _Acc) ->
+    #{status => <<"running">>, terminal => false, next_retry_at => null};
+project_event(#{event_type := 'step.failed'}, _Acc) ->
+    #{status => <<"failed">>, terminal => false, next_retry_at => null};
+project_event(#{event_type := 'retry.scheduled', payload := Payload}, _Acc) ->
+    #{status => <<"retrying">>, terminal => false,
+      next_retry_at => maps:get(next_retry_at, Payload, null)};
+project_event(#{event_type := 'workflow.completed'}, _Acc) ->
+    #{status => <<"completed">>, terminal => true, next_retry_at => null};
+project_event(#{event_type := 'workflow.failed'}, _Acc) ->
+    #{status => <<"failed">>, terminal => true, next_retry_at => null};
+project_event(_Event, Acc) ->
+    Acc.
+
+%% One-time normalization for runs that predate the projection columns: replays
+%% each run through the reducer and writes its current projection. Safe to run
+%% repeatedly; it does not touch updated_at_ms.
+backfill_run_projections() ->
+    backfill_run_projections(undefined, []).
+
+backfill_run_projections(Cursor, Failures) ->
+    case list_run_ids(Cursor, 500) of
+        {ok, #{run_ids := []}} ->
+            backfill_result(Failures);
+        {ok, #{run_ids := RunIds, has_more := HasMore, next_cursor := Next}} ->
+            Failures1 = lists:foldl(fun collect_backfill_result/2,
+                                     Failures,
+                                     RunIds),
+            case HasMore of
+                true -> backfill_run_projections(Next, Failures1);
+                false -> backfill_result(Failures1)
+            end;
+        {error, _} = Error ->
+            Error
+    end.
+
+collect_backfill_result(RunId, Failures) ->
+    case backfill_one(RunId) of
+        ok ->
+            Failures;
+        {error, Reason} ->
+            [#{run_id => RunId, reason => Reason} | Failures]
+    end.
+
+backfill_result([]) ->
+    ok;
+backfill_result(Failures) ->
+    {error, {backfill_failed, lists:reverse(Failures)}}.
+
+backfill_one(RunId) ->
+    case beamtrail_state:load(RunId, ?MODULE) of
+        {ok, State} ->
+            write_backfill_projection(RunId, State);
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+write_backfill_projection(RunId, State) ->
+    Status = atom_to_binary(maps:get(status, State, running), utf8),
+    Terminal = maps:get(terminal, State, false),
+    NextRetry = case maps:get(next_retry_at, State, undefined) of
+                    undefined -> null;
+                    N -> N
+                end,
+    case with_connection(
+           fun(C) ->
+                   epgsql:equery(
+                     C,
+                     "UPDATE workflow_runs SET status = $2, "
+                     "terminal = $3, next_retry_at_ms = $4 "
+                     "WHERE run_id = $1",
+                     [RunId, Status, Terminal, NextRetry])
+           end) of
+        {ok, 1} ->
+            ok;
+        {ok, 0} ->
+            {error, run_not_found};
+        {ok, Count} ->
+            {error, {unexpected_update_count, Count}};
+        {error, Reason} ->
+            {error, Reason}
     end.
 
 current_event_seq(C, RunId) ->
@@ -503,20 +664,27 @@ decode_event_rows([Row | Rest], RunId, Acc) ->
 
 decode_event(RunId, {Seq, TypeBin, StepBin, StepVersion,
                      IdempotencyBin, PayloadBin, Fence, OccurredAt}) ->
-    case {decode_term(IdempotencyBin), decode_term(PayloadBin)} of
-        {{ok, IdempotencyKey}, {ok, Payload}} ->
+    case {decode_event_type(TypeBin),
+          decode_step_id(StepBin),
+          decode_term(IdempotencyBin),
+          decode_term(PayloadBin)} of
+        {{ok, EventType}, {ok, StepId}, {ok, IdempotencyKey}, {ok, Payload}} ->
             {ok, #{run_id => RunId,
                    event_seq => Seq,
-                   event_type => binary_to_atom(TypeBin, utf8),
-                   step_id => decode_atom(StepBin),
+                   event_type => EventType,
+                   step_id => StepId,
                    step_version => decode_null(StepVersion),
                    idempotency_key => IdempotencyKey,
                    payload => Payload,
                    fencing_token => decode_null(Fence),
                    occurred_at => OccurredAt}};
-        {{error, _} = Error, _} ->
+        {{error, _} = Error, _, _, _} ->
             Error;
-        {_, {error, _} = Error} ->
+        {_, {error, _} = Error, _, _} ->
+            Error;
+        {_, _, {error, _} = Error, _} ->
+            Error;
+        {_, _, _, {error, _} = Error} ->
             Error
     end.
 
@@ -529,8 +697,35 @@ nullable_int(Int) when is_integer(Int) -> Int.
 nullable_term(undefined) -> null;
 nullable_term(Term) -> term_to_binary(Term).
 
-decode_atom(null) -> undefined;
-decode_atom(Bin) when is_binary(Bin) -> binary_to_atom(Bin, utf8).
+decode_event_type(<<"workflow.instance.created">>) ->
+    {ok, 'workflow.instance.created'};
+decode_event_type(<<"attempt.started">>) ->
+    {ok, 'attempt.started'};
+decode_event_type(<<"step.succeeded">>) ->
+    {ok, 'step.succeeded'};
+decode_event_type(<<"step.failed">>) ->
+    {ok, 'step.failed'};
+decode_event_type(<<"retry.scheduled">>) ->
+    {ok, 'retry.scheduled'};
+decode_event_type(<<"workflow.completed">>) ->
+    {ok, 'workflow.completed'};
+decode_event_type(<<"workflow.failed">>) ->
+    {ok, 'workflow.failed'};
+decode_event_type(<<"recovery.requeued">>) ->
+    {ok, 'recovery.requeued'};
+decode_event_type(<<"recovery.skipped">>) ->
+    {ok, 'recovery.skipped'};
+decode_event_type(Bin) when is_binary(Bin) ->
+    {error, {unknown_event_type, Bin}}.
+
+decode_step_id(null) ->
+    {ok, undefined};
+decode_step_id(Bin) when is_binary(Bin) ->
+    try binary_to_existing_atom(Bin, utf8) of
+        StepId -> {ok, StepId}
+    catch
+        error:badarg -> {error, {unknown_step_id, Bin}}
+    end.
 
 decode_null(null) -> undefined;
 decode_null(Value) -> Value.

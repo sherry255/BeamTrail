@@ -4,7 +4,7 @@
 
 -export([start_link/0, reset/0]).
 -export([append_event/8, append_events/4, read_events/3, events/1,
-         list_run_ids/0, list_run_ids/2]).
+         list_run_ids/0, list_run_ids/2, list_recoverable_run_ids/3]).
 -export([write_snapshot/4, read_snapshot/1]).
 -export([acquire_lease/3, renew_lease/3, read_lease/1]).
 -export([telemetry_counters/0]).
@@ -42,6 +42,9 @@ list_run_ids() ->
 list_run_ids(Cursor, Limit) ->
     gen_server:call(?MODULE, {list_run_ids, Cursor, Limit}).
 
+list_recoverable_run_ids(Cursor, Limit, NowMs) ->
+    gen_server:call(?MODULE, {list_recoverable_run_ids, Cursor, Limit, NowMs}).
+
 write_snapshot(RunId, State, SnapshotSeq, SnapshotRevision) ->
     gen_server:call(?MODULE,
         {write_snapshot, RunId, State, SnapshotSeq, SnapshotRevision}).
@@ -72,7 +75,10 @@ empty_state() ->
       event_counts => #{},
       snapshots => #{},
       leases => #{},
-      counters => #{}}.
+      counters => #{},
+      %% Per-run reduced state, folded through beamtrail_reducer at append time.
+      %% Used only as a recovery-scan index; the event log stays authoritative.
+      projections => #{}}.
 
 handle_call(reset, _From, _State) ->
     {reply, ok, empty_state()};
@@ -107,6 +113,30 @@ handle_call({list_run_ids, Cursor, Limit}, _From, State) ->
     AfterCursor = case Cursor of
                       undefined -> All;
                       _ -> [RunId || RunId <- All, RunId > Cursor]
+                  end,
+    Page = lists:sublist(AfterCursor, Limit),
+    HasMore = length(AfterCursor) > length(Page),
+    NextCursor = case Page of
+                     [] -> undefined;
+                     _ -> lists:last(Page)
+                 end,
+    {reply, {ok, #{run_ids => Page,
+                   next_cursor => NextCursor,
+                   has_more => HasMore}},
+     State};
+handle_call({list_recoverable_run_ids, Cursor, Limit, NowMs}, _From, State) ->
+    Projections = maps:get(projections, State),
+    Leases = maps:get(leases, State),
+    Candidates =
+        lists:sort(
+          [RunId
+           || RunId <- maps:keys(Projections),
+              recoverable_candidate(maps:get(RunId, Projections),
+                                    maps:get(RunId, Leases, undefined),
+                                    NowMs)]),
+    AfterCursor = case Cursor of
+                      undefined -> Candidates;
+                      _ -> [RunId || RunId <- Candidates, RunId > Cursor]
                   end,
     Page = lists:sublist(AfterCursor, Limit),
     HasMore = length(AfterCursor) > length(Page),
@@ -203,7 +233,9 @@ append_events_to_state(RunId, ExpectedSeq, FencingToken, EventSpecs, State) ->
                     State1 =
                         State#{events := maps:put(RunId, lists:reverse(Events) ++ RunEvents,
                                                   EventsByRun),
-                               event_counts := maps:put(RunId, EventSeq, EventCounts)},
+                               event_counts := maps:put(RunId, EventSeq, EventCounts),
+                               projections := update_projection(RunId, Events,
+                                                                maps:get(projections, State))},
                     {{ok, Events}, State1};
                 {error, _} = Error ->
                     {Error, State}
@@ -253,6 +285,41 @@ terminate(_Reason, _State) ->
 
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
+
+%% Fold the newly appended events onto the run's prior reduced state. The
+%% reducer is the authority for run state; this only keeps a derived copy for
+%% the recovery-scan index. Migration is deliberately excluded: it depends on
+%% live deployed code, so beamtrail_state:enrich applies it at load time and
+%% recoverable/2 re-checks it on candidates.
+update_projection(RunId, Events, Projections) ->
+    Prior = maps:get(RunId, Projections, beamtrail_reducer:new()),
+    Reduced = lists:foldl(fun(Event, Acc) ->
+                                  beamtrail_reducer:apply_event(Acc, Event)
+                          end,
+                          Prior,
+                          Events),
+    maps:put(RunId, Reduced, Projections).
+
+%% Coarse recovery candidate test mirroring beamtrail:recoverable_by_status/1
+%% and lease_recoverable/1, minus the migration gate (applied later from live
+%% code). It is a safe over-approximation: it never excludes a genuinely
+%% recoverable run.
+recoverable_candidate(Reduced, Lease, NowMs) ->
+    candidate_status(Reduced, NowMs) andalso lease_open(Lease, NowMs).
+
+candidate_status(Reduced, NowMs) ->
+    case maps:get(terminal, Reduced, false) of
+        true ->
+            false;
+        false ->
+            case maps:get(status, Reduced) of
+                retrying -> maps:get(next_retry_at, Reduced, 0) =< NowMs;
+                _ -> true
+            end
+    end.
+
+lease_open(undefined, _NowMs) -> true;
+lease_open(Lease, NowMs) -> maps:get(lease_until, Lease) =< NowMs.
 
 lease_available(undefined, _Now) -> true;
 lease_available(Lease, Now) -> maps:get(lease_until, Lease) =< Now.
