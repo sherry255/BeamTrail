@@ -1,0 +1,9 @@
+title = "beamtrail"
+
+[allowlist]
+description = "Allow known demo credentials in docs and test scaffolding"
+regexes = [
+  '''(?m)^\s*POSTGRES_PASSWORD\s*[:=]\s*beamtrail$''',
+  '''(?m)^\s*BEAMTRAIL_PG_PASSWORD\s*[:=]\s*beamtrail$''',
+  '''(?m)^\s*password\s*=>\s*"beamtrail"$'''
+]
