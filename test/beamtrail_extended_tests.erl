@@ -19,6 +19,7 @@ extended_test_() ->
       fun await_terminal_times_out_for_nonterminal_run/0,
       fun query_describe_exposes_read_model/0,
       fun query_describe_exposes_step_results/0,
+      fun query_describe_exposes_pending_step_input/0,
       fun query_instance_current_step_matches_reducer/0,
       fun telemetry_counters_track_attempts/0,
       fun postgres_adapter_requires_config/0,
@@ -79,6 +80,7 @@ extended_test_() ->
       fun malformed_retry_policy_map_fails_terminally_without_retry_loop/0,
       fun failed_step_decision_is_crash_atomic/0,
       fun open_attempt_recovery_reuses_attempt_budget/0,
+      fun legacy_attempt_started_falls_back_to_workflow_input/0,
       fun retry_attempts_preserved_in_chronological_order/0,
       fun workflow_module_preload_accepts_configured_modules/0,
       fun storage_adapter_is_application_configurable/0,
@@ -343,6 +345,23 @@ query_describe_exposes_step_results() ->
           event_seq := _,
           result := #{step := ship}}],
        maps:get(results, Q)).
+
+query_describe_exposes_pending_step_input() ->
+    RunId = <<"query-step-input-run-1">>,
+    Gate = query_step_input_gate,
+    Input = #{order_id => <<"o-q-step-input-1">>, test_pid => self(),
+              gate => Gate},
+    {ok, RunId} = beamtrail:start_workflow(bt_blocking_success_workflow, Input,
+                                           #{run_id => RunId}),
+    {blocking_started, ExecPid, 1} = receive_exec(),
+    Q = beamtrail_query:describe(RunId),
+    Pending = maps:get(pending_attempt, Q),
+    ?assertEqual(Input, maps:get(step_input, Pending)),
+    {ok, Events} = beamtrail:events(RunId),
+    [Started] = [E || E <- Events, maps:get(event_type, E) =:= 'attempt.started'],
+    ?assertEqual(Input, maps:get(step_input, maps:get(payload, Started))),
+    ExecPid ! {Gate, continue},
+    ok = wait_for_status(RunId, completed, 1000).
 
 query_instance_current_step_matches_reducer() ->
     RunId = <<"query-step-run-1">>,
@@ -700,7 +719,7 @@ storage_rejects_zombie_append_after_fence_takeover() ->
 
 storage_renews_current_lease_without_changing_fence() ->
     RunId = <<"renew-run-1">>,
-    {ok, Lease} = beamtrail_memory_storage:acquire_lease(RunId, worker_a, 10),
+    {ok, Lease} = beamtrail_memory_storage:acquire_lease(RunId, worker_a, 100),
     Fence = maps:get(fencing_token, Lease),
     timer:sleep(2),
     {ok, Renewed} = beamtrail_memory_storage:renew_lease(RunId, Fence, 100),
@@ -1462,6 +1481,27 @@ open_attempt_recovery_reuses_attempt_budget() ->
                             maps:get(event_type, E) =:= 'attempt.started'])),
     State = beamtrail:get_state(RunId),
     ?assertEqual(1, maps:get(charge, maps:get(attempt_counts, State))).
+
+legacy_attempt_started_falls_back_to_workflow_input() ->
+    RunId = <<"legacy-step-input-run-1">>,
+    Input = #{order_id => <<"o-legacy-step-input-1">>, test_pid => self()},
+    {ok, _} = beamtrail_memory_storage:append_event(
+                RunId, 0, undefined,
+                'workflow.instance.created', undefined, undefined,
+                undefined,
+                #{workflow => bt_success_workflow, input => Input,
+                  steps => [charge]}),
+    {ok, Lease} = beamtrail_memory_storage:acquire_lease(RunId, stale_worker, 20),
+    {ok, _} = beamtrail_memory_storage:append_event(
+                RunId, 1, maps:get(fencing_token, Lease),
+                'attempt.started', charge, 1,
+                {charge, <<"o-legacy-step-input-1">>}, #{attempt => 1}),
+    State = beamtrail:get_state(RunId),
+    ?assertEqual(Input, maps:get(step_input, maps:get(pending_attempt, State))),
+    ok = wait_until_lease_expired(RunId, 1000),
+    ?assertMatch({ok, [_]}, beamtrail:recover_unfinished()),
+    ?assertMatch({executed, charge, 1, {charge, <<"o-legacy-step-input-1">>}},
+                 receive_exec()).
 
 retry_attempts_preserved_in_chronological_order() ->
     Input = #{order_id => <<"o-ord-1">>, test_pid => self()},

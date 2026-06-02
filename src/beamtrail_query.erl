@@ -85,6 +85,7 @@ describe_loaded_events(RunId, Mod, State, Events) ->
       parked_at => maps:get(parked_at, State, undefined),
       migration_required_for_version_change =>
           maps:get(migration_required_for_version_change, State, false),
+      pending_attempt => maps:get(pending_attempt, State, undefined),
       attempts => Attempts,
       results => maps:get(results, State, []),
       workflow_result => maps:get(workflow_result, State, undefined),

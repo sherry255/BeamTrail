@@ -213,7 +213,8 @@ ensure_attempt_started(RunId, Workflow, Input, State, StepId, Lease) ->
             {ok, Attempt, false, State};
         _ ->
             AttemptNo = maps:get(StepId, maps:get(attempt_counts, State), 0) + 1,
-            case step_metadata(RunId, Workflow, StepId, Input) of
+            StepInput = Input,
+            case step_metadata(RunId, Workflow, StepId, StepInput) of
                 {ok, StepVersion, IdempotencyKey} ->
                     case append_event(
                            RunId,
@@ -223,7 +224,9 @@ ensure_attempt_started(RunId, Workflow, Input, State, StepId, Lease) ->
                            StepId,
                            StepVersion,
                            IdempotencyKey,
-                           #{attempt => AttemptNo, owner_node => owner()}) of
+                           #{attempt => AttemptNo,
+                             owner_node => owner(),
+                             step_input => StepInput}) of
                         {ok, Event} ->
                             State1 = apply_runtime_event(State, Event),
                             _ = maybe_snapshot_state(RunId, State1, false),
@@ -239,12 +242,13 @@ ensure_attempt_started(RunId, Workflow, Input, State, StepId, Lease) ->
 
 execution_spec(RunId, Workflow, StepId, Input, Attempt) ->
     StepVersion = maps:get(step_version, Attempt),
+    StepInput = maps:get(step_input, Attempt, Input),
     case safe_workflow_callback(timeout_ms, fun() -> Workflow:timeout_ms(StepId) end) of
         {ok, TimeoutMs} ->
             {ok, #{workflow => Workflow,
                    step_id => StepId,
                    step_version => StepVersion,
-                   input => Input,
+                   input => StepInput,
                    timeout_ms => TimeoutMs,
                    context => execution_context(RunId, Attempt)}};
         {error, CallbackError} ->

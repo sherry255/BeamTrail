@@ -91,6 +91,12 @@ Successful step results are retained in reducer state as an ordered
 prior step outputs durable and inspectable, but current linear workflows still do
 not feed those results into later step inputs.
 
+Each `attempt.started` also records the concrete `step_input` used by that
+attempt. Legacy linear workflows set that value to the original workflow input;
+future decider workflows can choose a different input before crossing the
+execution boundary. Recovery of an open attempt reuses the persisted
+`step_input` and does not re-run the decider.
+
 Workflow callback errors are captured at the engine boundary. `steps/1` errors
 return a structured create failure before the run is written. Runtime callback
 errors from `step_version/1`, `idempotency_key/3`, or `timeout_ms/1` are written
@@ -202,9 +208,10 @@ parked runs. Recovery budgets still apply to automatic recovery decisions.
 ## Current Limits
 
 BeamTrail currently supports linear step lists. Step results are retained and
-queryable, but they are not yet used as later step inputs. BeamTrail does not yet
-support dynamic workflow control flow, branching, DAGs, fan-out/fan-in, child
-workflows, or signals.
+queryable, and each attempt persists its chosen `step_input`, but legacy linear
+workflows still pass the original workflow input to every step. BeamTrail does
+not yet support dynamic workflow control flow, branching, DAGs, fan-out/fan-in,
+child workflows, or signals.
 
 The planned next orchestration boundary is an event-sourced decider plus
 step-result dataflow. The decider is deliberately not a Temporal-style arbitrary

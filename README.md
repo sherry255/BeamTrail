@@ -28,6 +28,7 @@ Current scope:
 - Durable run control: cancel, park/resume, and manual requeue
 - Inspector data through `beamtrail_query:describe/1`
 - Step result history exposed through the reducer state and inspector
+- Per-attempt step inputs persisted on `attempt.started`
 
 Not in scope yet:
 
@@ -246,8 +247,9 @@ View = beamtrail_query:describe(RunId).
 ```
 
 `beamtrail_query:describe/1` returns the current reduced state, attempts,
-snapshot metadata, replay tail length, lease/fencing metadata, active runner
-metadata, run-control metadata, recovery metadata, and the event list.
+pending attempt metadata, snapshot metadata, replay tail length, lease/fencing
+metadata, active runner metadata, run-control metadata, recovery metadata, and
+the event list.
 
 ## Configuration
 
