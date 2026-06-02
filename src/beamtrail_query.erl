@@ -7,6 +7,12 @@
 
 -export([describe/1, list/0, telemetry/0]).
 
+-export_type([description/0]).
+
+-type run_id() :: beamtrail:run_id().
+-type description() :: map().
+
+-spec list() -> [description()] | {error, term()}.
 list() ->
     ok = beamtrail_config:ensure_storage(),
     Mod = beamtrail_config:storage(),
@@ -15,6 +21,7 @@ list() ->
         {error, _} = Error -> Error
     end.
 
+-spec telemetry() -> map().
 telemetry() ->
     ok = beamtrail_config:ensure_storage(),
     Mod = beamtrail_config:storage(),
@@ -23,6 +30,7 @@ telemetry() ->
         false -> #{adapter => Mod, note => <<"telemetry counters not implemented by adapter">>}
     end.
 
+-spec describe(run_id()) -> description() | {error, term()}.
 describe(RunId) ->
     ok = beamtrail_config:ensure_storage(),
     Mod = beamtrail_config:storage(),

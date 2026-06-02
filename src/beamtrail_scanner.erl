@@ -15,21 +15,33 @@
 -define(DEFAULT_INTERVAL_MS, 5000).
 -define(DEFAULT_BATCH_SIZE, 100).
 
+-type options() ::
+    #{interval_ms => pos_integer() | infinity,
+      batch_size => pos_integer(),
+      auto_start => boolean()}.
+-type scan_result() :: {ok, [beamtrail:run_id()]} | {error, term()}.
+
+-spec start_link() -> {ok, pid()} | ignore | {error, term()}.
 start_link() ->
     start_link(#{interval_ms => ?DEFAULT_INTERVAL_MS, auto_start => true}).
 
+-spec start_link(options()) -> {ok, pid()} | ignore | {error, term()}.
 start_link(Opts) ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, Opts, []).
 
+-spec scan_now() -> scan_result().
 scan_now() ->
     gen_server:call(?MODULE, scan_now, 30000).
 
+-spec set_interval(pos_integer() | infinity) -> ok | {error, invalid_interval}.
 set_interval(Ms) ->
     gen_server:call(?MODULE, {set_interval, Ms}).
 
+-spec last_scan() -> map().
 last_scan() ->
     gen_server:call(?MODULE, last_scan).
 
+-spec stop() -> ok.
 stop() ->
     gen_server:stop(?MODULE).
 

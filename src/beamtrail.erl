@@ -8,17 +8,39 @@
 -export([list_recoverable/0, list_recoverable/2,
          mark_recovery_requeued/1, mark_recovery_requeued_with_lease/1]).
 
+-export_type([run_id/0, state/0, event/0, lease/0,
+              recoverable_page/0]).
+
 -define(RECOVER_UNFINISHED_BATCH_SIZE, 100).
 
+-type run_id() :: beamtrail_workflow:run_id().
+-type state() :: map().
+-type event() :: beamtrail_storage:event().
+-type lease() :: beamtrail_storage:lease().
+-type recoverable_page() :: beamtrail_storage:run_id_page().
+-type workflow_module() :: module().
+-type workflow_options() :: map().
+-type workflow_start_result() ::
+    {ok, run_id()} | {error, {create_failed | dispatch_failed, run_id(), term()}}.
+-type state_result() :: {ok, state()} | {error, term()}.
+-type recovery_mark_result() :: {ok, requeued | failed | skipped} | {error, term()}.
+-type recovery_with_lease_result() ::
+    {ok, {requeued, lease()} | {failed, state()} | skipped} | {error, term()}.
+
+-spec start() -> {ok, [atom()]} | {error, term()}.
 start() ->
     application:ensure_all_started(beamtrail).
 
+-spec stop() -> ok | {error, term()}.
 stop() ->
     application:stop(beamtrail).
 
+-spec start_workflow(workflow_module(), term()) -> workflow_start_result().
 start_workflow(Workflow, Input) ->
     start_workflow(Workflow, Input, #{}).
 
+-spec start_workflow(workflow_module(), term(), workflow_options()) ->
+    workflow_start_result().
 start_workflow(Workflow, Input, Options) ->
     ok = ensure_storage(),
     RunId = maps:get(run_id, Options, new_run_id()),
@@ -63,6 +85,7 @@ dispatch_supervised(RunId) ->
         _ -> beamtrail_run_sup:dispatch(RunId)
     end.
 
+-spec dispatch(run_id()) -> state_result().
 dispatch(RunId) ->
     ok = ensure_storage(),
     case load_state(RunId) of
@@ -88,12 +111,13 @@ dispatch_nonterminal(RunId, State) ->
                 failed ->
                     dispatch_with_new_lease(RunId, State);
                 retrying ->
-                    dispatch_retrying(RunId, State, none);
+                    dispatch_retrying(RunId, State);
                 _ ->
                     dispatch_with_new_lease(RunId, State)
             end
     end.
 
+-spec dispatch(run_id(), lease()) -> state_result().
 dispatch(RunId, Lease) when is_map(Lease) ->
     dispatch_with_lease(RunId, Lease, #{lease_heartbeat => internal}).
 
@@ -104,6 +128,7 @@ dispatch_with_lease(RunId, Lease, Options) ->
         {error, _} = Error -> Error
     end.
 
+-spec recover_unfinished() -> {ok, [run_id()]} | {error, term()}.
 recover_unfinished() ->
     ok = ensure_storage(),
     recover_unfinished_pages(undefined, []).
@@ -123,12 +148,15 @@ recover_unfinished_pages(Cursor, Acc) ->
             Error
     end.
 
+-spec get_state(run_id()) -> state() | {error, term()}.
 get_state(RunId) ->
     case load_state(RunId) of
         {ok, State} -> State;
         {error, _} = Error -> Error
     end.
 
+-spec await_terminal(run_id(), non_neg_integer()) ->
+    {ok, state()} | {error, timeout | term()}.
 await_terminal(RunId, TimeoutMs)
   when is_integer(TimeoutMs), TimeoutMs >= 0 ->
     Deadline = erlang:monotonic_time(millisecond) + TimeoutMs,
@@ -152,18 +180,21 @@ await_terminal_until(RunId, Deadline) ->
             end
     end.
 
+-spec cancel_run(run_id(), term()) -> state_result().
 cancel_run(RunId, Reason) ->
     case control_local_runner(RunId, cancel, Reason) of
         not_found -> cancel_run_with_new_lease(RunId, Reason);
         Result -> Result
     end.
 
+-spec park_run(run_id(), term()) -> state_result().
 park_run(RunId, Reason) ->
     case control_local_runner(RunId, park, Reason) of
         not_found -> park_run_with_new_lease(RunId, Reason);
         Result -> Result
     end.
 
+-spec resume_run(run_id()) -> state_result().
 resume_run(RunId) ->
     case load_state(RunId) of
         {ok, #{terminal := true}} ->
@@ -203,6 +234,7 @@ resume_run_with_new_lease(RunId) ->
               beamtrail_transition:resume_run(RunId, State, Lease)
       end).
 
+-spec requeue_run(run_id(), term()) -> recovery_mark_result() | {error, terminal | parked | term()}.
 requeue_run(RunId, _Reason) ->
     case load_state(RunId) of
         {ok, #{terminal := true}} ->
@@ -258,6 +290,7 @@ load_state(RunId) ->
     ok = ensure_storage(),
     beamtrail_state:load(RunId, storage()).
 
+-spec events(run_id()) -> {ok, [event()]} | {error, term()}.
 events(RunId) ->
     ok = ensure_storage(),
     (storage()):events(RunId).
@@ -276,17 +309,10 @@ dispatch_with_new_lease(RunId, _State) ->
             Error
     end.
 
-dispatch_retrying(RunId, State, Lease) ->
-    dispatch_retrying(RunId, State, Lease, #{lease_heartbeat => internal}).
-
-dispatch_retrying(RunId, State, Lease, Options) ->
+dispatch_retrying(RunId, State) ->
     Now = erlang:system_time(millisecond),
     case maps:get(next_retry_at, State, 0) =< Now of
-        true ->
-            case Lease of
-                none -> dispatch_with_new_lease(RunId, State);
-                _ -> beamtrail_transition:dispatch_retrying(RunId, State, Lease, Options)
-            end;
+        true -> dispatch_with_new_lease(RunId, State);
         false -> {ok, State}
     end.
 
@@ -326,6 +352,7 @@ recover_requeued(RunId) ->
             false
     end.
 
+-spec list_recoverable() -> [run_id()] | {error, term()}.
 list_recoverable() ->
     ok = ensure_storage(),
     case (storage()):list_run_ids() of
@@ -335,6 +362,8 @@ list_recoverable() ->
             Error
     end.
 
+-spec list_recoverable(run_id() | undefined, pos_integer()) ->
+    {ok, recoverable_page()} | {error, term()}.
 list_recoverable(Cursor, Limit) ->
     ok = ensure_storage(),
     fill_recoverable_page(storage(), Cursor, Limit,
@@ -392,6 +421,7 @@ run_recoverable(RunId) ->
 %% so successful recovery decisions are observable in the inspector. Lease
 %% contention means another live owner is still responsible for the run and is
 %% intentionally not written as durable log noise.
+-spec mark_recovery_requeued(run_id()) -> recovery_mark_result().
 mark_recovery_requeued(RunId) ->
     case mark_recovery_requeued_with_lease(RunId) of
         {ok, {requeued, _Lease}} -> {ok, requeued};
@@ -399,6 +429,7 @@ mark_recovery_requeued(RunId) ->
         Other -> Other
     end.
 
+-spec mark_recovery_requeued_with_lease(run_id()) -> recovery_with_lease_result().
 mark_recovery_requeued_with_lease(RunId) ->
     ok = ensure_storage(),
     Mod = storage(),
@@ -623,6 +654,7 @@ safe_workflow_callback(Callback, Fun) ->
             {error, #{callback => Callback, class => Class, reason => Reason}}
     end.
 
+-spec storage() -> module().
 storage() ->
     beamtrail_config:storage().
 

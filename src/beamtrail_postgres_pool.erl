@@ -138,7 +138,7 @@ return_connection(Connection, State) ->
     {Busy, Owners} = remove_busy_connection(Connection, State),
     case queue:out(maps:get(waiting, State)) of
         {{value, {From, TimerRef}}, Waiting1} ->
-            erlang:cancel_timer(TimerRef, [flush]),
+            erlang:cancel_timer(TimerRef, [{info, false}]),
             State1 = assign_connection(Connection, From,
                                        State#{busy := Busy,
                                               owners := Owners,
@@ -173,7 +173,7 @@ maybe_replace_connection(State) ->
 return_new_connection(Connection, State) ->
     case queue:out(maps:get(waiting, State)) of
         {{value, {From, TimerRef}}, Waiting1} ->
-            erlang:cancel_timer(TimerRef, [flush]),
+            erlang:cancel_timer(TimerRef, [{info, false}]),
             State1 = assign_connection(Connection, From,
                                        State#{waiting := Waiting1}),
             gen_server:reply(From, {ok, Connection}),

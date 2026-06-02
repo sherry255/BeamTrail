@@ -138,10 +138,8 @@ fail_workflow_with_timeout(RunId, State, Lease) ->
                       'workflow.failed', StepId, undefined, undefined, Payload) of
         {ok, Event} ->
             State1 = apply_runtime_event(State, Event),
-            case maybe_snapshot_state(RunId, State1, true) of
-                ok -> {ok, State1};
-                {error, _} = Error -> Error
-            end;
+            _ = maybe_snapshot_state(RunId, State1, true),
+            {ok, State1};
         {error, _} = Error ->
             Error
     end.
@@ -162,10 +160,8 @@ complete_if_needed(RunId, State, Lease) ->
                    #{completed_at => erlang:system_time(millisecond)}) of
                 {ok, Event} ->
                     State1 = apply_runtime_event(State, Event),
-                    case maybe_snapshot_state(RunId, State1, true) of
-                        ok -> {ok, State1};
-                        {error, _} = Error -> Error
-                    end;
+                    _ = maybe_snapshot_state(RunId, State1, true),
+                    {ok, State1};
                 {error, _} = Error ->
                     Error
             end
@@ -230,13 +226,8 @@ ensure_attempt_started(RunId, Workflow, Input, State, StepId, Lease) ->
                            #{attempt => AttemptNo, owner_node => owner()}) of
                         {ok, Event} ->
                             State1 = apply_runtime_event(State, Event),
-                            case maybe_snapshot_state(RunId, State1, false) of
-                                ok ->
-                                    {ok, maps:get(pending_attempt, State1),
-                                     true, State1};
-                                {error, _} = Error ->
-                                    Error
-                            end;
+                            _ = maybe_snapshot_state(RunId, State1, false),
+                            {ok, maps:get(pending_attempt, State1), true, State1};
                         {error, _} = Error ->
                             Error
                     end;
@@ -308,17 +299,13 @@ handle_step_success_state(RunId, State, Attempt, Value, Lease, Options) ->
                    #{result => Value}) of
                 {ok, Event} ->
                     State1 = apply_runtime_event(State, Event),
-                    case maybe_snapshot_state(RunId, State1, false) of
-                        ok ->
-                            case maps:get(runner_mode, Options, dispatch) of
-                                finish ->
-                                    {ok, State1};
-                                _ ->
-                                    dispatch_locked(RunId, State1, Lease,
-                                                    Options#{runner_state := State1})
-                            end;
-                        {error, _} = Error ->
-                            Error
+                    _ = maybe_snapshot_state(RunId, State1, false),
+                    case maps:get(runner_mode, Options, dispatch) of
+                        finish ->
+                            {ok, State1};
+                        _ ->
+                            dispatch_locked(RunId, State1, Lease,
+                                            Options#{runner_state := State1})
                     end;
                 {error, _} = Error ->
                     Error
@@ -394,20 +381,16 @@ append_failed_retry_decision(RunId, State, Attempt, Reason, Policy, Lease,
                                         #{run_id => RunId, step_id => StepId,
                                           next_retry_at => NextRetryAt}),
             State1 = apply_runtime_events(State, Events),
-            case maybe_snapshot_state(RunId, State1, false) of
-                ok ->
-                    case BackoffMs of
-                        0 ->
-                            case maps:get(runner_mode, Options, dispatch) of
-                                finish -> {ok, State1};
-                                _ -> dispatch_retrying(RunId, State1, Lease,
-                                                       Options#{runner_state := State1})
-                            end;
-                        _ ->
-                            {ok, State1}
+            _ = maybe_snapshot_state(RunId, State1, false),
+            case BackoffMs of
+                0 ->
+                    case maps:get(runner_mode, Options, dispatch) of
+                        finish -> {ok, State1};
+                        _ -> dispatch_retrying(RunId, State1, Lease,
+                                               Options#{runner_state := State1})
                     end;
-                {error, _} = Error ->
-                    Error
+                _ ->
+                    {ok, State1}
             end;
         {ok, Events} ->
             {error, {unexpected_append_result, Events}};
@@ -426,10 +409,8 @@ append_failed_terminal_decision(RunId, State, Attempt, FailurePayload, Lease,
     case append_events(RunId, ExpectedSeq, Lease, EventSpecs) of
         {ok, [_StepFailedEvent, _WorkflowFailedEvent] = Events} ->
             State1 = apply_runtime_events(State, Events),
-            case maybe_snapshot_state(RunId, State1, true) of
-                ok -> {ok, State1};
-                {error, _} = Error -> Error
-            end;
+            _ = maybe_snapshot_state(RunId, State1, true),
+            {ok, State1};
         {ok, Events} ->
             {error, {unexpected_append_result, Events}};
         {error, _} = Error ->
@@ -460,10 +441,8 @@ append_pre_attempt_callback_failure(RunId, State, StepId, Callback,
     case append_events(RunId, maps:get(last_event_seq, State, 0), Lease, EventSpecs) of
         {ok, [Event]} ->
             State1 = apply_runtime_event(State, Event),
-            case maybe_snapshot_state(RunId, State1, true) of
-                ok -> {terminal, State1};
-                {error, _} = Error -> Error
-            end;
+            _ = maybe_snapshot_state(RunId, State1, true),
+            {terminal, State1};
         {ok, Events} ->
             {error, {unexpected_append_result, Events}};
         {error, _} = Error ->
@@ -484,10 +463,8 @@ append_attempt_callback_failure(RunId, State, Attempt, Callback, CallbackError,
     case append_events(RunId, maps:get(last_event_seq, State, 0), Lease, EventSpecs) of
         {ok, [_StepFailedEvent, _WorkflowFailedEvent] = Events} ->
             State1 = apply_runtime_events(State, Events),
-            case maybe_snapshot_state(RunId, State1, true) of
-                ok -> {ok, State1};
-                {error, _} = Error -> Error
-            end;
+            _ = maybe_snapshot_state(RunId, State1, true),
+            {ok, State1};
         {ok, Events} ->
             {error, {unexpected_append_result, Events}};
         {error, _} = Error ->
