@@ -124,7 +124,7 @@ Run a workflow:
 {ok, RunId} = beamtrail:start_workflow(my_workflow,
                                        #{order_id => <<"o-1">>}).
 
-State = beamtrail:get_state(RunId).
+{ok, State} = beamtrail:await_terminal(RunId, 5000).
 View = beamtrail_query:describe(RunId).
 ```
 

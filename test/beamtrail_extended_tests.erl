@@ -15,6 +15,8 @@ extended_test_() ->
       fun start_workflow_returns_error_for_duplicate_run_id/0,
       fun start_workflow_returns_error_when_runner_supervisor_missing/0,
       fun start_workflow_default_dispatches_supervised_runner_async/0,
+      fun await_terminal_returns_terminal_state/0,
+      fun await_terminal_times_out_for_nonterminal_run/0,
       fun query_describe_exposes_read_model/0,
       fun query_instance_current_step_matches_reducer/0,
       fun telemetry_counters_track_attempts/0,
@@ -271,6 +273,22 @@ start_workflow_default_dispatches_supervised_runner_async() ->
     ok = wait_until_dead(Caller, 1000),
     ?assertEqual({ok, RunId}, StartResultBeforeCompletion),
     ok = wait_for_status(RunId, completed, 1000).
+
+await_terminal_returns_terminal_state() ->
+    Input = #{order_id => <<"o-await-terminal-1">>, test_pid => self()},
+    {ok, RunId} = beamtrail:start_workflow(bt_success_workflow, Input),
+    ?assertMatch({ok, #{status := completed, terminal := true}},
+                 beamtrail:await_terminal(RunId, 1000)),
+    _ = receive_exec(),
+    _ = receive_exec().
+
+await_terminal_times_out_for_nonterminal_run() ->
+    {ok, RunId} = beamtrail:start_workflow(
+                    bt_timeout_workflow,
+                    #{order_id => <<"o-await-timeout-1">>},
+                    #{run_id => <<"await-timeout-run-1">>,
+                      auto_dispatch => false}),
+    ?assertEqual({error, timeout}, beamtrail:await_terminal(RunId, 40)).
 
 query_describe_exposes_read_model() ->
     Input = #{order_id => <<"o-q-1">>, test_pid => self()},

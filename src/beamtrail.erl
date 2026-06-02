@@ -3,7 +3,7 @@
 -export([start/0, stop/0]).
 -export([start_workflow/2, start_workflow/3, dispatch/1, dispatch/2,
          recover_unfinished/0]).
--export([get_state/1, events/1, storage/0]).
+-export([get_state/1, await_terminal/2, events/1, storage/0]).
 -export([list_recoverable/0, list_recoverable/2,
          mark_recovery_requeued/1, mark_recovery_requeued_with_lease/1]).
 
@@ -111,6 +111,29 @@ get_state(RunId) ->
     case load_state(RunId) of
         {ok, State} -> State;
         {error, _} = Error -> Error
+    end.
+
+await_terminal(RunId, TimeoutMs)
+  when is_integer(TimeoutMs), TimeoutMs >= 0 ->
+    Deadline = erlang:monotonic_time(millisecond) + TimeoutMs,
+    await_terminal_until(RunId, Deadline).
+
+await_terminal_until(RunId, Deadline) ->
+    case get_state(RunId) of
+        #{terminal := true} = State ->
+            {ok, State};
+        {error, _} = Error ->
+            Error;
+        _State ->
+            Now = erlang:monotonic_time(millisecond),
+            Remaining = Deadline - Now,
+            case Remaining =< 0 of
+                true ->
+                    {error, timeout};
+                false ->
+                    timer:sleep(min(20, Remaining)),
+                    await_terminal_until(RunId, Deadline)
+            end
     end.
 
 load_state(RunId) ->
