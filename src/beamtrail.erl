@@ -46,27 +46,52 @@ start_workflow(Workflow, Input, Options) ->
     RunId = maps:get(run_id, Options, new_run_id()),
     case safe_workflow_callback(steps, fun() -> Workflow:steps(Input) end) of
         {ok, Steps} ->
-            case (storage()):append_event(
-                   RunId,
-                   0,
-                   undefined,
-                   'workflow.instance.created',
-                   undefined,
-                   undefined,
-                   undefined,
-                   #{workflow => Workflow, input => Input, steps => Steps}) of
-                {ok, _Event} ->
-                    case maybe_snapshot(RunId, false) of
-                        ok -> start_workflow_dispatch(RunId, Options);
-                        {error, Reason} -> {error, {create_failed, RunId, Reason}}
+            case validate_steps(Steps) of
+                ok ->
+                    case (storage()):append_event(
+                           RunId,
+                           0,
+                           undefined,
+                           'workflow.instance.created',
+                           undefined,
+                           undefined,
+                           undefined,
+                           #{workflow => Workflow, input => Input, steps => Steps}) of
+                        {ok, _Event} ->
+                            case maybe_snapshot(RunId, false) of
+                                ok -> start_workflow_dispatch(RunId, Options);
+                                {error, Reason} -> {error, {create_failed, RunId, Reason}}
+                            end;
+                        {error, Reason} ->
+                            {error, {create_failed, RunId, Reason}}
                     end;
                 {error, Reason} ->
-                    {error, {create_failed, RunId, Reason}}
+                    {error, {create_failed, RunId, {bad_workflow_steps, Reason}}}
             end;
         {error, CallbackError} ->
             {error, {create_failed, RunId,
                      {bad_workflow_callback, steps, CallbackError}}}
     end.
+
+validate_steps(Steps) when is_list(Steps) ->
+    validate_step_list(Steps);
+validate_steps(Steps) ->
+    {error, #{class => bad_steps,
+              reason => not_a_list,
+              steps => Steps}}.
+
+validate_step_list([]) ->
+    ok;
+validate_step_list([Step | Rest]) when is_atom(Step) ->
+    validate_step_list(Rest);
+validate_step_list([Step | _Rest]) ->
+    {error, #{class => bad_step_id,
+              reason => not_an_atom,
+              step => Step}};
+validate_step_list(Tail) ->
+    {error, #{class => bad_steps,
+              reason => improper_list,
+              tail => Tail}}.
 
 start_workflow_dispatch(RunId, Options) ->
     case maps:get(auto_dispatch, Options, true) of

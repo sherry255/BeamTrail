@@ -69,6 +69,7 @@ extended_test_() ->
       fun completed_step_version_change_does_not_block_next_step/0,
       fun scanner_skips_migration_blocked_runs/0,
       fun start_workflow_returns_structured_steps_callback_error/0,
+      fun start_workflow_rejects_non_atom_step_ids/0,
       fun step_version_callback_error_fails_terminally/0,
       fun idempotency_key_callback_error_fails_terminally/0,
       fun timeout_callback_error_closes_attempt_terminally/0,
@@ -1251,6 +1252,17 @@ start_workflow_returns_structured_steps_callback_error() ->
                    {bad_workflow_callback, steps, #{class := error}}}},
                  beamtrail:start_workflow(bt_bad_steps_workflow,
                                           #{order_id => <<"o-bad-steps-1">>},
+                                          #{run_id => RunId})),
+    ?assertEqual({ok, []}, beamtrail:events(RunId)).
+
+start_workflow_rejects_non_atom_step_ids() ->
+    RunId = <<"bad-step-id-run-1">>,
+    ?assertMatch({error,
+                  {create_failed, RunId,
+                   {bad_workflow_steps, #{class := bad_step_id,
+                                          step := <<"charge">>}}}},
+                 beamtrail:start_workflow(bt_bad_step_id_workflow,
+                                          #{order_id => <<"o-bad-step-id-1">>},
                                           #{run_id => RunId})),
     ?assertEqual({ok, []}, beamtrail:events(RunId)).
 

@@ -224,6 +224,10 @@ execute(StepId, StepVersion, Input, Ctx) ->
            input => Input}}.
 ```
 
+Step ids must be atoms. BeamTrail rejects workflow definitions whose `steps/1`
+return value is not a proper list of atoms. This keeps the memory and PostgreSQL
+storage adapters on the same contract and avoids hidden replay incompatibilities.
+
 `execute/4` should treat `Ctx.idempotency_key` as the key for any external
 side effect.
 
@@ -260,6 +264,12 @@ Set application environment before starting `beamtrail`:
 - `max_recoveries_per_attempt`: recovery requeue budget for one open attempt,
   default `3`; set to `infinity` to disable the fuse
 
+For PostgreSQL-backed production use, size `postgres_pool_size` for expected
+active runner concurrency. The default is intentionally small for local
+development; high `run_max_children` / `worker_max_children` values with a small
+pool will add checkout latency and can make active runners less responsive under
+load.
+
 ## Tests
 
 ```sh
@@ -275,6 +285,16 @@ examples/crash_recovery/run.sh
 The demo starts PostgreSQL, kills an Erlang VM while a step attempt is open, then
 starts a second VM and uses the scanner's recovery primitive to complete the same
 attempt. See `examples/crash_recovery/README.md`.
+
+PostgreSQL stress harness:
+
+```sh
+examples/pg_stress/run.sh
+```
+
+The stress harness runs many short workflows against a real PostgreSQL adapter
+and prints completion counts, elapsed time, and pool state. It is a pressure
+smoke test, not a benchmark. See `examples/pg_stress/README.md`.
 
 PostgreSQL integration tests:
 
