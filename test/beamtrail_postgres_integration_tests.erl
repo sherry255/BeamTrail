@@ -12,6 +12,7 @@ postgres_integration_test_() ->
              fun cleanup/1,
              [fun postgres_workflow_survives_application_restart/0,
               fun postgres_recovery_replays_unfinished_attempt_after_restart/0,
+              fun postgres_recovery_budget_exceeded_fails_open_attempt/0,
               fun postgres_append_locks_only_target_run/0,
               fun postgres_append_events_writes_adjacent_events/0,
               fun postgres_expected_seq_conflict_is_per_run/0,
@@ -24,6 +25,8 @@ postgres_integration_test_() ->
 setup(Config) ->
     ok = stop_beamtrail_runtime(),
     ok = application:unset_env(beamtrail, worker_max_children),
+    ok = application:unset_env(beamtrail, lease_ttl_ms),
+    ok = application:unset_env(beamtrail, max_recoveries_per_attempt),
     ok = application:set_env(beamtrail, storage_adapter,
                              beamtrail_postgres_storage),
     ok = application:set_env(beamtrail, postgres, Config),
@@ -38,6 +41,8 @@ setup(Config) ->
 cleanup(_) ->
     ok = stop_beamtrail_runtime(),
     ok = application:unset_env(beamtrail, worker_max_children),
+    ok = application:unset_env(beamtrail, lease_ttl_ms),
+    ok = application:unset_env(beamtrail, max_recoveries_per_attempt),
     ok = application:unset_env(beamtrail, storage_adapter),
     ok = application:unset_env(beamtrail, postgres),
     ok = application:unset_env(beamtrail, postgres_pool_size),
@@ -77,6 +82,38 @@ postgres_recovery_replays_unfinished_attempt_after_restart() ->
     ?assertMatch({ok, #{status := completed}},
                  beamtrail:dispatch(RunId, RecoveryLease)),
     ?assertMatch({executed, charge, 1, {charge, RunId}}, receive_exec()).
+
+postgres_recovery_budget_exceeded_fails_open_attempt() ->
+    ok = application:set_env(beamtrail, lease_ttl_ms, 20),
+    ok = application:set_env(beamtrail, max_recoveries_per_attempt, 1),
+    RunId = unique_run_id("pg-recovery-budget"),
+    Input = #{order_id => RunId},
+    {ok, _} =
+        beamtrail_postgres_storage:append_event(
+          RunId, 0, undefined,
+          'workflow.instance.created', undefined, undefined,
+          undefined,
+          #{workflow => bt_success_workflow, input => Input, steps => [charge]}),
+    {ok, Lease} = beamtrail_postgres_storage:acquire_lease(RunId, stale_worker, 20),
+    {ok, _} =
+        beamtrail_postgres_storage:append_event(
+          RunId, 1, maps:get(fencing_token, Lease),
+          'attempt.started', charge, 1,
+          {charge, RunId}, #{attempt => 1}),
+    ok = wait_until_pg_lease_expired(RunId, 1000),
+    ?assertEqual({ok, requeued}, beamtrail:mark_recovery_requeued(RunId)),
+    ok = wait_until_pg_lease_expired(RunId, 1000),
+    ?assertEqual({ok, failed}, beamtrail:mark_recovery_requeued(RunId)),
+    State = beamtrail:get_state(RunId),
+    ?assertEqual(failed, maps:get(status, State)),
+    ?assertEqual(true, maps:get(terminal, State)),
+    ?assertMatch(#{reason := recovery_budget_exceeded,
+                   recoveries := 1,
+                   max_recoveries := 1},
+                 maps:get(failure, State)),
+    {ok, Events} = beamtrail_postgres_storage:events(RunId),
+    ?assertEqual(1, length([E || E <- Events,
+                            maps:get(event_type, E) =:= 'workflow.failed'])).
 
 postgres_append_locks_only_target_run() ->
     {ok, Config} = application:get_env(beamtrail, postgres),

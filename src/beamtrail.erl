@@ -151,6 +151,8 @@ recover_loaded_if_unfinished(RunId, State) ->
 
 recover_requeued(RunId) ->
     case mark_recovery_requeued_with_lease(RunId) of
+        {ok, {failed, _State}} ->
+            false;
         {ok, {requeued, Lease}} ->
             case dispatch(RunId, Lease) of
                 {ok, _RecoveredState} ->
@@ -199,6 +201,7 @@ run_recoverable(RunId) ->
 mark_recovery_requeued(RunId) ->
     case mark_recovery_requeued_with_lease(RunId) of
         {ok, {requeued, _Lease}} -> {ok, requeued};
+        {ok, {failed, _State}} -> {ok, failed};
         Other -> Other
     end.
 
@@ -219,23 +222,111 @@ append_recovery_marker(Mod, RunId, 'recovery.requeued', Lease) ->
     Now = erlang:system_time(millisecond),
     case load_state(RunId) of
         {ok, State} ->
-            ExpectedSeq = maps:get(last_event_seq, State, 0),
-            RecoveredInMs = compute_recovered_in_ms(RunId, Now),
-            Payload = #{requeued_at => Now,
-                        owner_node => beamtrail_transition:owner(),
-                        lease => Lease,
-                        recovered_in_ms => RecoveredInMs},
+            append_recovery_decision(Mod, RunId, State, Lease, Now);
+        {error, _} = Error ->
+            Error
+    end.
+
+append_recovery_decision(Mod, RunId, State, Lease, Now) ->
+    case recovery_requeue_count(RunId, maps:get(pending_attempt, State, undefined)) of
+        {ok, Recoveries} ->
+            MaxRecoveries = beamtrail_config:max_recoveries_per_attempt(),
+            case recovery_budget_exceeded(Recoveries, MaxRecoveries) of
+                true ->
+                    append_recovery_budget_failure(Mod, RunId, State, Lease,
+                                                   Recoveries, MaxRecoveries, Now);
+                false ->
+                    append_recovery_requeued(Mod, RunId, State, Lease,
+                                             Recoveries, MaxRecoveries, Now)
+            end;
+        {error, _} = Error ->
+            Error
+    end.
+
+append_recovery_requeued(Mod, RunId, State, Lease, Recoveries, MaxRecoveries, Now) ->
+    ExpectedSeq = maps:get(last_event_seq, State, 0),
+    RecoveredInMs = compute_recovered_in_ms(RunId, Now),
+    Payload = #{requeued_at => Now,
+                owner_node => beamtrail_transition:owner(),
+                lease => Lease,
+                recovered_in_ms => RecoveredInMs,
+                recoveries => Recoveries + 1,
+                max_recoveries => MaxRecoveries},
+    FencingToken = beamtrail_lease_manager:fencing_token(Lease),
+    case Mod:append_event(RunId, ExpectedSeq, FencingToken, 'recovery.requeued',
+                          undefined, undefined, undefined, Payload) of
+        {ok, _} ->
+            beamtrail_telemetry:execute([beamtrail, recovery, requeued],
+                                        #{count => 1},
+                                        #{run_id => RunId, lease => Lease}),
+            {ok, {requeued, Lease}};
+        {error, _} = Error ->
+            Error
+    end.
+
+append_recovery_budget_failure(Mod, RunId, State, Lease, Recoveries,
+                               MaxRecoveries, Now) ->
+    case maps:get(pending_attempt, State, undefined) of
+        #{step_id := StepId,
+          step_version := StepVersion,
+          idempotency_key := IdempotencyKey,
+          attempt := AttemptNo} ->
+            Payload = #{reason => recovery_budget_exceeded,
+                        class => recovery_budget_exceeded,
+                        attempt => AttemptNo,
+                        recoveries => Recoveries,
+                        max_recoveries => MaxRecoveries,
+                        failed_at => Now},
+            EventSpecs =
+                [event_spec('step.failed', StepId, StepVersion,
+                            IdempotencyKey, Payload),
+                 event_spec('workflow.failed', StepId, StepVersion,
+                            IdempotencyKey, Payload)],
             FencingToken = beamtrail_lease_manager:fencing_token(Lease),
-            case Mod:append_event(RunId, ExpectedSeq, FencingToken, 'recovery.requeued',
-                                  undefined, undefined, undefined, Payload) of
-                {ok, _} ->
-                    beamtrail_telemetry:execute([beamtrail, recovery, requeued],
-                                                #{count => 1},
-                                                #{run_id => RunId, lease => Lease}),
-                    {ok, {requeued, Lease}};
+            case Mod:append_events(RunId, maps:get(last_event_seq, State, 0),
+                                   FencingToken, EventSpecs) of
+                {ok, Events} ->
+                    State1 = lists:foldl(
+                               fun(Event, Acc) ->
+                                       beamtrail_state:apply_event(Acc, Event)
+                               end,
+                               State,
+                               Events),
+                    _ = beamtrail_state:maybe_snapshot(RunId, State1, true, Mod),
+                    beamtrail_telemetry:execute(
+                      [beamtrail, recovery, budget_exceeded],
+                      #{count => 1},
+                      #{run_id => RunId,
+                        recoveries => Recoveries,
+                        max_recoveries => MaxRecoveries}),
+                    {ok, {failed, State1}};
                 {error, _} = Error ->
                     Error
             end;
+        _ ->
+            append_recovery_requeued(Mod, RunId, State, Lease, Recoveries,
+                                     MaxRecoveries, Now)
+    end.
+
+event_spec(EventType, StepId, StepVersion, IdempotencyKey, Payload) ->
+    #{event_type => EventType,
+      step_id => StepId,
+      step_version => StepVersion,
+      idempotency_key => IdempotencyKey,
+      payload => Payload}.
+
+recovery_budget_exceeded(_Recoveries, infinity) ->
+    false;
+recovery_budget_exceeded(Recoveries, MaxRecoveries) ->
+    Recoveries >= MaxRecoveries.
+
+recovery_requeue_count(_RunId, undefined) ->
+    {ok, 0};
+recovery_requeue_count(RunId, #{started_event_seq := StartedSeq}) ->
+    case (storage()):read_events(RunId, StartedSeq + 1, infinity) of
+        {ok, Events} ->
+            {ok, length([E || E <- Events,
+                              maps:get(event_type, E) =:= 'recovery.requeued'])};
         {error, _} = Error ->
             Error
     end.

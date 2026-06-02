@@ -1,8 +1,10 @@
 -module(beamtrail_config).
 
--export([storage/0, ensure_storage/0, preload_workflows/0]).
+-export([storage/0, ensure_storage/0, preload_workflows/0,
+         max_recoveries_per_attempt/0]).
 
 -define(STORAGE_DEFAULT, beamtrail_memory_storage).
+-define(DEFAULT_MAX_RECOVERIES_PER_ATTEMPT, 3).
 
 storage() ->
     case application:get_env(beamtrail, storage_adapter) of
@@ -27,6 +29,16 @@ ensure_storage() ->
             end;
         false ->
             ok
+    end.
+
+max_recoveries_per_attempt() ->
+    case application:get_env(beamtrail, max_recoveries_per_attempt) of
+        {ok, infinity} ->
+            infinity;
+        {ok, N} when is_integer(N), N >= 0 ->
+            N;
+        _ ->
+            ?DEFAULT_MAX_RECOVERIES_PER_ATTEMPT
     end.
 
 preload_workflows() ->

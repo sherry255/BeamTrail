@@ -115,6 +115,8 @@ do_scan(State) ->
 requeue(RunId) ->
     try
         case beamtrail:mark_recovery_requeued_with_lease(RunId) of
+            {ok, {failed, _State}} ->
+                {RunId, recovery_budget_exceeded};
             {ok, {requeued, Lease}} ->
                 Spawn = case whereis(beamtrail_worker_sup) of
                             undefined ->

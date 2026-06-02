@@ -74,6 +74,10 @@ starts. If a VM or node dies after a callback performs an external side effect
 but before BeamTrail records the attempt outcome, the same attempt number can be
 re-entered with the same idempotency key.
 
+Open attempts have a recovery fuse. If the same attempt is requeued too many
+times without reaching an outcome, BeamTrail terminally fails the run with
+`recovery_budget_exceeded` rather than looping forever.
+
 ## Quickstart With PostgreSQL
 
 Start PostgreSQL:
@@ -205,6 +209,8 @@ Set application environment before starting `beamtrail`:
 - `worker_max_children`: concurrent dispatch workers, default `64`
 - `run_max_children`: concurrent active run processes, default `64`
 - `lease_ttl_ms`: dispatch lease TTL, default `30000`
+- `max_recoveries_per_attempt`: recovery requeue budget for one open attempt,
+  default `3`; set to `infinity` to disable the fuse
 
 ## Tests
 

@@ -114,6 +114,11 @@ An open `attempt.started` without a closing event is retried as the same attempt
 number with the same idempotency key. That preserves the attempt budget, but it
 means callback execution is at-least-once.
 
+To avoid an unbounded recovery loop, BeamTrail counts `recovery.requeued` events
+for the open attempt. Once `max_recoveries_per_attempt` is reached, recovery
+appends a terminal failure with reason `recovery_budget_exceeded` instead of
+requeueing the attempt again.
+
 ## Callback Semantics
 
 BeamTrail does not provide exactly-once callback execution. If a callback

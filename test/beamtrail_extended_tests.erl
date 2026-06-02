@@ -61,6 +61,8 @@ extended_test_() ->
       fun storage_adapter_is_application_configurable/0,
       fun query_describe_exposes_inspector_blocks/0,
       fun recovery_requeued_records_recovered_in_ms/0,
+      fun recovery_budget_exceeded_fails_open_attempt/0,
+      fun scanner_handles_recovery_budget_failure/0,
       fun repeated_recovery_requeued_keeps_open_attempt_metric/0
      ]}.
 
@@ -101,6 +103,7 @@ cleanup(_) ->
     ok = application:unset_env(beamtrail, worker_max_children),
     ok = application:unset_env(beamtrail, run_max_children),
     ok = application:unset_env(beamtrail, lease_ttl_ms),
+    ok = application:unset_env(beamtrail, max_recoveries_per_attempt),
     ok = application:unset_env(beamtrail, workflow_modules),
     ok = application:unset_env(beamtrail, storage_adapter),
     ok = beamtrail_memory_storage:reset().
@@ -1053,6 +1056,72 @@ recovery_requeued_records_recovered_in_ms() ->
     ?assertEqual(Recovered, maps:get(recovered_in_ms, Q)),
     ?assertMatch(#{status := pass, recovered_in_ms := Recovered},
                  maps:get(recovery, Q)).
+
+recovery_budget_exceeded_fails_open_attempt() ->
+    ok = application:set_env(beamtrail, lease_ttl_ms, 20),
+    ok = application:set_env(beamtrail, max_recoveries_per_attempt, 2),
+    RunId = <<"recovery-budget-run-1">>,
+    Input = #{order_id => <<"o-recovery-budget-1">>},
+    {ok, _} = beamtrail_memory_storage:append_event(
+                RunId, 0, undefined,
+                'workflow.instance.created', undefined, undefined,
+                undefined,
+                #{workflow => bt_success_workflow, input => Input,
+                  steps => [charge]}),
+    {ok, Lease} = beamtrail_memory_storage:acquire_lease(RunId, recovery_seed, 10),
+    {ok, _} = beamtrail_memory_storage:append_event(
+                RunId, 1, maps:get(fencing_token, Lease),
+                'attempt.started', charge, 1,
+                {charge, <<"o-recovery-budget-1">>}, #{attempt => 1}),
+    ok = wait_until_lease_expired(RunId, 1000),
+    {ok, requeued} = beamtrail:mark_recovery_requeued(RunId),
+    ok = wait_until_lease_expired(RunId, 1000),
+    {ok, requeued} = beamtrail:mark_recovery_requeued(RunId),
+    ok = wait_until_lease_expired(RunId, 1000),
+    ?assertEqual({ok, failed}, beamtrail:mark_recovery_requeued(RunId)),
+    State = beamtrail:get_state(RunId),
+    ?assertEqual(failed, maps:get(status, State)),
+    ?assertEqual(true, maps:get(terminal, State)),
+    Failure = maps:get(failure, State),
+    ?assertMatch(#{reason := recovery_budget_exceeded,
+                   recoveries := 2,
+                   max_recoveries := 2},
+                 Failure),
+    {ok, Events} = beamtrail:events(RunId),
+    ?assertEqual(2, length([E || E <- Events,
+                            maps:get(event_type, E) =:= 'recovery.requeued'])),
+    ?assertEqual(1, length([E || E <- Events,
+                            maps:get(event_type, E) =:= 'workflow.failed'])),
+    ?assertEqual({ok, []}, beamtrail:recover_unfinished()).
+
+scanner_handles_recovery_budget_failure() ->
+    ok = application:set_env(beamtrail, lease_ttl_ms, 20),
+    ok = application:set_env(beamtrail, max_recoveries_per_attempt, 1),
+    RunId = <<"scanner-recovery-budget-run-1">>,
+    Input = #{order_id => <<"o-scanner-recovery-budget-1">>},
+    {ok, _} = beamtrail_memory_storage:append_event(
+                RunId, 0, undefined,
+                'workflow.instance.created', undefined, undefined,
+                undefined,
+                #{workflow => bt_success_workflow, input => Input,
+                  steps => [charge]}),
+    {ok, Lease} = beamtrail_memory_storage:acquire_lease(RunId, recovery_seed, 10),
+    {ok, _} = beamtrail_memory_storage:append_event(
+                RunId, 1, maps:get(fencing_token, Lease),
+                'attempt.started', charge, 1,
+                {charge, <<"o-scanner-recovery-budget-1">>}, #{attempt => 1}),
+    ok = wait_until_lease_expired(RunId, 1000),
+    {ok, requeued} = beamtrail:mark_recovery_requeued(RunId),
+    ok = wait_until_lease_expired(RunId, 1000),
+    ?assertEqual([RunId], beamtrail:list_recoverable()),
+    {ok, _Pid} = beamtrail_scanner:start_link(#{interval_ms => infinity,
+                                                auto_start => false}),
+    ?assertEqual({ok, []}, beamtrail_scanner:scan_now()),
+    State = beamtrail:get_state(RunId),
+    ?assertEqual(failed, maps:get(status, State)),
+    ?assertEqual(true, maps:get(terminal, State)),
+    ?assertMatch(#{reason := recovery_budget_exceeded},
+                 maps:get(failure, State)).
 
 repeated_recovery_requeued_keeps_open_attempt_metric() ->
     ok = application:set_env(beamtrail, lease_ttl_ms, 50),
