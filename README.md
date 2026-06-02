@@ -61,6 +61,9 @@ useful.
 For the OTP/process boundary and recovery model, see [Architecture and Failure
 Model](ARCHITECTURE.md).
 
+For the planned decider and step-result dataflow layer, see
+[Decider and Dataflow Design](DECIDER.md).
+
 For planned work and contribution areas, see [Roadmap](ROADMAP.md) and
 [Contributing](CONTRIBUTING.md).
 

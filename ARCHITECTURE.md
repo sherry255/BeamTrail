@@ -200,6 +200,12 @@ BeamTrail currently supports linear step lists. It does not yet support dynamic
 workflow control flow, branching, DAGs, fan-out/fan-in, child workflows, signals,
 or step-result dataflow into later steps.
 
+The planned next orchestration boundary is an event-sourced decider plus
+step-result dataflow. The decider is deliberately not a Temporal-style arbitrary
+workflow-code replay system; it is a deterministic callback over a reduced view
+that returns the next durable command. See [Decider and Dataflow
+Design](DECIDER.md).
+
 The recovery scan is driven by the `run projection` index (see Recovery), so it
 avoids snapshot/replay work for every historical run. The PostgreSQL adapter
 keeps `status`, `terminal`, `next_retry_at_ms`, and `parked` columns on

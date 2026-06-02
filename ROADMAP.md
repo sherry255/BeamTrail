@@ -70,8 +70,11 @@ Remaining:
 BeamTrail should grow workflow semantics carefully, without losing replay
 clarity.
 
+- Implement the v0.3 event-sourced decider described in
+  [DECIDER.md](DECIDER.md).
 - Pass prior step results into later steps through an explicit dataflow model.
-- Add conditional steps before adding arbitrary dynamic control flow.
+- Add conditional steps through decider commands before adding arbitrary dynamic
+  control flow.
 - Add compensation hooks for saga-style workflows.
 - Explore fan-out/fan-in only after the linear runtime remains stable.
 - Keep workflow definition versioning explicit; never hide replay hazards behind
