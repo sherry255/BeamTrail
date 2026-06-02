@@ -86,6 +86,8 @@ describe_loaded_events(RunId, Mod, State, Events) ->
       migration_required_for_version_change =>
           maps:get(migration_required_for_version_change, State, false),
       attempts => Attempts,
+      results => maps:get(results, State, []),
+      workflow_result => maps:get(workflow_result, State, undefined),
       snapshot => Snapshot,
       snapshots => list_snapshots(Snapshot),
       replay_tail_length => TailLen,

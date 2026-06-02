@@ -12,6 +12,19 @@ fed into later step selection.
 The v0.3 goal is to add a small deterministic decider layer without turning
 BeamTrail into a Temporal-style deterministic code replay engine.
 
+## Implemented Foundation
+
+The first dataflow foundation is implemented:
+
+- reducer state now keeps ordered `results`
+- reducer state keeps optional `workflow_result`
+- `beamtrail_query:describe/1` exposes both fields
+- snapshot schema revision includes the new state keys, so old snapshots replay
+  from events instead of loading an incompatible shape
+
+The fields are inspectable today, but they are not yet used as step inputs. The
+next implementation step is persisting `step_input` on `attempt.started`.
+
 ## Position
 
 BeamTrail should grow through an event-sourced decider:

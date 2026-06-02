@@ -11,6 +11,8 @@ new() ->
       status => new,
       current_step => undefined,
       completed_steps => 0,
+      results => [],
+      workflow_result => undefined,
       attempt_counts => #{},
       attempts => [],
       pending_attempt => undefined,
@@ -91,11 +93,15 @@ apply_event_type('step.succeeded', State, Event) ->
     StepId = maps:get(step_id, Event),
     CompletedSteps = maps:get(completed_steps, State) + 1,
     Steps = maps:get(steps, State),
+    Payload = maps:get(payload, Event),
+    Result = maps:get(result, Payload, undefined),
     State#{status => running,
            current_step => next_step(Steps, CompletedSteps),
            completed_steps => CompletedSteps,
            pending_attempt => undefined,
            attempts => update_latest_attempt(StepId, succeeded, Event, State),
+           results => maps:get(results, State) ++
+               [result_entry(StepId, Result, Event, State)],
            failure => undefined};
 apply_event_type('step.failed', State, Event) ->
     StepId = maps:get(step_id, Event),
@@ -110,11 +116,13 @@ apply_event_type('retry.scheduled', State, Event) ->
            current_step => maps:get(step_id, Event),
            next_retry_at => maps:get(next_retry_at, Payload),
            failure => Payload};
-apply_event_type('workflow.completed', State, _Event) ->
+apply_event_type('workflow.completed', State, Event) ->
+    Payload = maps:get(payload, Event, #{}),
     State#{status => completed,
            current_step => undefined,
            pending_attempt => undefined,
            terminal => true,
+           workflow_result => maps:get(result, Payload, undefined),
            failure => undefined};
 apply_event_type('workflow.failed', State, Event) ->
     State#{status => failed,
@@ -179,3 +187,10 @@ complete_attempt(Attempt, Status, Event) ->
              completed_event_seq => maps:get(event_seq, Event),
              result => maps:get(result, Payload, undefined),
              reason => maps:get(reason, Payload, undefined)}.
+
+result_entry(StepId, Result, Event, State) ->
+    Attempt = maps:get(pending_attempt, State, #{}),
+    #{step_id => StepId,
+      attempt => maps:get(attempt, Attempt, undefined),
+      event_seq => maps:get(event_seq, Event),
+      result => Result}.

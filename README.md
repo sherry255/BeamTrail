@@ -27,10 +27,12 @@ Current scope:
 - Version mismatch gating during replay
 - Durable run control: cancel, park/resume, and manual requeue
 - Inspector data through `beamtrail_query:describe/1`
+- Step result history exposed through the reducer state and inspector
 
 Not in scope yet:
 
 - Branching, DAGs, or fan-out
+- Passing prior step results as later step inputs
 - HTTP API or browser UI
 - SQL-native JSON inspection
 - Built-in external side-effect deduplication

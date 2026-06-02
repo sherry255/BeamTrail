@@ -5,6 +5,14 @@ All notable changes to BeamTrail are documented in this file.
 BeamTrail follows semantic versioning once public releases begin. `0.x` versions
 are pre-stable and may include breaking API or storage changes.
 
+## [Unreleased]
+
+### Added
+
+- Reducer-level step result history and optional workflow result state, exposed
+  through `beamtrail_query:describe/1`, as the first dataflow foundation for the
+  planned decider layer.
+
 ## [0.2.0-pre.1] - 2026-06-03
 
 ### Added

@@ -18,6 +18,7 @@ extended_test_() ->
       fun await_terminal_returns_terminal_state/0,
       fun await_terminal_times_out_for_nonterminal_run/0,
       fun query_describe_exposes_read_model/0,
+      fun query_describe_exposes_step_results/0,
       fun query_instance_current_step_matches_reducer/0,
       fun telemetry_counters_track_attempts/0,
       fun postgres_adapter_requires_config/0,
@@ -32,6 +33,7 @@ extended_test_() ->
       fun snapshot_write_failure_is_nonfatal/0,
       fun load_state_ignores_obsolete_snapshot_revision/0,
       fun snapshot_schema_contract_pins_revision_to_state_shape/0,
+      fun reducer_records_step_results_and_workflow_result/0,
       fun reducer_applies_cancelled_parked_and_resumed/0,
       fun storage_lists_run_ids_with_cursor/0,
       fun storage_append_events_validates_each_event_fence/0,
@@ -324,6 +326,24 @@ query_describe_exposes_read_model() ->
                    run_id := RunId}, maps:get(query, Q)),
     ?assertEqual(false, maps:get(migration_required_for_version_change, Q)).
 
+query_describe_exposes_step_results() ->
+    Input = #{order_id => <<"o-q-results-1">>, test_pid => self()},
+    {ok, RunId} = beamtrail:start_workflow(bt_success_workflow, Input),
+    _ = receive_exec(), _ = receive_exec(),
+    ok = wait_for_status(RunId, completed, 1000),
+    Q = beamtrail_query:describe(RunId),
+    ?assertEqual(undefined, maps:get(workflow_result, Q)),
+    ?assertMatch(
+       [#{step_id := charge,
+          attempt := 1,
+          event_seq := _,
+          result := #{step := charge}},
+        #{step_id := ship,
+          attempt := 1,
+          event_seq := _,
+          result := #{step := ship}}],
+       maps:get(results, Q)).
+
 query_instance_current_step_matches_reducer() ->
     RunId = <<"query-step-run-1">>,
     Input = #{order_id => <<"o-q-step-1">>},
@@ -507,6 +527,43 @@ snapshot_schema_contract_pins_revision_to_state_shape() ->
     ?assertEqual(beamtrail_reducer:attempt_keys(),
                  maps:get(attempt_keys, Schema)),
     ?assert(beamtrail_state:snapshot_revision() > 0).
+
+reducer_records_step_results_and_workflow_result() ->
+    RunId = <<"reducer-results-run-1">>,
+    Events =
+        [#{run_id => RunId,
+           event_seq => 1,
+           event_type => 'workflow.instance.created',
+           payload => #{workflow => bt_success_workflow,
+                        input => #{},
+                        steps => [charge]},
+           occurred_at => 1},
+         #{run_id => RunId,
+           event_seq => 2,
+           event_type => 'attempt.started',
+           step_id => charge,
+           step_version => 1,
+           idempotency_key => {charge, RunId},
+           payload => #{attempt => 1},
+           occurred_at => 2},
+         #{run_id => RunId,
+           event_seq => 3,
+           event_type => 'step.succeeded',
+           step_id => charge,
+           payload => #{result => #{charged => true}},
+           occurred_at => 3},
+         #{run_id => RunId,
+           event_seq => 4,
+           event_type => 'workflow.completed',
+           payload => #{result => #{ok => true}},
+           occurred_at => 4}],
+    State = beamtrail_reducer:from_events(Events),
+    ?assertEqual([#{step_id => charge,
+                    attempt => 1,
+                    event_seq => 3,
+                    result => #{charged => true}}],
+                 maps:get(results, State)),
+    ?assertEqual(#{ok => true}, maps:get(workflow_result, State)).
 
 reducer_applies_cancelled_parked_and_resumed() ->
     Created =

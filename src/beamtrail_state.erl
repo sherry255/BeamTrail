@@ -33,11 +33,13 @@ snapshot_schema_definition() ->
            parked_at,
            parked_reason,
            pending_attempt,
+           results,
            run_id,
            status,
            steps,
            terminal,
-           workflow],
+           workflow,
+           workflow_result],
       attempt_keys => beamtrail_reducer:attempt_keys()}.
 
 snapshot_every() ->
