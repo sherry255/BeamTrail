@@ -75,6 +75,12 @@ Failure decisions are written atomically. A failed step and its retry-or-termina
 decision are appended in one storage call, so a crash cannot leave a persistent
 state where `step.failed` is recorded but the retry/terminal decision is missing.
 
+Workflow callback errors are captured at the engine boundary. `steps/1` errors
+return a structured create failure before the run is written. Runtime callback
+errors from `step_version/1`, `idempotency_key/3`, or `timeout_ms/1` are written
+as terminal workflow failures; if an attempt was already opened, it is closed
+with `step.failed` in the same batch.
+
 ## Concurrency Control
 
 BeamTrail uses three layers for write safety.

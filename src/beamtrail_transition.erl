@@ -140,18 +140,27 @@ run_step(RunId, State, StepId, Lease, Options) ->
             end,
             case maps:get(runner_mode, Options, dispatch) of
                 prepare ->
-                    {ok, {execute, Attempt,
-                          execution_spec(RunId, Workflow, StepId, Input, Attempt),
-                          State1}};
+                    case execution_spec(RunId, Workflow, StepId, Input, Attempt) of
+                        {ok, ExecSpec} ->
+                            {ok, {execute, Attempt, ExecSpec, State1}};
+                        {error, {bad_workflow_callback, Callback, CallbackError}} ->
+                            append_attempt_callback_failure(
+                              RunId, State1, Attempt, Callback, CallbackError, Lease)
+                    end;
                 _ ->
                     Result = execute_attempt(RunId, Workflow, Input, Attempt, Lease),
                     case Result of
                         {ok, Value} ->
                             handle_step_success(RunId, Attempt, Value, Lease, Options1);
+                        {error, {bad_workflow_callback, Callback, CallbackError}} ->
+                            append_attempt_callback_failure(
+                              RunId, State1, Attempt, Callback, CallbackError, Lease);
                         {error, Reason} ->
                             handle_step_failure(RunId, Attempt, Reason, Lease, Options1)
                     end
             end;
+        {terminal, State1} ->
+            {ok, State1};
         {error, _} = Error ->
             Error
     end.
@@ -162,38 +171,48 @@ ensure_attempt_started(RunId, Workflow, Input, State, StepId, Lease) ->
             {ok, Attempt, false, State};
         _ ->
             AttemptNo = maps:get(StepId, maps:get(attempt_counts, State), 0) + 1,
-            StepVersion = Workflow:step_version(StepId),
-            IdempotencyKey = Workflow:idempotency_key(RunId, StepId, Input),
-            case append_event(
-                   RunId,
-                   maps:get(last_event_seq, State, 0),
-                   Lease,
-                   'attempt.started',
-                   StepId,
-                   StepVersion,
-                   IdempotencyKey,
-                   #{attempt => AttemptNo, owner_node => owner()}) of
-                {ok, Event} ->
-                    State1 = apply_runtime_event(State, Event),
-                    case maybe_snapshot_state(RunId, State1, false) of
-                        ok ->
-                            {ok, maps:get(pending_attempt, State1), true, State1};
+            case step_metadata(RunId, Workflow, StepId, Input) of
+                {ok, StepVersion, IdempotencyKey} ->
+                    case append_event(
+                           RunId,
+                           maps:get(last_event_seq, State, 0),
+                           Lease,
+                           'attempt.started',
+                           StepId,
+                           StepVersion,
+                           IdempotencyKey,
+                           #{attempt => AttemptNo, owner_node => owner()}) of
+                        {ok, Event} ->
+                            State1 = apply_runtime_event(State, Event),
+                            case maybe_snapshot_state(RunId, State1, false) of
+                                ok ->
+                                    {ok, maps:get(pending_attempt, State1),
+                                     true, State1};
+                                {error, _} = Error ->
+                                    Error
+                            end;
                         {error, _} = Error ->
                             Error
                     end;
-                {error, _} = Error ->
-                    Error
+                {error, {Callback, CallbackError}} ->
+                    append_pre_attempt_callback_failure(
+                      RunId, State, StepId, Callback, CallbackError, Lease)
             end
     end.
 
 execution_spec(RunId, Workflow, StepId, Input, Attempt) ->
     StepVersion = maps:get(step_version, Attempt),
-    #{workflow => Workflow,
-      step_id => StepId,
-      step_version => StepVersion,
-      input => Input,
-      timeout_ms => Workflow:timeout_ms(StepId),
-      context => execution_context(RunId, Attempt)}.
+    case safe_workflow_callback(timeout_ms, fun() -> Workflow:timeout_ms(StepId) end) of
+        {ok, TimeoutMs} ->
+            {ok, #{workflow => Workflow,
+                   step_id => StepId,
+                   step_version => StepVersion,
+                   input => Input,
+                   timeout_ms => TimeoutMs,
+                   context => execution_context(RunId, Attempt)}};
+        {error, CallbackError} ->
+            {error, {bad_workflow_callback, timeout_ms, CallbackError}}
+    end.
 
 execution_context(RunId, Attempt) ->
     #{run_id => RunId,
@@ -204,8 +223,12 @@ execution_context(RunId, Attempt) ->
 
 execute_attempt(RunId, Workflow, Input, Attempt, Lease) ->
     StepId = maps:get(step_id, Attempt),
-    ExecSpec = execution_spec(RunId, Workflow, StepId, Input, Attempt),
-    beamtrail_executor:execute_attempt(RunId, Lease, ExecSpec).
+    case execution_spec(RunId, Workflow, StepId, Input, Attempt) of
+        {ok, ExecSpec} ->
+            beamtrail_executor:execute_attempt(RunId, Lease, ExecSpec);
+        {error, {bad_workflow_callback, Callback, CallbackError}} ->
+            {error, {bad_workflow_callback, Callback, CallbackError}}
+    end.
 
 handle_step_success(RunId, Attempt, Value, Lease, Options) ->
     case maps:get(runner_state, Options, undefined) of
@@ -365,6 +388,79 @@ append_failed_terminal_decision(RunId, State, Attempt, FailurePayload, Lease,
             {error, {unexpected_append_result, Events}};
         {error, _} = Error ->
             Error
+    end.
+
+step_metadata(RunId, Workflow, StepId, Input) ->
+    case safe_workflow_callback(step_version,
+                                fun() -> Workflow:step_version(StepId) end) of
+        {ok, StepVersion} ->
+            case safe_workflow_callback(
+                   idempotency_key,
+                   fun() -> Workflow:idempotency_key(RunId, StepId, Input) end) of
+                {ok, IdempotencyKey} ->
+                    {ok, StepVersion, IdempotencyKey};
+                {error, CallbackError} ->
+                    {error, {idempotency_key, CallbackError}}
+            end;
+        {error, CallbackError} ->
+            {error, {step_version, CallbackError}}
+    end.
+
+append_pre_attempt_callback_failure(RunId, State, StepId, Callback,
+                                    CallbackError, Lease) ->
+    Payload = callback_failure_payload(Callback, CallbackError),
+    EventSpecs =
+        [event_spec('workflow.failed', StepId, undefined, undefined, Payload)],
+    case append_events(RunId, maps:get(last_event_seq, State, 0), Lease, EventSpecs) of
+        {ok, [Event]} ->
+            State1 = apply_runtime_event(State, Event),
+            case maybe_snapshot_state(RunId, State1, true) of
+                ok -> {terminal, State1};
+                {error, _} = Error -> Error
+            end;
+        {ok, Events} ->
+            {error, {unexpected_append_result, Events}};
+        {error, _} = Error ->
+            Error
+    end.
+
+append_attempt_callback_failure(RunId, State, Attempt, Callback, CallbackError,
+                                Lease) ->
+    StepId = maps:get(step_id, Attempt),
+    Payload =
+        (callback_failure_payload(Callback, CallbackError))#{
+          attempt => maps:get(attempt, Attempt)},
+    EventSpecs =
+        [event_spec('step.failed', StepId, maps:get(step_version, Attempt),
+                    maps:get(idempotency_key, Attempt), Payload),
+         event_spec('workflow.failed', StepId, maps:get(step_version, Attempt),
+                    maps:get(idempotency_key, Attempt), Payload)],
+    case append_events(RunId, maps:get(last_event_seq, State, 0), Lease, EventSpecs) of
+        {ok, [_StepFailedEvent, _WorkflowFailedEvent] = Events} ->
+            State1 = apply_runtime_events(State, Events),
+            case maybe_snapshot_state(RunId, State1, true) of
+                ok -> {ok, State1};
+                {error, _} = Error -> Error
+            end;
+        {ok, Events} ->
+            {error, {unexpected_append_result, Events}};
+        {error, _} = Error ->
+            Error
+    end.
+
+callback_failure_payload(Callback, CallbackError) ->
+    #{reason => bad_workflow_callback,
+      class => bad_workflow_callback,
+      callback => Callback,
+      callback_error => CallbackError}.
+
+safe_workflow_callback(Callback, Fun) ->
+    try Fun() of
+        Value ->
+            {ok, Value}
+    catch
+        Class:Reason:_Stacktrace ->
+            {error, #{callback => Callback, class => Class, reason => Reason}}
     end.
 
 should_retry(Policy, Reason, AttemptNo) ->

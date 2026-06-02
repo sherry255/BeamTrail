@@ -57,6 +57,10 @@ extended_test_() ->
       fun dispatch_refuses_version_mismatch_without_migration/0,
       fun completed_step_version_change_does_not_block_next_step/0,
       fun scanner_skips_migration_blocked_runs/0,
+      fun start_workflow_returns_structured_steps_callback_error/0,
+      fun step_version_callback_error_fails_terminally/0,
+      fun idempotency_key_callback_error_fails_terminally/0,
+      fun timeout_callback_error_closes_attempt_terminally/0,
       fun retry_policy_failure_fails_terminally_without_retry_loop/0,
       fun malformed_retry_policy_map_fails_terminally_without_retry_loop/0,
       fun failed_step_decision_is_crash_atomic/0,
@@ -959,6 +963,67 @@ scanner_skips_migration_blocked_runs() ->
     ?assertEqual(0, length([E || E <- Events,
                             maps:get(event_type, E) =:= 'recovery.requeued'])),
     ?assertEqual(timeout, receive_exec_short()).
+
+start_workflow_returns_structured_steps_callback_error() ->
+    RunId = <<"bad-steps-run-1">>,
+    ?assertMatch({error,
+                  {create_failed, RunId,
+                   {bad_workflow_callback, steps, #{class := error}}}},
+                 beamtrail:start_workflow(bt_bad_steps_workflow,
+                                          #{order_id => <<"o-bad-steps-1">>},
+                                          #{run_id => RunId})),
+    ?assertEqual({ok, []}, beamtrail:events(RunId)).
+
+step_version_callback_error_fails_terminally() ->
+    RunId = <<"bad-step-version-run-1">>,
+    {ok, RunId} = beamtrail:start_workflow(
+                    bt_bad_step_version_workflow,
+                    #{order_id => <<"o-bad-step-version-1">>},
+                    #{run_id => RunId}),
+    {ok, State} = beamtrail:await_terminal(RunId, 1000),
+    ?assertEqual(failed, maps:get(status, State)),
+    ?assertEqual(true, maps:get(terminal, State)),
+    Failure = maps:get(failure, State),
+    ?assertMatch(#{reason := bad_workflow_callback,
+                   callback := step_version,
+                   callback_error := #{class := error}},
+                 Failure).
+
+idempotency_key_callback_error_fails_terminally() ->
+    RunId = <<"bad-idempotency-run-1">>,
+    {ok, RunId} = beamtrail:start_workflow(
+                    bt_bad_idempotency_workflow,
+                    #{order_id => <<"o-bad-idempotency-1">>},
+                    #{run_id => RunId}),
+    {ok, State} = beamtrail:await_terminal(RunId, 1000),
+    ?assertEqual(failed, maps:get(status, State)),
+    ?assertEqual(true, maps:get(terminal, State)),
+    ?assertMatch(#{reason := bad_workflow_callback,
+                   callback := idempotency_key,
+                   callback_error := #{class := error}},
+                 maps:get(failure, State)),
+    {ok, Events} = beamtrail:events(RunId),
+    ?assertEqual(0, length([E || E <- Events,
+                            maps:get(event_type, E) =:= 'attempt.started'])).
+
+timeout_callback_error_closes_attempt_terminally() ->
+    RunId = <<"bad-timeout-run-1">>,
+    {ok, RunId} = beamtrail:start_workflow(
+                    bt_bad_timeout_workflow,
+                    #{order_id => <<"o-bad-timeout-1">>},
+                    #{run_id => RunId}),
+    {ok, State} = beamtrail:await_terminal(RunId, 1000),
+    ?assertEqual(failed, maps:get(status, State)),
+    ?assertEqual(true, maps:get(terminal, State)),
+    ?assertMatch(#{reason := bad_workflow_callback,
+                   callback := timeout_ms,
+                   callback_error := #{class := error}},
+                 maps:get(failure, State)),
+    {ok, Events} = beamtrail:events(RunId),
+    ?assertEqual(1, length([E || E <- Events,
+                            maps:get(event_type, E) =:= 'attempt.started'])),
+    ?assertEqual(1, length([E || E <- Events,
+                            maps:get(event_type, E) =:= 'step.failed'])).
 
 retry_policy_failure_fails_terminally_without_retry_loop() ->
     RunId = <<"bad-retry-policy-run-1">>,

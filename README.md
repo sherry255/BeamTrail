@@ -67,6 +67,9 @@ With the PostgreSQL adapter, BeamTrail guarantees:
 - `start_workflow/3` dispatches to a supervised active runner by default.
   `{ok, RunId}` means the run was durably created and accepted for execution;
   it does not mean the workflow has already reached a terminal state.
+- Workflow callback failures are captured as structured engine failures.
+  `steps/1` failures return a structured create error before a run is written;
+  runtime callback failures terminally fail the run.
 
 BeamTrail does not guarantee exactly-once side effects. Workflow code must use
 the idempotency key in the execution context when it calls external systems.
