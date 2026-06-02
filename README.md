@@ -48,6 +48,9 @@ event stream with replayed state, leases, fencing, snapshots, and supervised
 active runners. It is useful when the workflow history itself is the primary
 artifact, not only a queued job record.
 
+For the OTP/process boundary and recovery model, see [Architecture and Failure
+Model](ARCHITECTURE.md).
+
 ## Guarantees
 
 With the PostgreSQL adapter, BeamTrail guarantees:
