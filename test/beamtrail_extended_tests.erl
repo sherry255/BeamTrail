@@ -10,6 +10,7 @@ extended_test_() ->
       fun workflow_timeout_emits_workflow_failed/0,
       fun scanner_requeues_unknown_attempts/0,
       fun scanner_scans_one_batch_at_a_time/0,
+      fun scanner_requeues_via_active_runner_when_worker_pool_full/0,
       fun worker_supervisor_rejects_when_pool_full/0,
       fun start_workflow_returns_error_for_duplicate_run_id/0,
       fun start_workflow_returns_error_when_runner_supervisor_missing/0,
@@ -168,6 +169,40 @@ scanner_scans_one_batch_at_a_time() ->
                                                 batch_size => 1}),
     ?assertEqual({ok, [Run1]}, beamtrail_scanner:scan_now()),
     ?assertEqual({ok, [Run2]}, beamtrail_scanner:scan_now()).
+
+scanner_requeues_via_active_runner_when_worker_pool_full() ->
+    stop_registered(beamtrail_run_registry),
+    ok = application:set_env(beamtrail, worker_max_children, 1),
+    {ok, WorkerSup} = beamtrail_worker_sup:start_link(),
+    unlink(WorkerSup),
+    SlowInput = #{order_id => <<"o-worker-busy-1">>, test_pid => self(),
+                  sleep_ms => 500},
+    {ok, SlowRun} = beamtrail:start_workflow(
+                      bt_slow_success_workflow,
+                      SlowInput,
+                      #{run_id => <<"worker-busy-run-1">>,
+                        auto_dispatch => false}),
+    ?assertMatch({ok, _}, beamtrail_worker_sup:dispatch_async(SlowRun)),
+
+    RunId = <<"scanner-active-recover-run-1">>,
+    Input = #{order_id => <<"o-scanner-active-recover-1">>, test_pid => self()},
+    {ok, _} = beamtrail_memory_storage:append_event(
+                RunId, 0, undefined,
+                'workflow.instance.created', undefined, undefined,
+                undefined,
+                #{workflow => bt_success_workflow, input => Input,
+                  steps => [charge]}),
+    {ok, Lease} = beamtrail_memory_storage:acquire_lease(RunId, scanner_seed, 80),
+    {ok, _} = beamtrail_memory_storage:append_event(
+                RunId, 1, maps:get(fencing_token, Lease),
+                'attempt.started', charge, 1,
+                {charge, <<"o-scanner-active-recover-1">>}, #{attempt => 1}),
+    timer:sleep(100),
+
+    {ok, _Pid} = beamtrail_scanner:start_link(#{interval_ms => infinity,
+                                                auto_start => false}),
+    ?assertEqual({ok, [RunId]}, beamtrail_scanner:scan_now()),
+    ok = wait_for_status(RunId, completed, 1000).
 
 worker_supervisor_rejects_when_pool_full() ->
     ok = application:set_env(beamtrail, worker_max_children, 1),

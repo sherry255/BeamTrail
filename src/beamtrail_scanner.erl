@@ -2,11 +2,11 @@
 -behaviour(gen_server).
 
 %% Background recovery scanner. Periodically scans for unfinished runs and
-%% re-dispatches them via beamtrail_worker_sup. The append-only event log
+%% re-dispatches them via the active run supervisor. The append-only event log
 %% remains the only source of truth for run progress, but the scanner does
 %% appends durable recovery.requeued markers after acquiring a lease so
 %% recovery decisions are observable in the inspector. Dispatch execution
-%% happens on a separate worker process; the scan/requeue bookkeeping itself
+%% happens on a separate run process; the scan/requeue bookkeeping itself
 %% still runs on the scanner process.
 
 -export([start_link/0, start_link/1, scan_now/0, set_interval/1, last_scan/0, stop/0]).
@@ -85,9 +85,9 @@ terminate(_, State) ->
 code_change(_, S, _) -> {ok, S}.
 
 do_scan(State) ->
-    %% Detect one cursor page synchronously, then hand recoverable runs to a
-    %% supervised worker via beamtrail_worker_sup. Execution does NOT happen
-    %% on the scanner process, so a slow run can't stall scans.
+    %% Detect one cursor page synchronously, then hand recoverable runs to the
+    %% active runner supervisor. Execution does NOT happen on the scanner
+    %% process, so a slow run can't stall scans.
     Cursor = maps:get(cursor, State, undefined),
     BatchSize = maps:get(batch_size, State, ?DEFAULT_BATCH_SIZE),
     Result =
@@ -118,16 +118,10 @@ requeue(RunId) ->
             {ok, {failed, _State}} ->
                 {RunId, recovery_budget_exceeded};
             {ok, {requeued, Lease}} ->
-                Spawn = case whereis(beamtrail_worker_sup) of
-                            undefined ->
-                                _ = proc_lib:spawn(beamtrail_worker, run, [RunId, Lease]),
-                                ok;
-                            _Pid ->
-                                case beamtrail_worker_sup:dispatch_async(RunId, Lease) of
-                                    {ok, _} -> ok;
-                                    {ok, _, _} -> ok;
-                                    Other -> Other
-                                end
+                Spawn = case beamtrail_run_sup:dispatch(RunId, Lease) of
+                            {ok, _} -> ok;
+                            {ok, _, _} -> ok;
+                            Other -> Other
                         end,
                 {RunId, Spawn};
             {ok, skipped} ->

@@ -53,7 +53,7 @@ durable adapter; the memory adapter is for tests and local development.
 
 `beamtrail_scanner` is a recovery trigger. It scans for runs that are unfinished
 and whose lease is missing or expired, records a `recovery.requeued` marker after
-acquiring a lease, and dispatches the run through a worker process.
+acquiring a lease, and dispatches the run through the active runner supervisor.
 
 ## Event Log
 
@@ -114,8 +114,8 @@ Recovery is needed when an active owner disappears after recording progress but
 before reaching a terminal state.
 
 The scanner does not execute workflow code itself. It identifies a recoverable
-run, acquires a lease, appends `recovery.requeued`, and hands the run to a worker
-or active runner path. The worker can then replay the event stream and continue.
+run, acquires a lease, appends `recovery.requeued`, and hands the run to an
+active runner. The runner can then replay the event stream and continue.
 
 To find recoverable runs without replaying every run, storage maintains a
 `run projection` index: per-run `status`, `terminal`, and `next_retry_at`,
