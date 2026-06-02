@@ -3,7 +3,8 @@
 -behaviour(beamtrail_storage).
 
 -export([start_link/0, reset/0]).
--export([append_event/8, read_events/3, events/1, list_run_ids/0, list_run_ids/2]).
+-export([append_event/8, append_events/4, read_events/3, events/1,
+         list_run_ids/0, list_run_ids/2]).
 -export([write_snapshot/4, read_snapshot/1]).
 -export([acquire_lease/3, renew_lease/3, read_lease/1]).
 -export([telemetry_counters/0]).
@@ -24,6 +25,10 @@ append_event(RunId, ExpectedSeq, FencingToken,
     gen_server:call(?MODULE,
         {append_event, RunId, ExpectedSeq, FencingToken,
          EventType, StepId, StepVersion, IdempotencyKey, Payload}).
+
+append_events(RunId, ExpectedSeq, FencingToken, EventSpecs) ->
+    gen_server:call(?MODULE,
+                    {append_events, RunId, ExpectedSeq, FencingToken, EventSpecs}).
 
 read_events(RunId, FromSeq, Limit) ->
     gen_server:call(?MODULE, {read_events, RunId, FromSeq, Limit}).
@@ -73,37 +78,19 @@ handle_call(reset, _From, _State) ->
     {reply, ok, empty_state()};
 handle_call({append_event, RunId, ExpectedSeq, FencingToken,
              EventType, StepId, StepVersion, IdempotencyKey, Payload}, _From, State) ->
-    EventsByRun = maps:get(events, State),
-    EventCounts = maps:get(event_counts, State),
-    RunEvents = maps:get(RunId, EventsByRun, []),
-    ActualSeq = maps:get(RunId, EventCounts, 0),
-    case ExpectedSeq =:= ActualSeq of
-        false ->
-            {reply, {error, {conflict, #{expected_seq => ExpectedSeq,
-                                         actual_seq => ActualSeq}}},
-             State};
-        true ->
-            case validate_fencing(RunId, EventType, FencingToken, State) of
-                ok ->
-                    EventSeq = ActualSeq + 1,
-                    Event =
-                        #{run_id => RunId,
-                          event_seq => EventSeq,
-                          event_type => EventType,
-                          step_id => StepId,
-                          step_version => StepVersion,
-                          idempotency_key => IdempotencyKey,
-                          fencing_token => FencingToken,
-                          payload => Payload,
-                          occurred_at => erlang:system_time(millisecond)},
-                    State1 =
-                        State#{events := maps:put(RunId, [Event | RunEvents], EventsByRun),
-                               event_counts := maps:put(RunId, EventSeq, EventCounts)},
-                    {reply, {ok, Event}, State1};
-                {error, _} = Error ->
-                    {reply, Error, State}
-            end
+    Spec = #{event_type => EventType,
+             step_id => StepId,
+             step_version => StepVersion,
+             idempotency_key => IdempotencyKey,
+             payload => Payload},
+    case append_events_to_state(RunId, ExpectedSeq, FencingToken, [Spec], State) of
+        {{ok, [Event]}, State1} -> {reply, {ok, Event}, State1};
+        {{error, _} = Error, State1} -> {reply, Error, State1}
     end;
+handle_call({append_events, RunId, ExpectedSeq, FencingToken, EventSpecs}, _From, State) ->
+    {Reply, State1} =
+        append_events_to_state(RunId, ExpectedSeq, FencingToken, EventSpecs, State),
+    {reply, Reply, State1};
 handle_call({read_events, RunId, FromSeq, Limit}, _From, State) ->
     RunEvents = lists:reverse(maps:get(RunId, maps:get(events, State), [])),
     Tail = [E || E <- RunEvents, maps:get(event_seq, E) >= FromSeq],
@@ -195,6 +182,61 @@ handle_call(telemetry_counters, _From, State) ->
     {reply, maps:get(counters, State), State};
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown_call}, State}.
+
+append_events_to_state(_RunId, _ExpectedSeq, _FencingToken, [], State) ->
+    {{ok, []}, State};
+append_events_to_state(RunId, ExpectedSeq, FencingToken, EventSpecs, State) ->
+    EventsByRun = maps:get(events, State),
+    EventCounts = maps:get(event_counts, State),
+    RunEvents = maps:get(RunId, EventsByRun, []),
+    ActualSeq = maps:get(RunId, EventCounts, 0),
+    case ExpectedSeq =:= ActualSeq of
+        false ->
+            {{error, {conflict, #{expected_seq => ExpectedSeq,
+                                  actual_seq => ActualSeq}}},
+             State};
+        true ->
+            case validate_fencing_for_specs(RunId, FencingToken, EventSpecs, State) of
+                ok ->
+                    Events = build_events(RunId, ActualSeq, FencingToken, EventSpecs),
+                    EventSeq = ActualSeq + length(Events),
+                    State1 =
+                        State#{events := maps:put(RunId, lists:reverse(Events) ++ RunEvents,
+                                                  EventsByRun),
+                               event_counts := maps:put(RunId, EventSeq, EventCounts)},
+                    {{ok, Events}, State1};
+                {error, _} = Error ->
+                    {Error, State}
+            end
+    end.
+
+build_events(RunId, ActualSeq, FencingToken, EventSpecs) ->
+    {Events, _Seq} =
+        lists:mapfoldl(fun(Spec, Seq) ->
+                               EventSeq = Seq + 1,
+                               {#{run_id => RunId,
+                                  event_seq => EventSeq,
+                                  event_type => maps:get(event_type, Spec),
+                                  step_id => maps:get(step_id, Spec, undefined),
+                                  step_version => maps:get(step_version, Spec, undefined),
+                                  idempotency_key => maps:get(idempotency_key, Spec, undefined),
+                                  fencing_token => FencingToken,
+                                  payload => maps:get(payload, Spec),
+                                  occurred_at => erlang:system_time(millisecond)},
+                                EventSeq}
+                       end,
+                       ActualSeq,
+                       EventSpecs),
+    Events.
+
+validate_fencing_for_specs(_RunId, _FencingToken, [], _State) ->
+    ok;
+validate_fencing_for_specs(RunId, FencingToken, [Spec | Rest], State) ->
+    EventType = maps:get(event_type, Spec),
+    case validate_fencing(RunId, EventType, FencingToken, State) of
+        ok -> validate_fencing_for_specs(RunId, FencingToken, Rest, State);
+        {error, _} = Error -> Error
+    end.
 
 handle_cast({bump_counter, Name, By}, State) ->
     Counters = maps:get(counters, State),

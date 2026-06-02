@@ -281,72 +281,50 @@ handle_step_failure_state(RunId, State, Attempt, Reason, Lease, Options) ->
                        attempt => maps:get(attempt, Attempt)},
     case pending_attempt_expected_seq_from_state(State, Attempt) of
         {ok, ExpectedSeq} ->
-            case append_event(
-                   RunId,
-                   ExpectedSeq,
-                   Lease,
-                   'step.failed',
-                   StepId,
-                   maps:get(step_version, Attempt),
-                   maps:get(idempotency_key, Attempt),
-                   FailurePayload) of
-                {ok, FailedEvent} ->
-                    State1 = apply_runtime_event(State, FailedEvent),
-                    case maybe_snapshot_state(RunId, State1, false) of
-                        ok ->
-                            Workflow = maps:get(workflow, State1),
-                            case safe_retry_policy(Workflow, StepId) of
-                                {ok, Policy} ->
-                                    case should_retry(Policy, Reason, maps:get(attempt, Attempt)) of
-                                        true ->
-                                            schedule_retry_state(RunId, State1, Attempt,
-                                                                 Reason, Policy, Lease,
-                                                                 maps:get(event_seq, FailedEvent),
-                                                                 Options#{runner_state := State1});
-                                        false ->
-                                            fail_workflow_state(RunId, State1, Attempt,
-                                                                FailurePayload, Lease,
-                                                                maps:get(event_seq, FailedEvent))
-                                    end;
-                                {error, PolicyError} ->
-                                    fail_workflow_state(
-                                      RunId, State1, Attempt,
-                                      FailurePayload#{retry_policy_error => PolicyError},
-                                      Lease, maps:get(event_seq, FailedEvent))
-                            end;
-                        {error, _} = Error ->
-                            Error
+            Workflow = maps:get(workflow, State),
+            case safe_retry_policy(Workflow, StepId) of
+                {ok, Policy} ->
+                    case should_retry(Policy, Reason, maps:get(attempt, Attempt)) of
+                        true ->
+                            append_failed_retry_decision(
+                              RunId, State, Attempt, Reason, Policy, Lease,
+                              ExpectedSeq, Options, FailurePayload);
+                        false ->
+                            append_failed_terminal_decision(
+                              RunId, State, Attempt, FailurePayload, Lease,
+                              ExpectedSeq)
                     end;
-                {error, _} = Error ->
-                    Error
+                {error, PolicyError} ->
+                    append_failed_terminal_decision(
+                      RunId, State, Attempt,
+                      FailurePayload#{retry_policy_error => PolicyError},
+                      Lease, ExpectedSeq)
             end;
         {error, _} = Error ->
             Error
     end.
 
-schedule_retry_state(RunId, State, Attempt, Reason, Policy, Lease, ExpectedSeq, Options) ->
+append_failed_retry_decision(RunId, State, Attempt, Reason, Policy, Lease,
+                             ExpectedSeq, Options, FailurePayload) ->
     StepId = maps:get(step_id, Attempt),
     BackoffMs = maps:get(backoff_ms, Policy, 0),
     NextRetryAt = erlang:system_time(millisecond) + BackoffMs,
-    Payload =
+    RetryPayload =
         #{reason => Reason,
           class => error_key(Reason),
           attempt => maps:get(attempt, Attempt),
           next_retry_at => NextRetryAt},
-    case append_event(
-           RunId,
-           ExpectedSeq,
-           Lease,
-           'retry.scheduled',
-           StepId,
-           maps:get(step_version, Attempt),
-           maps:get(idempotency_key, Attempt),
-           Payload) of
-        {ok, RetryEvent} ->
+    EventSpecs =
+        [event_spec('step.failed', StepId, maps:get(step_version, Attempt),
+                    maps:get(idempotency_key, Attempt), FailurePayload),
+         event_spec('retry.scheduled', StepId, maps:get(step_version, Attempt),
+                    maps:get(idempotency_key, Attempt), RetryPayload)],
+    case append_events(RunId, ExpectedSeq, Lease, EventSpecs) of
+        {ok, [_FailedEvent, _RetryEvent] = Events} ->
             beamtrail_telemetry:execute([beamtrail, retry, scheduled], #{count => 1},
                                         #{run_id => RunId, step_id => StepId,
                                           next_retry_at => NextRetryAt}),
-            State1 = apply_runtime_event(State, RetryEvent),
+            State1 = apply_runtime_events(State, Events),
             case maybe_snapshot_state(RunId, State1, false) of
                 ok ->
                     case BackoffMs of
@@ -362,26 +340,29 @@ schedule_retry_state(RunId, State, Attempt, Reason, Policy, Lease, ExpectedSeq, 
                 {error, _} = Error ->
                     Error
             end;
+        {ok, Events} ->
+            {error, {unexpected_append_result, Events}};
         {error, _} = Error ->
             Error
     end.
 
-fail_workflow_state(RunId, State, Attempt, FailurePayload, Lease, ExpectedSeq) ->
-    case append_event(
-           RunId,
-           ExpectedSeq,
-           Lease,
-           'workflow.failed',
-           maps:get(step_id, Attempt),
-           maps:get(step_version, Attempt),
-           maps:get(idempotency_key, Attempt),
-           FailurePayload) of
-        {ok, FailedEvent} ->
-            State1 = apply_runtime_event(State, FailedEvent),
+append_failed_terminal_decision(RunId, State, Attempt, FailurePayload, Lease,
+                                ExpectedSeq) ->
+    StepId = maps:get(step_id, Attempt),
+    EventSpecs =
+        [event_spec('step.failed', StepId, maps:get(step_version, Attempt),
+                    maps:get(idempotency_key, Attempt), FailurePayload),
+         event_spec('workflow.failed', StepId, maps:get(step_version, Attempt),
+                    maps:get(idempotency_key, Attempt), FailurePayload)],
+    case append_events(RunId, ExpectedSeq, Lease, EventSpecs) of
+        {ok, [_StepFailedEvent, _WorkflowFailedEvent] = Events} ->
+            State1 = apply_runtime_events(State, Events),
             case maybe_snapshot_state(RunId, State1, true) of
                 ok -> {ok, State1};
                 {error, _} = Error -> Error
             end;
+        {ok, Events} ->
+            {error, {unexpected_append_result, Events}};
         {error, _} = Error ->
             Error
     end.
@@ -450,11 +431,28 @@ append_event(RunId, ExpectedSeq, Lease, EventType, StepId, StepVersion,
       RunId, ExpectedSeq, beamtrail_lease_manager:fencing_token(Lease),
       EventType, StepId, StepVersion, IdempotencyKey, Payload).
 
+append_events(RunId, ExpectedSeq, Lease, EventSpecs) ->
+    (beamtrail_config:storage()):append_events(
+      RunId, ExpectedSeq, beamtrail_lease_manager:fencing_token(Lease),
+      EventSpecs).
+
+event_spec(EventType, StepId, StepVersion, IdempotencyKey, Payload) ->
+    #{event_type => EventType,
+      step_id => StepId,
+      step_version => StepVersion,
+      idempotency_key => IdempotencyKey,
+      payload => Payload}.
+
 maybe_snapshot_state(RunId, State, Force) ->
     beamtrail_state:maybe_snapshot(RunId, State, Force, beamtrail_config:storage()).
 
 apply_runtime_event(State, Event) ->
     beamtrail_state:apply_event(State, Event).
+
+apply_runtime_events(State, Events) ->
+    lists:foldl(fun(Event, Acc) -> apply_runtime_event(Acc, Event) end,
+                State,
+                Events).
 
 lease_current(RunId, Lease) ->
     FencingToken = beamtrail_lease_manager:fencing_token(Lease),

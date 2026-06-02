@@ -8,16 +8,26 @@
 %% SQL-level inspection.
 
 -export([init_schema/0]).
--export([append_event/8, read_events/3, events/1, write_snapshot/4, read_snapshot/1,
+-export([append_event/8, append_events/4, read_events/3, events/1, write_snapshot/4, read_snapshot/1,
          acquire_lease/3, renew_lease/3, read_lease/1, list_run_ids/0, list_run_ids/2]).
 
 append_event(RunId, ExpectedSeq, FencingToken,
              EventType, StepId, StepVersion, IdempotencyKey, Payload) ->
+    Spec = #{event_type => EventType,
+             step_id => StepId,
+             step_version => StepVersion,
+             idempotency_key => IdempotencyKey,
+             payload => Payload},
+    case append_events(RunId, ExpectedSeq, FencingToken, [Spec]) of
+        {ok, [Event]} -> {ok, Event};
+        {error, _} = Error -> Error
+    end.
+
+append_events(RunId, ExpectedSeq, FencingToken, EventSpecs) ->
     transaction(
       fun(C) ->
-              append_event_with_run_lock(C, RunId, ExpectedSeq, FencingToken,
-                                         EventType, StepId, StepVersion,
-                                         IdempotencyKey, Payload)
+              append_events_with_run_lock(C, RunId, ExpectedSeq, FencingToken,
+                                          EventSpecs)
       end).
 
 read_events(RunId, FromSeq, infinity) ->
@@ -258,24 +268,22 @@ connect() ->
             Error
     end.
 
-append_event_with_run_lock(C, RunId, ExpectedSeq, FencingToken,
-                           EventType, StepId, StepVersion, IdempotencyKey, Payload) ->
+append_events_with_run_lock(_C, _RunId, _ExpectedSeq, _FencingToken, []) ->
+    {ok, []};
+append_events_with_run_lock(C, RunId, ExpectedSeq, FencingToken, EventSpecs) ->
     case lock_run(C, RunId) of
         ok ->
-            append_event_after_lock(C, RunId, ExpectedSeq, FencingToken,
-                                    EventType, StepId, StepVersion,
-                                    IdempotencyKey, Payload);
+            append_events_after_lock(C, RunId, ExpectedSeq, FencingToken,
+                                     EventSpecs);
         {error, _} = Error ->
             Error
     end.
 
-append_event_after_lock(C, RunId, ExpectedSeq, FencingToken,
-                        EventType, StepId, StepVersion, IdempotencyKey, Payload) ->
+append_events_after_lock(C, RunId, ExpectedSeq, FencingToken, EventSpecs) ->
     case current_event_seq(C, RunId) of
         {ok, ExpectedSeq} ->
-            append_event_at_expected_seq(C, RunId, ExpectedSeq, FencingToken,
-                                         EventType, StepId, StepVersion,
-                                         IdempotencyKey, Payload);
+            append_events_at_expected_seq(C, RunId, ExpectedSeq, FencingToken,
+                                          EventSpecs);
         {ok, ActualSeq} ->
             {error, {conflict, #{expected_seq => ExpectedSeq,
                                  actual_seq => ActualSeq}}};
@@ -283,44 +291,74 @@ append_event_after_lock(C, RunId, ExpectedSeq, FencingToken,
             Error
     end.
 
-append_event_at_expected_seq(C, RunId, ExpectedSeq, FencingToken,
-                             EventType, StepId, StepVersion, IdempotencyKey, Payload) ->
-    case validate_fencing(C, RunId, EventType, FencingToken) of
+append_events_at_expected_seq(C, RunId, ExpectedSeq, FencingToken, EventSpecs) ->
+    case validate_fencing_for_specs(C, RunId, FencingToken, EventSpecs) of
         ok ->
-            EventSeq = ExpectedSeq + 1,
-            OccurredAt = now_ms(),
-            Params =
-                [RunId, EventSeq, atom_to_binary(EventType, utf8),
-                 nullable_atom(StepId), nullable_int(StepVersion),
-                 nullable_term(IdempotencyKey), term_to_binary(Payload),
-                 nullable_int(FencingToken), OccurredAt],
-            case epgsql:equery(
-                   C,
-                   "INSERT INTO workflow_events "
-                   "(run_id, event_seq, event_type, step_id, step_version, "
-                   " idempotency_key, payload, fencing_token, occurred_at_ms) "
-                   "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
-                   Params) of
-                {ok, 1} ->
-                    case touch_run(C, RunId, OccurredAt) of
-                        ok ->
-                            {ok, #{run_id => RunId,
-                                   event_seq => EventSeq,
-                                   event_type => EventType,
-                                   step_id => StepId,
-                                   step_version => StepVersion,
-                                   idempotency_key => IdempotencyKey,
-                                   fencing_token => FencingToken,
-                                   payload => Payload,
-                                   occurred_at => OccurredAt}};
-                        {error, _} = Error ->
-                            Error
-                    end;
-                {error, Reason} ->
-                    {error, Reason}
-            end;
+            append_event_specs(C, RunId, ExpectedSeq, FencingToken,
+                               EventSpecs, []);
         {error, _} = Error ->
             Error
+    end.
+
+validate_fencing_for_specs(_C, _RunId, _FencingToken, []) ->
+    ok;
+validate_fencing_for_specs(C, RunId, FencingToken, [Spec | Rest]) ->
+    EventType = maps:get(event_type, Spec),
+    case validate_fencing(C, RunId, EventType, FencingToken) of
+        ok -> validate_fencing_for_specs(C, RunId, FencingToken, Rest);
+        {error, _} = Error -> Error
+    end.
+
+append_event_specs(C, RunId, _Seq, _FencingToken, [], Acc) ->
+    Events = lists:reverse(Acc),
+    Last = lists:last(Events),
+    case touch_run(C, RunId, maps:get(occurred_at, Last)) of
+        ok -> {ok, Events};
+        {error, _} = Error -> Error
+    end;
+append_event_specs(C, RunId, Seq, FencingToken, [Spec | Rest], Acc) ->
+    EventSeq = Seq + 1,
+    EventType = maps:get(event_type, Spec),
+    StepId = maps:get(step_id, Spec, undefined),
+    StepVersion = maps:get(step_version, Spec, undefined),
+    IdempotencyKey = maps:get(idempotency_key, Spec, undefined),
+    Payload = maps:get(payload, Spec),
+    case insert_event(C, RunId, EventSeq, FencingToken, EventType, StepId,
+                      StepVersion, IdempotencyKey, Payload) of
+        {ok, Event} ->
+            append_event_specs(C, RunId, EventSeq, FencingToken, Rest,
+                               [Event | Acc]);
+        {error, _} = Error ->
+            Error
+    end.
+
+insert_event(C, RunId, EventSeq, FencingToken,
+             EventType, StepId, StepVersion, IdempotencyKey, Payload) ->
+    OccurredAt = now_ms(),
+    Params =
+        [RunId, EventSeq, atom_to_binary(EventType, utf8),
+         nullable_atom(StepId), nullable_int(StepVersion),
+         nullable_term(IdempotencyKey), term_to_binary(Payload),
+         nullable_int(FencingToken), OccurredAt],
+    case epgsql:equery(
+           C,
+           "INSERT INTO workflow_events "
+           "(run_id, event_seq, event_type, step_id, step_version, "
+           " idempotency_key, payload, fencing_token, occurred_at_ms) "
+           "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+           Params) of
+        {ok, 1} ->
+            {ok, #{run_id => RunId,
+                   event_seq => EventSeq,
+                   event_type => EventType,
+                   step_id => StepId,
+                   step_version => StepVersion,
+                   idempotency_key => IdempotencyKey,
+                   fencing_token => FencingToken,
+                   payload => Payload,
+                   occurred_at => OccurredAt}};
+        {error, Reason} ->
+            {error, Reason}
     end.
 
 lock_run(C, RunId) ->

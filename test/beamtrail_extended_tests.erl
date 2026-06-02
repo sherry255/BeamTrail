@@ -28,6 +28,7 @@ extended_test_() ->
       fun load_state_ignores_obsolete_snapshot_revision/0,
       fun snapshot_schema_contract_pins_revision_to_state_shape/0,
       fun storage_lists_run_ids_with_cursor/0,
+      fun storage_append_events_validates_each_event_fence/0,
       fun storage_rejects_expected_seq_conflict/0,
       fun storage_rejects_zombie_append_after_fence_takeover/0,
       fun storage_renews_current_lease_without_changing_fence/0,
@@ -53,6 +54,8 @@ extended_test_() ->
       fun scanner_skips_migration_blocked_runs/0,
       fun retry_policy_failure_fails_terminally_without_retry_loop/0,
       fun malformed_retry_policy_map_fails_terminally_without_retry_loop/0,
+      fun failed_step_decision_is_crash_atomic/0,
+      fun open_attempt_recovery_reuses_attempt_budget/0,
       fun retry_attempts_preserved_in_chronological_order/0,
       fun workflow_module_preload_accepts_configured_modules/0,
       fun storage_adapter_is_application_configurable/0,
@@ -399,6 +402,22 @@ storage_lists_run_ids_with_cursor() ->
               next_cursor => <<"page-run-3">>,
               has_more => false}},
        beamtrail_memory_storage:list_run_ids(<<"page-run-2">>, 2)).
+
+storage_append_events_validates_each_event_fence() ->
+    RunId = <<"batch-fence-run-1">>,
+    EventSpecs =
+        [#{event_type => 'workflow.instance.created',
+           payload => #{workflow => bt_success_workflow, input => #{},
+                        steps => [charge]}},
+         #{event_type => 'step.failed',
+           step_id => charge,
+           step_version => 1,
+           idempotency_key => {charge, RunId},
+           payload => #{reason => transient, class => transient, attempt => 1}}],
+    ?assertEqual({error, missing_fence},
+                 beamtrail_memory_storage:append_events(RunId, 0, undefined,
+                                                        EventSpecs)),
+    ?assertEqual({ok, []}, beamtrail_memory_storage:events(RunId)).
 
 storage_rejects_expected_seq_conflict() ->
     RunId = <<"cas-run-1">>,
@@ -911,6 +930,50 @@ malformed_retry_policy_map_fails_terminally_without_retry_loop() ->
     {ok, EventsAfterRecovery} = beamtrail:events(RunId),
     ?assertEqual(length(Events), length(EventsAfterRecovery)).
 
+failed_step_decision_is_crash_atomic() ->
+    RunId = <<"atomic-failure-run-1">>,
+    ok = application:set_env(beamtrail, storage_adapter,
+                             bt_decision_append_fail_storage),
+    ok = application:set_env(beamtrail, lease_ttl_ms, 20),
+    Input = #{order_id => <<"o-atomic-failure-1">>, test_pid => self()},
+    ?assertEqual({ok, RunId},
+                 beamtrail:start_workflow(bt_single_fail_workflow, Input,
+                                          #{run_id => RunId})),
+    ?assertEqual({single_fail_execute, 1}, receive_exec()),
+    ?assertEqual(timeout, receive_exec_short()),
+    {ok, Events} = beamtrail:events(RunId),
+    ?assertEqual(1, length([E || E <- Events,
+                            maps:get(event_type, E) =:= 'attempt.started'])),
+    ?assertEqual(1, length([E || E <- Events,
+                            maps:get(event_type, E) =:= 'step.failed'])),
+    ?assertEqual(1, length([E || E <- Events,
+                            maps:get(event_type, E) =:= 'workflow.failed'])),
+    ?assertEqual({ok, []}, beamtrail:recover_unfinished()),
+    ?assertEqual(terminal, terminal_status(beamtrail:get_state(RunId))).
+
+open_attempt_recovery_reuses_attempt_budget() ->
+    RunId = <<"open-attempt-budget-run-1">>,
+    Input = #{order_id => <<"o-open-attempt-budget-1">>, test_pid => self()},
+    {ok, _} = beamtrail_memory_storage:append_event(
+                RunId, 0, undefined,
+                'workflow.instance.created', undefined, undefined,
+                undefined,
+                #{workflow => bt_single_fail_workflow, input => Input,
+                  steps => [charge]}),
+    {ok, Lease} = beamtrail_memory_storage:acquire_lease(RunId, stale_worker, 20),
+    {ok, _} = beamtrail_memory_storage:append_event(
+                RunId, 1, maps:get(fencing_token, Lease),
+                'attempt.started', charge, 1,
+                {charge, <<"o-open-attempt-budget-1">>}, #{attempt => 1}),
+    ok = wait_until_lease_expired(RunId, 1000),
+    ?assertMatch({ok, [_]}, beamtrail:recover_unfinished()),
+    ?assertEqual({single_fail_execute, 1}, receive_exec()),
+    {ok, Events} = beamtrail:events(RunId),
+    ?assertEqual(1, length([E || E <- Events,
+                            maps:get(event_type, E) =:= 'attempt.started'])),
+    State = beamtrail:get_state(RunId),
+    ?assertEqual(1, maps:get(charge, maps:get(attempt_counts, State))).
+
 retry_attempts_preserved_in_chronological_order() ->
     Input = #{order_id => <<"o-ord-1">>, test_pid => self()},
     {ok, RunId} = beamtrail:start_workflow(bt_retry_workflow, Input),
@@ -1028,6 +1091,11 @@ receive_exec_short() ->
     receive Message -> Message
     after 50 -> timeout
     end.
+
+terminal_status(#{status := failed, terminal := true}) ->
+    terminal;
+terminal_status(#{status := Status, terminal := Terminal}) ->
+    {Status, Terminal}.
 
 wait_for_status(_RunId, _Target, Remaining) when Remaining =< 0 ->
     {error, timeout};

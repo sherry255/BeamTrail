@@ -1,7 +1,7 @@
 -module(bt_read_error_storage).
 -behaviour(beamtrail_storage).
 
--export([append_event/8, read_events/3, events/1, write_snapshot/4,
+-export([append_event/8, append_events/4, read_events/3, events/1, write_snapshot/4,
          read_snapshot/1, acquire_lease/3, renew_lease/3, read_lease/1,
          list_run_ids/0, list_run_ids/2]).
 -export([telemetry_counters/0]).
@@ -11,6 +11,10 @@ append_event(RunId, ExpectedSeq, FencingToken, EventType, StepId,
     beamtrail_memory_storage:append_event(RunId, ExpectedSeq, FencingToken,
                                           EventType, StepId, StepVersion,
                                           IdempotencyKey, Payload).
+
+append_events(RunId, ExpectedSeq, FencingToken, EventSpecs) ->
+    beamtrail_memory_storage:append_events(RunId, ExpectedSeq, FencingToken,
+                                           EventSpecs).
 
 read_events(RunId, FromSeq, Limit) ->
     beamtrail_memory_storage:read_events(RunId, FromSeq, Limit).

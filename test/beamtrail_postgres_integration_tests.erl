@@ -13,6 +13,7 @@ postgres_integration_test_() ->
              [fun postgres_workflow_survives_application_restart/0,
               fun postgres_recovery_replays_unfinished_attempt_after_restart/0,
               fun postgres_append_locks_only_target_run/0,
+              fun postgres_append_events_writes_adjacent_events/0,
               fun postgres_expected_seq_conflict_is_per_run/0,
               fun postgres_rejects_zombie_append_after_fence_takeover/0,
               fun postgres_storage_uses_supervised_connection_pool/0,
@@ -98,6 +99,31 @@ postgres_append_locks_only_target_run() ->
     ?assertMatch({ok, #{event_seq := 1}}, FastResult),
     ?assertMatch({ok, #{event_seq := 1}}, SlowResult),
     ?assert(ElapsedMs < 900).
+
+postgres_append_events_writes_adjacent_events() ->
+    RunId = unique_run_id("pg-batch-append"),
+    {ok, _} = append_created_event(RunId),
+    {ok, Lease} = beamtrail_postgres_storage:acquire_lease(RunId, worker_a, 1000),
+    Fence = maps:get(fencing_token, Lease),
+    EventSpecs =
+        [#{event_type => 'attempt.started',
+           step_id => charge,
+           step_version => 1,
+           idempotency_key => {charge, RunId},
+           payload => #{attempt => 1}},
+         #{event_type => 'step.failed',
+           step_id => charge,
+           step_version => 1,
+           idempotency_key => {charge, RunId},
+           payload => #{reason => transient, class => transient, attempt => 1}}],
+    ?assertMatch({ok, [#{event_seq := 2}, #{event_seq := 3}]},
+                 beamtrail_postgres_storage:append_events(RunId, 1, Fence,
+                                                          EventSpecs)),
+    ?assertMatch({error, {conflict, #{expected_seq := 1, actual_seq := 3}}},
+                 beamtrail_postgres_storage:append_events(RunId, 1, Fence,
+                                                          EventSpecs)),
+    {ok, Events} = beamtrail_postgres_storage:events(RunId),
+    ?assertEqual([1, 2, 3], [maps:get(event_seq, E) || E <- Events]).
 
 postgres_expected_seq_conflict_is_per_run() ->
     RunId = unique_run_id("pg-conflict"),

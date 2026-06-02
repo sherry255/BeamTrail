@@ -8,6 +8,10 @@
                        StepVersion :: non_neg_integer() | undefined,
                        IdempotencyKey :: term(),
                        Payload :: map()) -> {ok, map()} | {error, term()}.
+-callback append_events(RunId :: binary(),
+                        ExpectedSeq :: non_neg_integer(),
+                        FencingToken :: pos_integer() | undefined,
+                        EventSpecs :: [map()]) -> {ok, [map()]} | {error, term()}.
 -callback read_events(RunId :: binary(), FromSeq :: pos_integer(), Limit :: pos_integer() | infinity) ->
     {ok, [map()]} | {error, term()}.
 -callback events(RunId :: binary()) -> {ok, [map()]} | {error, term()}.

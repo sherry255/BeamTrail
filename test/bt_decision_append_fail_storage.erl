@@ -1,4 +1,4 @@
--module(bt_no_renew_storage).
+-module(bt_decision_append_fail_storage).
 -behaviour(beamtrail_storage).
 
 -export([append_event/8, append_events/4, read_events/3, events/1, write_snapshot/4,
@@ -6,6 +6,10 @@
          list_run_ids/0, list_run_ids/2]).
 -export([telemetry_counters/0]).
 
+append_event(_RunId, _ExpectedSeq, _FencingToken, EventType, _StepId,
+             _StepVersion, _IdempotencyKey, _Payload)
+  when EventType =:= 'retry.scheduled'; EventType =:= 'workflow.failed' ->
+    {error, decision_append_failed};
 append_event(RunId, ExpectedSeq, FencingToken, EventType, StepId,
              StepVersion, IdempotencyKey, Payload) ->
     beamtrail_memory_storage:append_event(RunId, ExpectedSeq, FencingToken,
@@ -32,8 +36,8 @@ read_snapshot(RunId) ->
 acquire_lease(RunId, Owner, TtlMs) ->
     beamtrail_memory_storage:acquire_lease(RunId, Owner, TtlMs).
 
-renew_lease(_RunId, _FencingToken, _TtlMs) ->
-    {error, heartbeat_blocked}.
+renew_lease(RunId, FencingToken, TtlMs) ->
+    beamtrail_memory_storage:renew_lease(RunId, FencingToken, TtlMs).
 
 read_lease(RunId) ->
     beamtrail_memory_storage:read_lease(RunId).

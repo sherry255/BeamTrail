@@ -65,11 +65,11 @@ With the PostgreSQL adapter, BeamTrail guarantees:
 BeamTrail does not guarantee exactly-once side effects. Workflow code must use
 the idempotency key in the execution context when it calls external systems.
 
-Retry limits are enforced by persisted events, but they are not crash-atomic
-across the small window between recording `step.failed` and recording the next
-retry or terminal decision. If the VM or node dies in that window, recovery may
-re-enter the failed step. External side effects must therefore be idempotent
-against the stable idempotency key.
+Step failure and the retry-or-terminal decision are appended atomically, so
+`max_attempts` is a crash-safe upper bound on the attempt numbers BeamTrail
+starts. If a VM or node dies after a callback performs an external side effect
+but before BeamTrail records the attempt outcome, the same attempt number can be
+re-entered with the same idempotency key.
 
 ## Quickstart With PostgreSQL
 
