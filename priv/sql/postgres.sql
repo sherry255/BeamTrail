@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS workflow_runs (
   updated_at_ms bigint NOT NULL,
   status text NOT NULL DEFAULT 'running',
   terminal boolean NOT NULL DEFAULT false,
+  parked boolean NOT NULL DEFAULT false,
   next_retry_at_ms bigint
 );
 
@@ -31,6 +32,7 @@ CREATE TABLE IF NOT EXISTS workflow_runs (
 -- the default until normalized by beamtrail_postgres_storage:backfill_run_projections/0.
 ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'running';
 ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS terminal boolean NOT NULL DEFAULT false;
+ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS parked boolean NOT NULL DEFAULT false;
 ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS next_retry_at_ms bigint;
 
 INSERT INTO workflow_runs (run_id, created_at_ms, updated_at_ms)
@@ -43,6 +45,9 @@ ON CONFLICT (run_id) DO NOTHING;
 -- among non-terminal runs only.
 CREATE INDEX IF NOT EXISTS workflow_runs_recoverable_idx
   ON workflow_runs (run_id) WHERE terminal = false;
+
+CREATE INDEX IF NOT EXISTS workflow_runs_recoverable_active_idx
+  ON workflow_runs (run_id) WHERE terminal = false AND parked = false;
 
 CREATE TABLE IF NOT EXISTS workflow_snapshots (
   run_id bytea PRIMARY KEY,

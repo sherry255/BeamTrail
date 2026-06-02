@@ -5,7 +5,7 @@
 %% runner per run on this BEAM node; storage leases and fencing remain the
 %% correctness boundary across node loss or split ownership.
 
--export([start_link/0, dispatch/1, dispatch/2, lookup/1, list/0]).
+-export([start_link/0, dispatch/1, dispatch/2, control/3, lookup/1, list/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
@@ -17,6 +17,9 @@ dispatch(RunId) ->
 
 dispatch(RunId, Lease) ->
     gen_server:call(?MODULE, {dispatch, RunId, Lease}, 30000).
+
+control(RunId, Operation, Reason) ->
+    gen_server:call(?MODULE, {control, RunId, Operation, Reason}, 30000).
 
 lookup(RunId) ->
     gen_server:call(?MODULE, {lookup, RunId}).
@@ -37,6 +40,19 @@ handle_call({dispatch, RunId, Lease}, _From, State) ->
                 {ok, Pid, State1} -> {reply, {ok, Pid}, State1};
                 {error, _} = Error -> {reply, Error, State}
             end
+    end;
+handle_call({control, RunId, Operation, Reason}, _From, State) ->
+    case find_live_runner(RunId, State) of
+        {ok, Pid, State1} ->
+            Reply =
+                try beamtrail_run:control(Pid, Operation, Reason) of
+                    Result -> Result
+                catch
+                    exit:_ -> not_found
+                end,
+            {reply, Reply, State1};
+        not_found ->
+            {reply, not_found, State}
     end;
 handle_call({lookup, RunId}, _From, State) ->
     case find_live_runner(RunId, State) of

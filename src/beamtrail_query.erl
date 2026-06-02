@@ -60,6 +60,8 @@ describe_loaded_events(RunId, Mod, State, Events) ->
     TailLen = replay_tail(Snapshot, LastSeq),
     Recovered = recovered_in_ms_from_events(Events),
     Workflow = maps:get(workflow, State),
+    Terminal = maps:get(terminal, State, false),
+    Parked = maps:get(parked, State, false),
     #{run_id => RunId,
       instance => Instance,
       status => maps:get(status, State),
@@ -69,7 +71,10 @@ describe_loaded_events(RunId, Mod, State, Events) ->
       last_event_seq => LastSeq,
       next_retry_at => maps:get(next_retry_at, State, undefined),
       failure => maps:get(failure, State, undefined),
-      terminal => maps:get(terminal, State, false),
+      terminal => Terminal,
+      parked => Parked,
+      parked_reason => maps:get(parked_reason, State, undefined),
+      parked_at => maps:get(parked_at, State, undefined),
       migration_required_for_version_change =>
           maps:get(migration_required_for_version_change, State, false),
       attempts => Attempts,
@@ -78,6 +83,7 @@ describe_loaded_events(RunId, Mod, State, Events) ->
       replay_tail_length => TailLen,
       lease => Lease,
       active_runner => active_runner(RunId),
+      control => control_state(State, Events),
       recovered_in_ms => Recovered,
       events => Events,
       source_of_truth =>
@@ -114,7 +120,8 @@ describe_loaded_events(RunId, Mod, State, Events) ->
                 [<<"append_event(run_id, expected_seq, fencing_token, type, step_id, step_version, key, payload)">>,
                  <<"write_snapshot(run_id, state, snapshot_seq, snapshot_revision)">>,
                  <<"acquire_lease(run_id, owner_node, ttl_ms)">>,
-                 <<"renew_lease(run_id, fencing_token, ttl_ms)">>],
+                 <<"renew_lease(run_id, fencing_token, ttl_ms)">>,
+                 <<"release_lease(run_id, fencing_token)">>],
             query_path =>
                 <<"read_snapshot + read_events(from_snapshot_seq + 1) + reduce tail">>},
       query => #{api => <<"beamtrail_query:describe/1">>,
@@ -139,6 +146,41 @@ active_runner(RunId) ->
                 {error, Reason} -> #{status => unknown, error => Reason}
             end
     end.
+
+control_state(State, Events) ->
+    Terminal = maps:get(terminal, State, false),
+    Parked = maps:get(parked, State, false),
+    MigrationRequired =
+        maps:get(migration_required_for_version_change, State, false),
+    Latest = latest_control_event(Events),
+    #{parked => Parked,
+      parked_reason => maps:get(parked_reason, State, undefined),
+      parked_at => maps:get(parked_at, State, undefined),
+      cancelled => maps:get(status, State, undefined) =:= cancelled,
+      terminal => Terminal,
+      dispatch_allowed => not (Terminal orelse Parked orelse MigrationRequired),
+      requeue_allowed => not (Terminal orelse Parked),
+      latest_event => control_event_type(Latest),
+      latest_event_detail => Latest}.
+
+latest_control_event(Events) ->
+    ControlEvents =
+        [E || #{event_type := EventType} = E <- Events,
+              is_control_event(EventType)],
+    case ControlEvents of
+        [] -> undefined;
+        _ -> lists:last(ControlEvents)
+    end.
+
+is_control_event('workflow.cancelled') -> true;
+is_control_event('workflow.parked') -> true;
+is_control_event('workflow.resumed') -> true;
+is_control_event(_) -> false.
+
+control_event_type(undefined) ->
+    undefined;
+control_event_type(#{event_type := EventType}) ->
+    EventType.
 
 %% Latest-only: the memory adapter exposes a single current snapshot per
 %% run. Real adapters with snapshot history can extend the read model to
@@ -199,6 +241,7 @@ pair_starts([#{event_type := 'attempt.started', occurred_at := T} | Rest], _Pend
 pair_starts([#{event_type := Et, occurred_at := T} | Rest], Pending, _Pair)
   when (Et =:= 'step.succeeded' orelse Et =:= 'step.failed'
         orelse Et =:= 'workflow.completed' orelse Et =:= 'workflow.failed'
+        orelse Et =:= 'workflow.cancelled'
         orelse Et =:= 'recovery.requeued')
        andalso Pending =/= undefined ->
     pair_starts(Rest, undefined, {Pending, T});
@@ -215,4 +258,7 @@ instance_from_state(State) ->
       last_event_seq => maps:get(last_event_seq, State, 0),
       next_retry_at => maps:get(next_retry_at, State, undefined),
       failure => maps:get(failure, State, undefined),
+      parked => maps:get(parked, State, false),
+      parked_reason => maps:get(parked_reason, State, undefined),
+      parked_at => maps:get(parked_at, State, undefined),
       terminal => maps:get(terminal, State, false)}.

@@ -32,12 +32,22 @@ extended_test_() ->
       fun snapshot_write_failure_is_nonfatal/0,
       fun load_state_ignores_obsolete_snapshot_revision/0,
       fun snapshot_schema_contract_pins_revision_to_state_shape/0,
+      fun reducer_applies_cancelled_parked_and_resumed/0,
       fun storage_lists_run_ids_with_cursor/0,
       fun storage_append_events_validates_each_event_fence/0,
       fun storage_rejects_expected_seq_conflict/0,
       fun storage_rejects_zombie_append_after_fence_takeover/0,
       fun storage_renews_current_lease_without_changing_fence/0,
       fun storage_refuses_to_renew_expired_lease/0,
+      fun storage_release_lease_preserves_fencing/0,
+      fun memory_recoverable_index_excludes_parked_runs/0,
+      fun dispatch_does_not_complete_cancelled_run/0,
+      fun dispatch_does_not_progress_parked_run/0,
+      fun cancel_run_appends_terminal_event/0,
+      fun cancel_run_stops_local_active_runner/0,
+      fun park_run_stops_local_active_runner/0,
+      fun park_resume_round_trip/0,
+      fun requeue_run_rejects_parked_run/0,
       fun dispatch_refuses_when_run_is_leased/0,
       fun dispatch_refuses_stale_lease_before_replay/0,
       fun dispatch_renews_lease_while_step_runs/0,
@@ -54,6 +64,7 @@ extended_test_() ->
       fun query_describe_exposes_active_runner/0,
       fun active_runner_stays_inspectable_while_step_executes/0,
       fun active_runner_reuses_loaded_state_across_steps/0,
+      fun query_describe_exposes_run_control_state/0,
       fun dispatch_refuses_version_mismatch_without_migration/0,
       fun completed_step_version_change_does_not_block_next_step/0,
       fun scanner_skips_migration_blocked_runs/0,
@@ -496,6 +507,60 @@ snapshot_schema_contract_pins_revision_to_state_shape() ->
                  maps:get(attempt_keys, Schema)),
     ?assert(beamtrail_state:snapshot_revision() > 0).
 
+reducer_applies_cancelled_parked_and_resumed() ->
+    Created =
+        #{run_id => <<"control-run">>,
+          event_seq => 1,
+          event_type => 'workflow.instance.created',
+          payload => #{workflow => bt_success_workflow,
+                       input => #{},
+                       steps => [charge]},
+          occurred_at => 1},
+    Parked =
+        #{run_id => <<"control-run">>,
+          event_seq => 2,
+          event_type => 'workflow.parked',
+          payload => #{reason => maintenance, parked_at => 2},
+          occurred_at => 2},
+    Resumed =
+        #{run_id => <<"control-run">>,
+          event_seq => 3,
+          event_type => 'workflow.resumed',
+          payload => #{resumed_at => 3},
+          occurred_at => 3},
+    Cancelled =
+        #{run_id => <<"control-run">>,
+          event_seq => 4,
+          event_type => 'workflow.cancelled',
+          payload => #{reason => operator_cancel,
+                       class => cancelled,
+                       cancelled_at => 4},
+          occurred_at => 4},
+
+    ParkedState = beamtrail_reducer:from_events([Created, Parked]),
+    ?assertMatch(#{status := running,
+                   parked := true,
+                   parked_reason := maintenance,
+                   parked_at := 2,
+                   terminal := false},
+                 ParkedState),
+
+    ResumedState = beamtrail_reducer:from_events([Created, Parked, Resumed]),
+    ?assertMatch(#{status := running,
+                   parked := false,
+                   parked_reason := undefined,
+                   parked_at := undefined,
+                   terminal := false},
+                 ResumedState),
+
+    CancelledState = beamtrail_reducer:from_events([Created, Cancelled]),
+    ?assertMatch(#{status := cancelled,
+                   terminal := true,
+                   current_step := undefined,
+                   pending_attempt := undefined,
+                   failure := #{class := cancelled}},
+                 CancelledState).
+
 storage_lists_run_ids_with_cursor() ->
     {ok, _} = beamtrail:start_workflow(bt_timeout_workflow, #{order_id => <<"o-page-2">>},
                                        #{run_id => <<"page-run-2">>, auto_dispatch => false}),
@@ -593,6 +658,181 @@ storage_refuses_to_renew_expired_lease() ->
     ?assertEqual({error, lease_expired},
                  beamtrail_memory_storage:renew_lease(
                    RunId, maps:get(fencing_token, Lease), 100)).
+
+storage_release_lease_preserves_fencing() ->
+    RunId = <<"release-lease-run">>,
+    {ok, _} = beamtrail:start_workflow(bt_success_workflow, #{},
+                                       #{run_id => RunId,
+                                         auto_dispatch => false}),
+    {ok, Lease1} = beamtrail_memory_storage:acquire_lease(RunId, owner1, 30000),
+    Fence1 = maps:get(fencing_token, Lease1),
+    ok = beamtrail_memory_storage:release_lease(RunId, Fence1),
+    {ok, Lease2} = beamtrail_memory_storage:acquire_lease(RunId, owner2, 30000),
+    ?assertEqual(Fence1 + 1, maps:get(fencing_token, Lease2)),
+    ?assertEqual({error, stale_fence},
+                 beamtrail_memory_storage:release_lease(RunId, Fence1)).
+
+memory_recoverable_index_excludes_parked_runs() ->
+    RunId = <<"parked-index-run">>,
+    {ok, _} = beamtrail:start_workflow(bt_success_workflow, #{},
+                                       #{run_id => RunId,
+                                         auto_dispatch => false}),
+    {ok, Lease} = beamtrail_memory_storage:acquire_lease(RunId, owner1, 5),
+    {ok, State0} = beamtrail_state:load(RunId, beamtrail_memory_storage),
+    Parked =
+        #{event_type => 'workflow.parked',
+          step_id => undefined,
+          step_version => undefined,
+          idempotency_key => undefined,
+          payload => #{reason => maintenance,
+                       parked_at => erlang:system_time(millisecond)}},
+    {ok, [_]} =
+        beamtrail_memory_storage:append_events(
+          RunId, maps:get(last_event_seq, State0),
+          maps:get(fencing_token, Lease), [Parked]),
+    timer:sleep(10),
+    {ok, #{run_ids := RunIds}} =
+        beamtrail_memory_storage:list_recoverable_run_ids(
+          undefined, 100, erlang:system_time(millisecond)),
+    ?assertNot(lists:member(RunId, RunIds)).
+
+dispatch_does_not_complete_cancelled_run() ->
+    RunId = <<"cancel-dispatch-run">>,
+    {ok, _} = beamtrail:start_workflow(bt_success_workflow,
+                                       #{order_id => RunId,
+                                         test_pid => self()},
+                                       #{run_id => RunId,
+                                         auto_dispatch => false}),
+    {ok, Lease} = beamtrail_memory_storage:acquire_lease(RunId, owner1, 30000),
+    {ok, State0} = beamtrail_state:load(RunId, beamtrail_memory_storage),
+    Cancelled =
+        #{event_type => 'workflow.cancelled',
+          step_id => undefined,
+          step_version => undefined,
+          idempotency_key => undefined,
+          payload => #{reason => operator_cancel,
+                       class => cancelled,
+                       cancelled_at => erlang:system_time(millisecond)}},
+    {ok, [_]} =
+        beamtrail_memory_storage:append_events(
+          RunId, maps:get(last_event_seq, State0),
+          maps:get(fencing_token, Lease), [Cancelled]),
+    ok = beamtrail_memory_storage:release_lease(
+           RunId, maps:get(fencing_token, Lease)),
+    {ok, State1} = beamtrail:dispatch(RunId),
+    ?assertMatch(#{status := cancelled, terminal := true}, State1),
+    ?assertEqual(timeout, receive_exec_short()),
+    {ok, Events} = beamtrail:events(RunId),
+    ?assertNot(lists:member('workflow.completed',
+                            [maps:get(event_type, E) || E <- Events])).
+
+dispatch_does_not_progress_parked_run() ->
+    RunId = <<"park-dispatch-run">>,
+    {ok, _} = beamtrail:start_workflow(bt_success_workflow,
+                                       #{order_id => RunId,
+                                         test_pid => self()},
+                                       #{run_id => RunId,
+                                         auto_dispatch => false}),
+    {ok, Lease} = beamtrail_memory_storage:acquire_lease(RunId, owner1, 30000),
+    {ok, State0} = beamtrail_state:load(RunId, beamtrail_memory_storage),
+    Parked =
+        #{event_type => 'workflow.parked',
+          step_id => undefined,
+          step_version => undefined,
+          idempotency_key => undefined,
+          payload => #{reason => maintenance,
+                       parked_at => erlang:system_time(millisecond)}},
+    {ok, [_]} =
+        beamtrail_memory_storage:append_events(
+          RunId, maps:get(last_event_seq, State0),
+          maps:get(fencing_token, Lease), [Parked]),
+    ok = beamtrail_memory_storage:release_lease(
+           RunId, maps:get(fencing_token, Lease)),
+    {ok, State1} = beamtrail:dispatch(RunId),
+    ?assertMatch(#{status := running, parked := true, terminal := false},
+                 State1),
+    ?assertEqual(timeout, receive_exec_short()),
+    {ok, Events} = beamtrail:events(RunId),
+    ?assertNot(lists:member('attempt.started',
+                            [maps:get(event_type, E) || E <- Events])).
+
+cancel_run_appends_terminal_event() ->
+    RunId = <<"cancel-api-run">>,
+    {ok, _} = beamtrail:start_workflow(bt_success_workflow, #{},
+                                       #{run_id => RunId,
+                                         auto_dispatch => false}),
+    {ok, State} = beamtrail:cancel_run(RunId, operator_cancel),
+    ?assertMatch(#{status := cancelled, terminal := true}, State),
+    {ok, Events} = beamtrail:events(RunId),
+    ?assert(lists:member('workflow.cancelled',
+                         [maps:get(event_type, E) || E <- Events])).
+
+cancel_run_stops_local_active_runner() ->
+    RunId = <<"cancel-active-run">>,
+    Gate = cancel_active_gate,
+    Input = #{order_id => <<"o-cancel-active">>, test_pid => self(),
+              gate => Gate},
+    {ok, RunId} = beamtrail:start_workflow(bt_blocking_success_workflow, Input,
+                                           #{run_id => RunId}),
+    ?assertMatch({blocking_started, ExecPid, 1} when is_pid(ExecPid),
+                 receive_exec()),
+    {ok, State} = beamtrail:cancel_run(RunId, operator_cancel),
+    ?assertMatch(#{status := cancelled, terminal := true}, State),
+    ok = wait_for_status(RunId, cancelled, 1000),
+    ?assertEqual(not_found, beamtrail_run_registry:lookup(RunId)),
+    ?assertEqual(timeout, receive_exec_short()),
+    {ok, Events} = beamtrail:events(RunId),
+    Types = [maps:get(event_type, E) || E <- Events],
+    ?assert(lists:member('workflow.cancelled', Types)),
+    ?assertNot(lists:member('step.succeeded', Types)).
+
+park_run_stops_local_active_runner() ->
+    RunId = <<"park-active-run">>,
+    Gate = park_active_gate,
+    Input = #{order_id => <<"o-park-active">>, test_pid => self(),
+              gate => Gate},
+    {ok, RunId} = beamtrail:start_workflow(bt_blocking_success_workflow, Input,
+                                           #{run_id => RunId}),
+    ?assertMatch({blocking_started, ExecPid, 1} when is_pid(ExecPid),
+                 receive_exec()),
+    {ok, State} = beamtrail:park_run(RunId, maintenance),
+    ?assertMatch(#{status := running,
+                   parked := true,
+                   terminal := false},
+                 State),
+    timer:sleep(50),
+    ?assertEqual(not_found, beamtrail_run_registry:lookup(RunId)),
+    ?assertEqual(timeout, receive_exec_short()),
+    Parked = beamtrail:get_state(RunId),
+    ?assertMatch(#{status := running,
+                   parked := true,
+                   terminal := false},
+                 Parked),
+    {ok, Events} = beamtrail:events(RunId),
+    Types = [maps:get(event_type, E) || E <- Events],
+    ?assert(lists:member('workflow.parked', Types)),
+    ?assertNot(lists:member('step.succeeded', Types)).
+
+park_resume_round_trip() ->
+    RunId = <<"park-resume-api-run">>,
+    {ok, _} = beamtrail:start_workflow(bt_success_workflow, #{},
+                                       #{run_id => RunId,
+                                         auto_dispatch => false}),
+    {ok, Parked} = beamtrail:park_run(RunId, maintenance),
+    ?assertMatch(#{parked := true,
+                   parked_reason := maintenance,
+                   terminal := false},
+                 Parked),
+    {ok, Resumed} = beamtrail:resume_run(RunId),
+    ?assertMatch(#{parked := false, terminal := false}, Resumed).
+
+requeue_run_rejects_parked_run() ->
+    RunId = <<"parked-requeue-run">>,
+    {ok, _} = beamtrail:start_workflow(bt_success_workflow, #{},
+                                       #{run_id => RunId,
+                                         auto_dispatch => false}),
+    {ok, _} = beamtrail:park_run(RunId, maintenance),
+    ?assertEqual({error, parked}, beamtrail:requeue_run(RunId, manual)).
 
 dispatch_refuses_when_run_is_leased() ->
     RunId = <<"leased-run-1">>,
@@ -888,6 +1128,46 @@ active_runner_reuses_loaded_state_across_steps() ->
     ?assertEqual(1, maps:get(events, Counts, 0)),
     ?assertEqual(0, maps:get(read_events, Counts, 0)).
 
+query_describe_exposes_run_control_state() ->
+    ParkedRun = <<"query-control-parked-run">>,
+    {ok, ParkedRun} = beamtrail:start_workflow(bt_success_workflow, #{},
+                                               #{run_id => ParkedRun,
+                                                 auto_dispatch => false}),
+    {ok, _Parked} = beamtrail:park_run(ParkedRun, maintenance),
+    Q1 = beamtrail_query:describe(ParkedRun),
+    ?assertMatch(#{parked := true,
+                   parked_reason := maintenance,
+                   terminal := false},
+                 Q1),
+    ?assertMatch(#{parked := true,
+                   parked_reason := maintenance,
+                   latest_event := 'workflow.parked',
+                   dispatch_allowed := false},
+                 maps:get(control, Q1)),
+    {ok, _Resumed} = beamtrail:resume_run(ParkedRun),
+    Q2 = beamtrail_query:describe(ParkedRun),
+    ?assertMatch(#{parked := false,
+                   terminal := false},
+                 Q2),
+    ?assertMatch(#{parked := false,
+                   latest_event := 'workflow.resumed',
+                   dispatch_allowed := true},
+                 maps:get(control, Q2)),
+
+    CancelledRun = <<"query-control-cancelled-run">>,
+    {ok, CancelledRun} = beamtrail:start_workflow(bt_success_workflow, #{},
+                                                  #{run_id => CancelledRun,
+                                                    auto_dispatch => false}),
+    {ok, _Cancelled} = beamtrail:cancel_run(CancelledRun, operator_cancel),
+    Q3 = beamtrail_query:describe(CancelledRun),
+    ?assertMatch(#{status := cancelled,
+                   terminal := true},
+                 Q3),
+    ?assertMatch(#{cancelled := true,
+                   latest_event := 'workflow.cancelled',
+                   dispatch_allowed := false},
+                 maps:get(control, Q3)).
+
 dispatch_refuses_version_mismatch_without_migration() ->
     RunId = <<"version-gate-run-1">>,
     Input = #{order_id => <<"o-version-1">>, test_pid => self()},
@@ -1147,6 +1427,7 @@ query_describe_exposes_inspector_blocks() ->
     Input = #{order_id => <<"o-proto-1">>, test_pid => self()},
     {ok, RunId} = beamtrail:start_workflow(bt_success_workflow, Input),
     _ = receive_exec(), _ = receive_exec(),
+    ok = wait_for_status(RunId, completed, 1000),
     Q = beamtrail_query:describe(RunId),
     SourceOfTruth = maps:get(source_of_truth, Q),
     SnapshotInfo = maps:get(snapshot, SourceOfTruth),

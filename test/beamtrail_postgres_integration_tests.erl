@@ -14,6 +14,8 @@ postgres_integration_test_() ->
               fun postgres_recovery_replays_unfinished_attempt_after_restart/0,
               fun postgres_recovery_budget_exceeded_fails_open_attempt/0,
               fun postgres_list_recoverable_uses_indexed_projection/0,
+              fun postgres_release_lease_preserves_fencing/0,
+              fun postgres_recoverable_index_excludes_parked_runs/0,
               fun postgres_backfill_reports_per_run_load_errors/0,
               fun postgres_transaction_rolls_back_on_internal_exception/0,
               fun postgres_decode_rejects_unknown_atoms/0,
@@ -145,12 +147,46 @@ postgres_list_recoverable_uses_indexed_projection() ->
     {ok, #{run_ids := Recoverable}} = beamtrail:list_recoverable(undefined, 100),
     ?assertEqual([<<"pg-rec-1-running">>, <<"pg-rec-5-retry-due">>], Recoverable),
     %% Projection columns mirror the reduced state derived by the reducer.
-    ?assertEqual({<<"completed">>, true, null},
+    ?assertEqual({<<"completed">>, true, null, false},
                  run_projection_row(Config, <<"pg-rec-2-completed">>)),
-    ?assertMatch({<<"retrying">>, false, NextRetry} when is_integer(NextRetry),
+    ?assertMatch({<<"retrying">>, false, NextRetry, false} when is_integer(NextRetry),
                  run_projection_row(Config, <<"pg-rec-4-retry-future">>)),
-    ?assertEqual({<<"failed">>, true, null},
+    ?assertEqual({<<"failed">>, true, null, false},
                  run_projection_row(Config, <<"pg-rec-6-terminal-failed">>)).
+
+postgres_release_lease_preserves_fencing() ->
+    RunId = unique_run_id("pg-release-lease"),
+    seed_created_pg(RunId, [charge]),
+    {ok, Lease1} = beamtrail_postgres_storage:acquire_lease(RunId, owner1, 30000),
+    Fence1 = maps:get(fencing_token, Lease1),
+    ok = beamtrail_postgres_storage:release_lease(RunId, Fence1),
+    {ok, Lease2} = beamtrail_postgres_storage:acquire_lease(RunId, owner2, 30000),
+    ?assertEqual(Fence1 + 1, maps:get(fencing_token, Lease2)),
+    ?assertEqual({error, stale_fence},
+                 beamtrail_postgres_storage:release_lease(RunId, Fence1)).
+
+postgres_recoverable_index_excludes_parked_runs() ->
+    RunId = unique_run_id("pg-parked-index"),
+    seed_created_pg(RunId, [charge]),
+    {ok, Lease} = beamtrail_postgres_storage:acquire_lease(RunId, owner1, 30000),
+    {ok, State0} = beamtrail_state:load(RunId, beamtrail_postgres_storage),
+    Parked =
+        #{event_type => 'workflow.parked',
+          step_id => undefined,
+          step_version => undefined,
+          idempotency_key => undefined,
+          payload => #{reason => maintenance,
+                       parked_at => erlang:system_time(millisecond)}},
+    {ok, [_]} =
+        beamtrail_postgres_storage:append_events(
+          RunId, maps:get(last_event_seq, State0),
+          maps:get(fencing_token, Lease), [Parked]),
+    ok = beamtrail_postgres_storage:release_lease(
+           RunId, maps:get(fencing_token, Lease)),
+    {ok, #{run_ids := Candidates}} =
+        beamtrail_postgres_storage:list_recoverable_run_ids(
+          undefined, 100, erlang:system_time(millisecond)),
+    ?assertNot(lists:member(RunId, Candidates)).
 
 postgres_backfill_reports_per_run_load_errors() ->
     {ok, Config} = application:get_env(beamtrail, postgres),
@@ -424,7 +460,7 @@ run_projection_row(Config, RunId) ->
                     {ok, _Cols, [Row]} =
                         epgsql:equery(
                           C,
-                          "SELECT status, terminal, next_retry_at_ms "
+                          "SELECT status, terminal, next_retry_at_ms, parked "
                           "FROM workflow_runs WHERE run_id = $1",
                           [RunId]),
                     Row

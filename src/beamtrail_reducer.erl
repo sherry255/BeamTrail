@@ -16,6 +16,9 @@ new() ->
       pending_attempt => undefined,
       next_retry_at => undefined,
       failure => undefined,
+      parked => false,
+      parked_reason => undefined,
+      parked_at => undefined,
       terminal => false,
       last_event_seq => 0}.
 
@@ -119,6 +122,26 @@ apply_event_type('workflow.failed', State, Event) ->
            pending_attempt => undefined,
            terminal => true,
            failure => maps:get(payload, Event)};
+apply_event_type('workflow.cancelled', State, Event) ->
+    Payload = maps:get(payload, Event),
+    State#{status => cancelled,
+           current_step => undefined,
+           pending_attempt => undefined,
+           terminal => true,
+           failure => Payload,
+           parked => false,
+           parked_reason => undefined,
+           parked_at => undefined};
+apply_event_type('workflow.parked', State, Event) ->
+    Payload = maps:get(payload, Event),
+    State#{parked => true,
+           parked_reason => maps:get(reason, Payload, undefined),
+           parked_at => maps:get(parked_at, Payload,
+                                 maps:get(occurred_at, Event, undefined))};
+apply_event_type('workflow.resumed', State, _Event) ->
+    State#{parked => false,
+           parked_reason => undefined,
+           parked_at => undefined};
 apply_event_type(_Other, State, _Event) ->
     State.
 

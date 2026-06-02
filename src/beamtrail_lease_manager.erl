@@ -3,7 +3,7 @@
 %% Thin facade over the storage lease primitives used by dispatch,
 %% recovery handoff, and heartbeat renewal.
 
--export([acquire/2, acquire/3, renew/2, renew/3, read/1,
+-export([acquire/2, acquire/3, renew/2, renew/3, release/2, read/1,
          fencing_token/1, ttl_ms/1, heartbeat_interval_ms/0,
          heartbeat_interval_ms/1, default_ttl_ms/0]).
 
@@ -20,6 +20,14 @@ renew(RunId, FencingToken) ->
 
 renew(RunId, FencingToken, TtlMs) ->
     (beamtrail_config:storage()):renew_lease(RunId, FencingToken, TtlMs).
+
+release(RunId, FencingToken) ->
+    Mod = beamtrail_config:storage(),
+    _ = code:ensure_loaded(Mod),
+    case erlang:function_exported(Mod, release_lease, 2) of
+        true -> Mod:release_lease(RunId, FencingToken);
+        false -> ok
+    end.
 
 read(RunId) ->
     (beamtrail_config:storage()):read_lease(RunId).

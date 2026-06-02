@@ -9,7 +9,7 @@
 
 -export([init_schema/0, backfill_run_projections/0]).
 -export([append_event/8, append_events/4, read_events/3, events/1, write_snapshot/4, read_snapshot/1,
-         acquire_lease/3, renew_lease/3, read_lease/1, list_run_ids/0, list_run_ids/2,
+         acquire_lease/3, renew_lease/3, release_lease/2, read_lease/1, list_run_ids/0, list_run_ids/2,
          list_recoverable_run_ids/3]).
 
 append_event(RunId, ExpectedSeq, FencingToken,
@@ -155,6 +155,29 @@ renew_lease(RunId, FencingToken, TtlMs) ->
               end
       end).
 
+release_lease(RunId, FencingToken) ->
+    transaction(
+      fun(C) ->
+              Now = now_ms(),
+              case select_lease_for_update(C, RunId) of
+                  not_found ->
+                      {error, no_lease};
+                  {ok, #{fencing_token := FencingToken} = Current} ->
+                      case update_lease(C, Current#{lease_until := Now,
+                                                    updated_at := Now}) of
+                          {ok, _Lease} -> ok;
+                          {error, _} = Error -> Error
+                      end;
+                  {ok, #{fencing_token := CurrentFence}} when FencingToken < CurrentFence ->
+                      {error, stale_fence};
+                  {ok, #{fencing_token := CurrentFence}} ->
+                      {error, {invalid_fence, #{provided => FencingToken,
+                                                current => CurrentFence}}};
+                  {error, _} = Error ->
+                      Error
+              end
+      end).
+
 read_lease(RunId) ->
     with_connection(fun(C) -> select_lease(C, RunId, "") end).
 
@@ -212,15 +235,17 @@ list_recoverable_run_ids(Cursor, Limit, NowMs) ->
               end
       end).
 
-%% Coarse recovery candidates at NowMs: not terminal, not waiting on a future
-%% retry, and not currently leased. The lease is read live via LEFT JOIN (never
-%% denormalized into workflow_runs, which is updated in a different transaction).
+%% Coarse recovery candidates at NowMs: not terminal, not parked, not waiting
+%% on a future retry, and not currently leased. The lease is read live via LEFT
+%% JOIN (never denormalized into workflow_runs, which is updated in a different
+%% transaction).
 %% Mirrors beamtrail:recoverable_by_status/1 + lease_recoverable/1, minus the
 %% migration gate, which beamtrail re-checks per candidate from live code.
 recoverable_query(undefined, Limit, NowMs) ->
     {"SELECT r.run_id FROM workflow_runs r "
      "LEFT JOIN workflow_leases l ON l.run_id = r.run_id "
      "WHERE r.terminal = false "
+     "AND r.parked = false "
      "AND (r.status <> 'retrying' OR r.next_retry_at_ms <= $1) "
      "AND (l.lease_until_ms IS NULL OR l.lease_until_ms <= $1) "
      "ORDER BY r.run_id LIMIT $2",
@@ -229,6 +254,7 @@ recoverable_query(Cursor, Limit, NowMs) ->
     {"SELECT r.run_id FROM workflow_runs r "
      "LEFT JOIN workflow_leases l ON l.run_id = r.run_id "
      "WHERE r.terminal = false "
+     "AND r.parked = false "
      "AND (r.status <> 'retrying' OR r.next_retry_at_ms <= $1) "
      "AND (l.lease_until_ms IS NULL OR l.lease_until_ms <= $1) "
      "AND r.run_id > $2 "
@@ -449,40 +475,68 @@ update_run_after_append(C, RunId, Events, UpdatedAt) ->
     case run_projection(Events) of
         no_change ->
             touch_run(C, RunId, UpdatedAt);
-        #{status := Status, terminal := Terminal, next_retry_at := NextRetry} ->
+        #{status := Status,
+          terminal := Terminal,
+          next_retry_at := NextRetry,
+          parked := Parked} ->
             case epgsql:equery(
                    C,
                    "UPDATE workflow_runs SET updated_at_ms = $2, status = $3, "
-                   "terminal = $4, next_retry_at_ms = $5 WHERE run_id = $1",
-                   [RunId, UpdatedAt, Status, Terminal, NextRetry]) of
+                   "terminal = $4, next_retry_at_ms = $5, parked = $6 "
+                   "WHERE run_id = $1",
+                   [RunId, UpdatedAt, Status, Terminal, NextRetry, Parked]) of
+                {ok, 1} -> ok;
+                {ok, 0} -> {error, run_lock_missing};
+                {error, Reason} -> {error, Reason}
+            end;
+        #{parked := Parked} ->
+            case epgsql:equery(
+                   C,
+                   "UPDATE workflow_runs SET updated_at_ms = $2, parked = $3 "
+                   "WHERE run_id = $1",
+                   [RunId, UpdatedAt, Parked]) of
                 {ok, 1} -> ok;
                 {ok, 0} -> {error, run_lock_missing};
                 {error, Reason} -> {error, Reason}
             end
     end.
 
-%% Derive the (status, terminal, next_retry_at) projection from a committed
-%% batch. The reducer is the authority for run state (see beamtrail_reducer);
-%% this mirrors only the columns the scan filters on. The parity assertion in
-%% the PostgreSQL integration test guards against drift from the reducer.
+%% Derive the recovery-scan projection from a committed batch. The reducer is
+%% the authority for run state (see beamtrail_reducer); this mirrors only the
+%% columns the scan filters on. The parity assertion in the PostgreSQL
+%% integration test guards against drift from the reducer.
 run_projection(Events) ->
     lists:foldl(fun project_event/2, no_change, Events).
 
 project_event(#{event_type := 'workflow.instance.created'}, _Acc) ->
-    #{status => <<"running">>, terminal => false, next_retry_at => null};
+    #{status => <<"running">>, terminal => false,
+      next_retry_at => null, parked => false};
 project_event(#{event_type := 'attempt.started'}, _Acc) ->
-    #{status => <<"running">>, terminal => false, next_retry_at => null};
+    #{status => <<"running">>, terminal => false,
+      next_retry_at => null, parked => false};
 project_event(#{event_type := 'step.succeeded'}, _Acc) ->
-    #{status => <<"running">>, terminal => false, next_retry_at => null};
+    #{status => <<"running">>, terminal => false,
+      next_retry_at => null, parked => false};
 project_event(#{event_type := 'step.failed'}, _Acc) ->
-    #{status => <<"failed">>, terminal => false, next_retry_at => null};
+    #{status => <<"failed">>, terminal => false,
+      next_retry_at => null, parked => false};
 project_event(#{event_type := 'retry.scheduled', payload := Payload}, _Acc) ->
     #{status => <<"retrying">>, terminal => false,
-      next_retry_at => maps:get(next_retry_at, Payload, null)};
+      next_retry_at => maps:get(next_retry_at, Payload, null),
+      parked => false};
 project_event(#{event_type := 'workflow.completed'}, _Acc) ->
-    #{status => <<"completed">>, terminal => true, next_retry_at => null};
+    #{status => <<"completed">>, terminal => true,
+      next_retry_at => null, parked => false};
 project_event(#{event_type := 'workflow.failed'}, _Acc) ->
-    #{status => <<"failed">>, terminal => true, next_retry_at => null};
+    #{status => <<"failed">>, terminal => true,
+      next_retry_at => null, parked => false};
+project_event(#{event_type := 'workflow.cancelled'}, _Acc) ->
+    #{status => <<"cancelled">>, terminal => true,
+      next_retry_at => null, parked => false};
+project_event(#{event_type := 'workflow.parked'}, _Acc) ->
+    #{parked => true};
+project_event(#{event_type := 'workflow.resumed'}, _Acc) ->
+    #{parked => false};
 project_event(_Event, Acc) ->
     Acc.
 
@@ -532,6 +586,7 @@ backfill_one(RunId) ->
 write_backfill_projection(RunId, State) ->
     Status = atom_to_binary(maps:get(status, State, running), utf8),
     Terminal = maps:get(terminal, State, false),
+    Parked = maps:get(parked, State, false),
     NextRetry = case maps:get(next_retry_at, State, undefined) of
                     undefined -> null;
                     N -> N
@@ -541,9 +596,9 @@ write_backfill_projection(RunId, State) ->
                    epgsql:equery(
                      C,
                      "UPDATE workflow_runs SET status = $2, "
-                     "terminal = $3, next_retry_at_ms = $4 "
+                     "terminal = $3, next_retry_at_ms = $4, parked = $5 "
                      "WHERE run_id = $1",
-                     [RunId, Status, Terminal, NextRetry])
+                     [RunId, Status, Terminal, NextRetry, Parked])
            end) of
         {ok, 1} ->
             ok;
@@ -711,6 +766,12 @@ decode_event_type(<<"workflow.completed">>) ->
     {ok, 'workflow.completed'};
 decode_event_type(<<"workflow.failed">>) ->
     {ok, 'workflow.failed'};
+decode_event_type(<<"workflow.cancelled">>) ->
+    {ok, 'workflow.cancelled'};
+decode_event_type(<<"workflow.parked">>) ->
+    {ok, 'workflow.parked'};
+decode_event_type(<<"workflow.resumed">>) ->
+    {ok, 'workflow.resumed'};
 decode_event_type(<<"recovery.requeued">>) ->
     {ok, 'recovery.requeued'};
 decode_event_type(<<"recovery.skipped">>) ->

@@ -6,7 +6,7 @@
 -export([append_event/8, append_events/4, read_events/3, events/1,
          list_run_ids/0, list_run_ids/2, list_recoverable_run_ids/3]).
 -export([write_snapshot/4, read_snapshot/1]).
--export([acquire_lease/3, renew_lease/3, read_lease/1]).
+-export([acquire_lease/3, renew_lease/3, release_lease/2, read_lease/1]).
 -export([telemetry_counters/0]).
 -export([bump_counter/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
@@ -57,6 +57,9 @@ acquire_lease(RunId, Owner, TtlMs) ->
 
 renew_lease(RunId, FencingToken, TtlMs) ->
     gen_server:call(?MODULE, {renew_lease, RunId, FencingToken, TtlMs}).
+
+release_lease(RunId, FencingToken) ->
+    gen_server:call(?MODULE, {release_lease, RunId, FencingToken}).
 
 read_lease(RunId) ->
     gen_server:call(?MODULE, {read_lease, RunId}).
@@ -208,6 +211,22 @@ handle_call({read_lease, RunId}, _From, State) ->
             error -> not_found
         end,
     {reply, Reply, State};
+handle_call({release_lease, RunId, FencingToken}, _From, State) ->
+    Now = erlang:system_time(millisecond),
+    Leases = maps:get(leases, State),
+    case maps:get(RunId, Leases, undefined) of
+        undefined ->
+            {reply, {error, no_lease}, State};
+        #{fencing_token := FencingToken} = Lease ->
+            Lease1 = Lease#{lease_until := Now},
+            {reply, ok, State#{leases := maps:put(RunId, Lease1, Leases)}};
+        #{fencing_token := Current} when FencingToken < Current ->
+            {reply, {error, stale_fence}, State};
+        #{fencing_token := Current} ->
+            {reply, {error, {invalid_fence, #{provided => FencingToken,
+                                              current => Current}}},
+             State}
+    end;
 handle_call(telemetry_counters, _From, State) ->
     {reply, maps:get(counters, State), State};
 handle_call(_Request, _From, State) ->
@@ -305,7 +324,9 @@ update_projection(RunId, Events, Projections) ->
 %% code). It is a safe over-approximation: it never excludes a genuinely
 %% recoverable run.
 recoverable_candidate(Reduced, Lease, NowMs) ->
-    candidate_status(Reduced, NowMs) andalso lease_open(Lease, NowMs).
+    maps:get(parked, Reduced, false) =/= true
+        andalso candidate_status(Reduced, NowMs)
+        andalso lease_open(Lease, NowMs).
 
 candidate_status(Reduced, NowMs) ->
     case maps:get(terminal, Reduced, false) of

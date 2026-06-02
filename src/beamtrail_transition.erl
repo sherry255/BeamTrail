@@ -2,7 +2,8 @@
 
 -export([owner/0, dispatch_locked/3, dispatch_locked/4,
          dispatch_retrying/4,
-         finish_attempt/4, finish_attempt/5]).
+         finish_attempt/4, finish_attempt/5,
+         cancel_run/4, park_run/4, resume_run/3]).
 
 dispatch_locked(RunId, State, Lease) ->
     dispatch_locked(RunId, State, Lease, #{lease_heartbeat => internal}).
@@ -12,6 +13,19 @@ dispatch_locked(RunId, State, Lease, Options) ->
         false ->
             {error, stale_lease};
         true ->
+            case maps:get(terminal, State, false) of
+                true ->
+                    {ok, State};
+                false ->
+                    dispatch_unparked_locked(RunId, State, Lease, Options)
+            end
+    end.
+
+dispatch_unparked_locked(RunId, State, Lease, Options) ->
+    case maps:get(parked, State, false) of
+        true ->
+            {ok, State};
+        false ->
             case maps:get(migration_required_for_version_change, State, false) of
                 true ->
                     {error, {migration_required, State}};
@@ -35,6 +49,38 @@ finish_attempt(RunId, Lease, Attempt, Result, State)
   when is_map(Lease), is_map(Attempt), is_map(State) ->
     Options = #{runner_mode => finish, runner_state => State},
     finish_attempt_with_options(RunId, Lease, Attempt, Result, Options).
+
+cancel_run(_RunId, #{terminal := true}, _Lease, _Reason) ->
+    {error, terminal};
+cancel_run(RunId, State, Lease, Reason) ->
+    append_control_event(
+      RunId, State, Lease, 'workflow.cancelled',
+      #{reason => Reason,
+        class => cancelled,
+        cancelled_at => erlang:system_time(millisecond)},
+      true).
+
+park_run(_RunId, #{terminal := true}, _Lease, _Reason) ->
+    {error, terminal};
+park_run(_RunId, #{parked := true, parked_reason := Reason} = State,
+         _Lease, Reason) ->
+    {ok, State};
+park_run(RunId, State, Lease, Reason) ->
+    append_control_event(
+      RunId, State, Lease, 'workflow.parked',
+      #{reason => Reason,
+        parked_at => erlang:system_time(millisecond)},
+      false).
+
+resume_run(_RunId, #{terminal := true}, _Lease) ->
+    {error, terminal};
+resume_run(_RunId, #{parked := false} = State, _Lease) ->
+    {ok, State};
+resume_run(RunId, State, Lease) ->
+    append_control_event(
+      RunId, State, Lease, 'workflow.resumed',
+      #{resumed_at => erlang:system_time(millisecond)},
+      false).
 
 finish_attempt_with_options(RunId, Lease, Attempt, Result, Options) ->
     case Result of
@@ -444,6 +490,17 @@ append_attempt_callback_failure(RunId, State, Attempt, Callback, CallbackError,
             end;
         {ok, Events} ->
             {error, {unexpected_append_result, Events}};
+        {error, _} = Error ->
+            Error
+    end.
+
+append_control_event(RunId, State, Lease, EventType, Payload, ForceSnapshot) ->
+    case append_event(RunId, maps:get(last_event_seq, State, 0), Lease,
+                      EventType, undefined, undefined, undefined, Payload) of
+        {ok, Event} ->
+            State1 = apply_runtime_event(State, Event),
+            _ = maybe_snapshot_state(RunId, State1, ForceSnapshot),
+            {ok, State1};
         {error, _} = Error ->
             Error
     end.

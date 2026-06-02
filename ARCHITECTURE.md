@@ -38,6 +38,14 @@ the runner was accepted for execution; completion is observed later through
 The synchronous `beamtrail:dispatch/1` path remains an explicit low-level driver
 for tests and fallback tooling.
 
+Run-control APIs (`cancel_run/2`, `park_run/2`, `resume_run/1`, and
+`requeue_run/2`) are durable state transitions. A call first targets a local
+active runner, if one exists, so the runner can stop in-flight step execution and
+append the control event with its current lease. If there is no local runner, the
+API falls back to acquiring the storage lease and appending the event directly.
+Control APIs do not force a live remote owner; cross-node handoff still happens
+through lease expiry and fencing.
+
 `beamtrail_transition` is the durable transition layer. It decides which events
 to append for a state transition and applies those events to the reduced state.
 It is deliberately separate from `beamtrail_run` so the same transition rules can
@@ -69,6 +77,9 @@ Important event types:
 - `step.failed` records a failed attempt.
 - `retry.scheduled` records the retry decision and `next_retry_at`.
 - `workflow.completed` and `workflow.failed` are terminal decisions.
+- `workflow.cancelled` is a terminal operator decision.
+- `workflow.parked` and `workflow.resumed` gate automatic dispatch and recovery
+  without changing the underlying run status.
 - `recovery.requeued` records an observable recovery takeover decision.
 
 Failure decisions are written atomically. A failed step and its retry-or-terminal
@@ -127,12 +138,13 @@ To find recoverable runs without replaying every run, storage maintains a
 `run projection` index: per-run `status`, `terminal`, and `next_retry_at`,
 derived from the reducer and kept beside the run row. A scan queries that index
 for coarse candidates (not terminal, not waiting on a future retry, not currently
-leased) and pages over them. The lease is read live (a join, never denormalized,
-since leases are written in a separate transaction). The projection is a scan
-optimization in the same tier as snapshots: the event log stays authoritative,
-and the precise `recoverable/2` check is still applied to each candidate before a
-takeover. Because the index can only over-approximate (it omits the migration
-gate, which depends on live code), it never hides a genuinely recoverable run.
+leased, not parked) and pages over them. The lease is read live (a join, never
+denormalized, since leases are written in a separate transaction). The projection
+is a scan optimization in the same tier as snapshots: the event log stays
+authoritative, and the precise `recoverable/2` check is still applied to each
+candidate before a takeover. Because the index can only over-approximate (it
+omits the migration gate, which depends on live code), it never hides a genuinely
+recoverable run.
 
 An open `attempt.started` without a closing event is retried as the same attempt
 number with the same idempotency key. That preserves the attempt budget, but it
@@ -167,6 +179,21 @@ and refuses to advance it automatically.
 Completed steps are not re-executed, so completed-step version changes do not
 block later steps.
 
+## Run Control Boundary
+
+Cancellation is terminal. Once `workflow.cancelled` is appended, dispatch and
+recovery treat the run as closed and will not append `workflow.completed`.
+
+Parking is a separate gate, not a status. A parked run keeps its current
+underlying status (`running`, `retrying`, or `failed`), but dispatch and recovery
+refuse to advance it until `workflow.resumed` is appended. This is useful for
+operator intervention, migration review, and poison-run triage without losing the
+run's original execution state.
+
+Manual requeue uses the same durable recovery path as the scanner:
+`recovery.requeued` plus supervised runner dispatch. It refuses terminal and
+parked runs. Recovery budgets still apply to automatic recovery decisions.
+
 ## Current Limits
 
 BeamTrail currently supports linear step lists. It does not yet support dynamic
@@ -175,10 +202,10 @@ or step-result dataflow into later steps.
 
 The recovery scan is driven by the `run projection` index (see Recovery), so it
 avoids snapshot/replay work for every historical run. The PostgreSQL adapter
-keeps `status`, `terminal`, and `next_retry_at_ms` columns on `workflow_runs`,
-updated in the same transaction as the append, with a partial index on
-non-terminal runs and an index on lease expiry. Adapters that do not implement
-the optional
+keeps `status`, `terminal`, `next_retry_at_ms`, and `parked` columns on
+`workflow_runs`, updated in the same transaction as the append, with a partial
+index on non-terminal, non-parked runs and an index on lease expiry. Adapters
+that do not implement the optional
 `list_recoverable_run_ids/3` callback fall back to paging all run ids and
 replaying each, which is still correct. Runs created before the projection
 columns existed default to a safe over-approximating state and can be normalized

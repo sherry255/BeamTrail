@@ -22,6 +22,8 @@
     {ok, map()} | {error, term()}.
 -callback renew_lease(RunId :: binary(), FencingToken :: pos_integer(), TtlMs :: pos_integer()) ->
     {ok, map()} | {error, no_lease | stale_fence | term()}.
+-callback release_lease(RunId :: binary(), FencingToken :: pos_integer()) ->
+    ok | {error, no_lease | stale_fence | term()}.
 -callback read_lease(RunId :: binary()) -> {ok, map()} | not_found | {error, term()}.
 -callback list_run_ids() -> {ok, [binary()]} | {error, term()}.
 -callback list_run_ids(Cursor :: binary() | undefined, Limit :: pos_integer()) ->
@@ -44,5 +46,6 @@
            has_more := boolean()}} | {error, term()}.
 
 %% Optional observability accessors. Never part of the primary source of truth.
--optional_callbacks([list_recoverable_run_ids/3, telemetry_counters/0]).
+-optional_callbacks([release_lease/2, list_recoverable_run_ids/3,
+                     telemetry_counters/0]).
 -callback telemetry_counters() -> map().

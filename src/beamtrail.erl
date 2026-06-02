@@ -4,6 +4,7 @@
 -export([start_workflow/2, start_workflow/3, dispatch/1, dispatch/2,
          recover_unfinished/0]).
 -export([get_state/1, await_terminal/2, events/1, storage/0]).
+-export([cancel_run/2, park_run/2, resume_run/1, requeue_run/2]).
 -export([list_recoverable/0, list_recoverable/2,
          mark_recovery_requeued/1, mark_recovery_requeued_with_lease/1]).
 
@@ -66,21 +67,31 @@ dispatch(RunId) ->
     ok = ensure_storage(),
     case load_state(RunId) of
         {ok, State} ->
+            case maps:get(terminal, State, false) of
+                true ->
+                    {ok, State};
+                false ->
+                    dispatch_nonterminal(RunId, State)
+            end;
+        {error, _} = Error ->
+            Error
+    end.
+
+dispatch_nonterminal(RunId, State) ->
+    case maps:get(parked, State, false) of
+        true ->
+            {ok, State};
+        false ->
             case maps:get(status, State) of
                 completed ->
                     {ok, State};
                 failed ->
-                    case maps:get(terminal, State, false) of
-                        true -> {ok, State};
-                        false -> dispatch_with_new_lease(RunId, State)
-                    end;
+                    dispatch_with_new_lease(RunId, State);
                 retrying ->
                     dispatch_retrying(RunId, State, none);
                 _ ->
                     dispatch_with_new_lease(RunId, State)
-            end;
-        {error, _} = Error ->
-            Error
+            end
     end.
 
 dispatch(RunId, Lease) when is_map(Lease) ->
@@ -139,6 +150,108 @@ await_terminal_until(RunId, Deadline) ->
                     timer:sleep(min(20, Remaining)),
                     await_terminal_until(RunId, Deadline)
             end
+    end.
+
+cancel_run(RunId, Reason) ->
+    case control_local_runner(RunId, cancel, Reason) of
+        not_found -> cancel_run_with_new_lease(RunId, Reason);
+        Result -> Result
+    end.
+
+park_run(RunId, Reason) ->
+    case control_local_runner(RunId, park, Reason) of
+        not_found -> park_run_with_new_lease(RunId, Reason);
+        Result -> Result
+    end.
+
+resume_run(RunId) ->
+    case load_state(RunId) of
+        {ok, #{terminal := true}} ->
+            {error, terminal};
+        {ok, #{parked := false} = State} ->
+            {ok, State};
+        {ok, _State} ->
+            case resume_run_with_new_lease(RunId) of
+                {ok, State1} ->
+                    _ = dispatch_supervised(RunId),
+                    {ok, State1};
+                {error, _} = Error ->
+                    Error
+            end;
+        {error, _} = Error ->
+            Error
+    end.
+
+cancel_run_with_new_lease(RunId, Reason) ->
+    append_control_with_new_lease(
+      RunId,
+      fun(State, Lease) ->
+              beamtrail_transition:cancel_run(RunId, State, Lease, Reason)
+      end).
+
+park_run_with_new_lease(RunId, Reason) ->
+    append_control_with_new_lease(
+      RunId,
+      fun(State, Lease) ->
+              beamtrail_transition:park_run(RunId, State, Lease, Reason)
+      end).
+
+resume_run_with_new_lease(RunId) ->
+    append_control_with_new_lease(
+      RunId,
+      fun(State, Lease) ->
+              beamtrail_transition:resume_run(RunId, State, Lease)
+      end).
+
+requeue_run(RunId, _Reason) ->
+    case load_state(RunId) of
+        {ok, #{terminal := true}} ->
+            {error, terminal};
+        {ok, #{parked := true}} ->
+            {error, parked};
+        {ok, _State} ->
+            mark_recovery_requeued(RunId);
+        {error, _} = Error ->
+            Error
+    end.
+
+control_local_runner(RunId, Operation, Reason) ->
+    case whereis(beamtrail_run_registry) of
+        undefined ->
+            not_found;
+        _ ->
+            try beamtrail_run_registry:control(RunId, Operation, Reason) of
+                Result -> Result
+            catch
+                exit:{noproc, _} -> not_found;
+                exit:noproc -> not_found
+            end
+    end.
+
+append_control_with_new_lease(RunId, ControlFun) ->
+    ok = ensure_storage(),
+    case (storage()):acquire_lease(
+           RunId, beamtrail_transition:owner(),
+           beamtrail_lease_manager:default_ttl_ms()) of
+        {ok, Lease} ->
+            append_control_with_lease(RunId, Lease, ControlFun);
+        {error, _} = Error ->
+            Error
+    end.
+
+append_control_with_lease(RunId, Lease, ControlFun) ->
+    case load_state(RunId) of
+        {ok, State} ->
+            FencingToken = beamtrail_lease_manager:fencing_token(Lease),
+            case ControlFun(State, Lease) of
+                {ok, State1} ->
+                    _ = beamtrail_lease_manager:release(RunId, FencingToken),
+                    {ok, State1};
+                {error, _} = Error ->
+                    Error
+            end;
+        {error, _} = Error ->
+            Error
     end.
 
 load_state(RunId) ->
@@ -445,7 +558,9 @@ open_step_fold(#{event_type := Et, step_id := StepId}, Acc)
   when Et =:= 'step.succeeded'; Et =:= 'step.failed' ->
     maps:remove(StepId, Acc);
 open_step_fold(#{event_type := Et}, _Acc)
-  when Et =:= 'workflow.completed'; Et =:= 'workflow.failed' ->
+  when Et =:= 'workflow.completed';
+       Et =:= 'workflow.failed';
+       Et =:= 'workflow.cancelled' ->
     #{};
 open_step_fold(_, Acc) -> Acc.
 
@@ -453,11 +568,16 @@ recoverable(RunId, State) ->
     recoverable_state(State) andalso lease_recoverable(RunId).
 
 recoverable_state(State) ->
-    case maps:get(migration_required_for_version_change, State, false) of
+    case maps:get(terminal, State, false) orelse maps:get(parked, State, false) of
         true ->
             false;
         false ->
-            recoverable_by_status(State)
+            case maps:get(migration_required_for_version_change, State, false) of
+                true ->
+                    false;
+                false ->
+                    recoverable_by_status(State)
+            end
     end.
 
 recoverable_by_status(State) ->

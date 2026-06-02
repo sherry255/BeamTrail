@@ -5,7 +5,7 @@
 %% source of truth; this process only keeps the hot path alive between dispatch
 %% calls and retry timers while holding a renewable storage lease.
 
--export([start_link/1, dispatch/1, dispatch/2, info/1]).
+-export([start_link/1, dispatch/1, dispatch/2, control/3, info/1]).
 -export([callback_mode/0, init/1, handle_event/4, terminate/3, code_change/4]).
 
 start_link(RunId) ->
@@ -18,6 +18,9 @@ dispatch(Pid, undefined) ->
     gen_statem:cast(Pid, dispatch);
 dispatch(Pid, Lease) when is_map(Lease) ->
     gen_statem:cast(Pid, {dispatch, Lease}).
+
+control(Pid, Operation, Reason) ->
+    gen_statem:call(Pid, {control, Operation, Reason}, 30000).
 
 info(Pid) ->
     gen_statem:call(Pid, info, 1000).
@@ -43,6 +46,8 @@ handle_event(cast, dispatch, _StateName, Data) ->
     start_dispatch(Data);
 handle_event(cast, {dispatch, Lease}, _StateName, Data) ->
     start_dispatch(seed_lease(Lease, Data));
+handle_event({call, From}, {control, Operation, Reason}, StateName, Data) ->
+    handle_control(Operation, Reason, From, StateName, Data);
 handle_event({call, From}, info, StateName, Data) ->
     {keep_state, Data, [{reply, From, info_map(StateName, Data)}]};
 handle_event(internal, dispatch_now, executing, Data) ->
@@ -137,8 +142,56 @@ handle_step_result(Result, #{run_id := RunId, lease := Lease,
 handle_step_result(_Result, Data) ->
     {stop, normal, Data}.
 
+handle_control(Operation, Reason, From, _StateName, Data0) ->
+    cancel_dispatch(maps:get(dispatch, Data0, undefined)),
+    Data1 = cancel_heartbeat_timer(clear_retry_due(clear_step_execution(Data0))),
+    case ensure_lease(Data1) of
+        {ok, #{run_id := RunId, lease := Lease} = Data2} ->
+            case ensure_runner_state(Data2) of
+                {ok, #{state := State} = Data3} ->
+                    Reply = apply_control(Operation, RunId, State, Lease, Reason),
+                    Data4 = Data3#{dispatch := undefined,
+                                   attempt := undefined},
+                    case Reply of
+                        {ok, State1} ->
+                            FencingToken =
+                                beamtrail_lease_manager:fencing_token(Lease),
+                            _ = beamtrail_lease_manager:release(RunId,
+                                                                 FencingToken),
+                            {stop_and_reply, normal,
+                             [{reply, From, {ok, State1}}],
+                             Data4#{state := State1,
+                                    lease := undefined}};
+                        {error, _} = Error ->
+                            {stop_and_reply, normal, [{reply, From, Error}],
+                             Data4}
+                    end;
+                {error, _} = Error ->
+                    {stop_and_reply, normal, [{reply, From, Error}], Data2}
+            end;
+        {error, _} = Error ->
+            {stop_and_reply, normal, [{reply, From, Error}], Data1}
+    end.
+
+apply_control(cancel, RunId, State, Lease, Reason) ->
+    beamtrail_transition:cancel_run(RunId, State, Lease, Reason);
+apply_control(park, RunId, State, Lease, Reason) ->
+    beamtrail_transition:park_run(RunId, State, Lease, Reason);
+apply_control(resume, RunId, State, Lease, _Reason) ->
+    beamtrail_transition:resume_run(RunId, State, Lease);
+apply_control(Operation, _RunId, _State, _Lease, _Reason) ->
+    {error, {unknown_control, Operation}}.
+
 after_dispatch(State, Data0) ->
     Data = Data0#{state := State},
+    case maps:get(terminal, State, false) orelse maps:get(parked, State, false) of
+        true ->
+            {stop, normal, Data};
+        false ->
+            after_dispatch_nonterminal(State, Data)
+    end.
+
+after_dispatch_nonterminal(State, Data) ->
     case maps:get(status, State, undefined) of
         completed ->
             {stop, normal, Data};

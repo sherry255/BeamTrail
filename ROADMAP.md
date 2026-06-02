@@ -24,6 +24,8 @@ BeamTrail is a serious MVP. It has the core durable runtime shape:
 - crash-atomic failure decisions
 - bounded poison recovery
 - indexed recovery scans
+- durable run control APIs (`cancel_run/2`, `park_run/2`, `resume_run/1`,
+  `requeue_run/2`)
 - structured workflow callback failure handling
 
 It is still early. It supports linear step lists, not DAGs, fan-out, signals,
@@ -48,9 +50,15 @@ an Erlang library.
 BeamTrail should make failure and recovery operations explicit enough for real
 operators.
 
-- Add `cancel_run/2` with a durable terminal event.
-- Add `park_run/2` / `resume_run/1` for migration-blocked and poison runs.
-- Add manual retry or requeue APIs with clear fencing semantics.
+Implemented in v0.3:
+
+- `cancel_run/2` writes a durable terminal event.
+- `park_run/2` / `resume_run/1` gate and un-gate automatic dispatch and
+  recovery.
+- `requeue_run/2` provides a manual recovery trigger with fencing semantics.
+
+Remaining:
+
 - Add dead-letter style inspection for runs that exceeded recovery budget.
 - Emit structured `logger` events for runner stop reasons and recovery actions.
 - Expose standard telemetry measurements for run duration, step duration,

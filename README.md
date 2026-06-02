@@ -25,6 +25,7 @@ Current scope:
 - Retry backoff and step/workflow timeouts
 - Scanner recovery for unfinished attempts
 - Version mismatch gating during replay
+- Durable run control: cancel, park/resume, and manual requeue
 - Inspector data through `beamtrail_query:describe/1`
 
 Not in scope yet:
@@ -152,6 +153,26 @@ For explicit synchronous driving in tests or low-level tooling:
 {ok, FinalState} = beamtrail:dispatch(RunId).
 ```
 
+Run control APIs are durable events, not in-memory flags:
+
+```erlang
+{ok, Cancelled} = beamtrail:cancel_run(RunId, operator_cancel).
+{ok, Parked} = beamtrail:park_run(RunId, maintenance).
+{ok, Resumed} = beamtrail:resume_run(RunId).
+{ok, requeued} = beamtrail:requeue_run(RunId, manual).
+```
+
+`cancel_run/2` writes a terminal `workflow.cancelled` event. `park_run/2`
+writes `workflow.parked` and prevents dispatch and recovery from advancing the
+run. `resume_run/1` clears the parked gate with `workflow.resumed` and dispatches
+through the supervised runner path. `requeue_run/2` is a manual recovery trigger
+and refuses terminal or parked runs.
+
+Control calls first target a live active runner on the local BEAM node. If there
+is no local runner, they acquire the storage lease and append directly. They do
+not force-control a live runner on another node; in that case fencing and lease
+expiry remain the handoff boundary.
+
 Clean up the local container:
 
 ```sh
@@ -217,7 +238,7 @@ View = beamtrail_query:describe(RunId).
 
 `beamtrail_query:describe/1` returns the current reduced state, attempts,
 snapshot metadata, replay tail length, lease/fencing metadata, active runner
-metadata, recovery metadata, and the event list.
+metadata, run-control metadata, recovery metadata, and the event list.
 
 ## Configuration
 
