@@ -21,9 +21,11 @@ setup() ->
             ok
     end,
     ok = beamtrail_memory_storage:reset(),
+    ensure_runner_infra(),
     ok.
 
 cleanup(_) ->
+    stop_runner_infra(),
     ok = beamtrail_memory_storage:reset().
 
 successful_workflow_writes_append_only_events_and_snapshot() ->
@@ -32,6 +34,7 @@ successful_workflow_writes_append_only_events_and_snapshot() ->
 
     ?assertMatch({executed, charge, 1, {charge, <<"order-1">>}}, receive_exec()),
     ?assertMatch({executed, ship, 1, {ship, <<"order-1">>}}, receive_exec()),
+    ok = wait_for_status(RunId, completed, 1000),
 
     State = beamtrail:get_state(RunId),
     ?assertEqual(completed, maps:get(status, State)),
@@ -58,6 +61,7 @@ retry_uses_stable_idempotency_key_across_attempts() ->
 
     ?assertMatch({retry_execute, 1, {charge, <<"order-2">>}}, receive_exec()),
     ?assertMatch({retry_execute, 2, {charge, <<"order-2">>}}, receive_exec()),
+    ok = wait_for_status(RunId, completed, 1000),
 
     State = beamtrail:get_state(RunId),
     ?assertEqual(completed, maps:get(status, State)),
@@ -110,6 +114,7 @@ recovery_replays_unknown_attempt_with_recorded_step_version() ->
 step_timeout_records_observable_failure() ->
     Input = #{order_id => <<"order-4">>},
     {ok, RunId} = beamtrail:start_workflow(bt_timeout_workflow, Input),
+    ok = wait_for_status(RunId, failed, 1000),
 
     State = beamtrail:get_state(RunId),
     ?assertEqual(failed, maps:get(status, State)),
@@ -125,4 +130,55 @@ receive_exec() ->
         Message -> Message
     after 1000 ->
         timeout
+    end.
+
+wait_for_status(_RunId, _Target, Remaining) when Remaining =< 0 ->
+    {error, timeout};
+wait_for_status(RunId, Target, Remaining) ->
+    case maps:get(status, beamtrail:get_state(RunId)) of
+        Target ->
+            ok;
+        _ ->
+            timer:sleep(20),
+            wait_for_status(RunId, Target, Remaining - 20)
+    end.
+
+ensure_runner_infra() ->
+    case whereis(beamtrail_run_registry) of
+        undefined ->
+            {ok, Registry} = beamtrail_run_registry:start_link(),
+            unlink(Registry);
+        _ ->
+            ok
+    end,
+    case whereis(beamtrail_run_sup) of
+        undefined ->
+            {ok, RunSup} = beamtrail_run_sup:start_link(),
+            unlink(RunSup);
+        _ ->
+            ok
+    end.
+
+stop_runner_infra() ->
+    stop_registered(beamtrail_run_sup),
+    stop_registered(beamtrail_run_registry).
+
+stop_registered(Name) ->
+    case whereis(Name) of
+        undefined ->
+            ok;
+        Pid ->
+            exit(Pid, shutdown),
+            wait_until_stopped(Pid, 1000)
+    end.
+
+wait_until_stopped(_Pid, Remaining) when Remaining =< 0 ->
+    ok;
+wait_until_stopped(Pid, Remaining) ->
+    case is_process_alive(Pid) of
+        false ->
+            ok;
+        true ->
+            timer:sleep(20),
+            wait_until_stopped(Pid, Remaining - 20)
     end.

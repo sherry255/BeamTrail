@@ -43,12 +43,18 @@ start_workflow(Workflow, Input, Options) ->
 start_workflow_dispatch(RunId, Options) ->
     case maps:get(auto_dispatch, Options, true) of
         true ->
-            case dispatch(RunId) of
-                {ok, _State} -> {ok, RunId};
+            case dispatch_supervised(RunId) of
+                {ok, _Pid} -> {ok, RunId};
                 {error, Reason} -> {error, {dispatch_failed, RunId, Reason}}
             end;
         false ->
             {ok, RunId}
+    end.
+
+dispatch_supervised(RunId) ->
+    case whereis(beamtrail_run_sup) of
+        undefined -> {error, run_supervisor_not_started};
+        _ -> beamtrail_run_sup:dispatch(RunId)
     end.
 
 dispatch(RunId) ->

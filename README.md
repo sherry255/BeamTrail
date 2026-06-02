@@ -64,6 +64,9 @@ With the PostgreSQL adapter, BeamTrail guarantees:
   BeamTrail ignores it and replays from events.
 - Active runner processes are a fast path. PostgreSQL events, leases, fencing
   tokens, and snapshots remain the recovery boundary.
+- `start_workflow/3` dispatches to a supervised active runner by default.
+  `{ok, RunId}` means the run was durably created and accepted for execution;
+  it does not mean the workflow has already reached a terminal state.
 
 BeamTrail does not guarantee exactly-once side effects. Workflow code must use
 the idempotency key in the execution context when it calls external systems.
@@ -123,6 +126,15 @@ Run a workflow:
 
 State = beamtrail:get_state(RunId).
 View = beamtrail_query:describe(RunId).
+```
+
+For explicit synchronous driving in tests or low-level tooling:
+
+```erlang
+{ok, RunId} = beamtrail:start_workflow(my_workflow,
+                                       #{order_id => <<"o-1">>},
+                                       #{auto_dispatch => false}).
+{ok, FinalState} = beamtrail:dispatch(RunId).
 ```
 
 Clean up the local container:

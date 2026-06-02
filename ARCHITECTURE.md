@@ -31,6 +31,13 @@ loop for one run: acquiring or reusing a lease, preparing the next transition,
 starting step execution, handling retry timers, renewing the lease, and stopping
 when the run reaches a terminal state.
 
+`beamtrail:start_workflow/3` dispatches to this supervised runner path by
+default. Its `{ok, RunId}` return means the run creation event was committed and
+the runner was accepted for execution; completion is observed later through
+`beamtrail:get_state/1`, `beamtrail_query:describe/1`, events, or telemetry.
+The synchronous `beamtrail:dispatch/1` path remains an explicit low-level driver
+for tests and fallback tooling.
+
 `beamtrail_transition` is the durable transition layer. It decides which events
 to append for a state transition and applies those events to the reduced state.
 It is deliberately separate from `beamtrail_run` so the same transition rules can

@@ -12,6 +12,8 @@ extended_test_() ->
       fun scanner_scans_one_batch_at_a_time/0,
       fun worker_supervisor_rejects_when_pool_full/0,
       fun start_workflow_returns_error_for_duplicate_run_id/0,
+      fun start_workflow_returns_error_when_runner_supervisor_missing/0,
+      fun start_workflow_default_dispatches_supervised_runner_async/0,
       fun query_describe_exposes_read_model/0,
       fun query_instance_current_step_matches_reducer/0,
       fun telemetry_counters_track_attempts/0,
@@ -79,6 +81,7 @@ setup() ->
         _ -> ok
     end,
     ok = beamtrail_memory_storage:reset(),
+    ensure_runner_infra(),
     ok.
 
 cleanup(_) ->
@@ -115,6 +118,7 @@ cleanup(_) ->
 workflow_timeout_emits_workflow_failed() ->
     Input = #{order_id => <<"o-wt-1">>},
     {ok, RunId} = beamtrail:start_workflow(bt_workflow_timeout_workflow, Input),
+    ok = wait_for_status(RunId, failed, 1000),
     State = beamtrail:get_state(RunId),
     ?assertEqual(failed, maps:get(status, State)),
     {ok, Events} = beamtrail:events(RunId),
@@ -195,10 +199,49 @@ start_workflow_returns_error_for_duplicate_run_id() ->
                                           #{run_id => RunId,
                                             auto_dispatch => false})).
 
+start_workflow_returns_error_when_runner_supervisor_missing() ->
+    stop_registered(beamtrail_run_registry),
+    stop_registered(beamtrail_run_sup),
+    RunId = <<"missing-run-sup-run-1">>,
+    Input = #{order_id => <<"o-missing-run-sup-1">>},
+    ?assertEqual({error, {dispatch_failed, RunId, run_supervisor_not_started}},
+                 beamtrail:start_workflow(bt_success_workflow, Input,
+                                          #{run_id => RunId})).
+
+start_workflow_default_dispatches_supervised_runner_async() ->
+    ensure_runner_infra(),
+    RunId = <<"default-async-run-1">>,
+    Gate = default_async_gate,
+    Parent = self(),
+    Input = #{order_id => <<"o-default-async-1">>, test_pid => Parent,
+              gate => Gate},
+    Caller =
+        spawn(fun() ->
+                      Parent ! {start_result,
+                                beamtrail:start_workflow(
+                                  bt_blocking_success_workflow, Input,
+                                  #{run_id => RunId})}
+              end),
+    StartResultBeforeCompletion =
+        receive
+            {start_result, Result} -> Result
+        after 50 ->
+            timeout
+        end,
+    {blocking_started, ExecPid, 1} = receive_exec(),
+    {ok, Active} = beamtrail_run_registry:lookup(RunId),
+    ?assertEqual(RunId, maps:get(run_id, Active)),
+    ?assertEqual(executing, maps:get(status, Active)),
+    ExecPid ! {Gate, continue},
+    ok = wait_until_dead(Caller, 1000),
+    ?assertEqual({ok, RunId}, StartResultBeforeCompletion),
+    ok = wait_for_status(RunId, completed, 1000).
+
 query_describe_exposes_read_model() ->
     Input = #{order_id => <<"o-q-1">>, test_pid => self()},
     {ok, RunId} = beamtrail:start_workflow(bt_success_workflow, Input),
     _ = receive_exec(), _ = receive_exec(),
+    ok = wait_for_status(RunId, completed, 1000),
     Q = beamtrail_query:describe(RunId),
     ?assertEqual(completed, maps:get(status, Q)),
     ?assertEqual(RunId, maps:get(run_id, Q)),
@@ -237,8 +280,9 @@ query_instance_current_step_matches_reducer() ->
 
 telemetry_counters_track_attempts() ->
     Input = #{order_id => <<"o-t-1">>, test_pid => self()},
-    {ok, _RunId} = beamtrail:start_workflow(bt_success_workflow, Input),
+    {ok, RunId} = beamtrail:start_workflow(bt_success_workflow, Input),
     _ = receive_exec(), _ = receive_exec(),
+    ok = wait_for_status(RunId, completed, 1000),
     Counters = beamtrail_query:telemetry(),
     Started = maps:get([beamtrail, attempt, started], Counters, 0),
     Snap = maps:get([beamtrail, snapshot, written], Counters, 0),
@@ -362,6 +406,7 @@ snapshot_write_failure_is_nonfatal() ->
                  receive_exec()),
     ?assertMatch({executed, ship, 1, {ship, <<"o-snapshot-fail-1">>}},
                  receive_exec()),
+    ok = wait_for_status(RunId, completed, 1000),
     ?assertEqual(completed, maps:get(status, beamtrail:get_state(RunId))).
 
 load_state_ignores_obsolete_snapshot_revision() ->
@@ -572,10 +617,7 @@ scanner_rejects_invalid_interval() ->
     ?assertEqual(ok, beamtrail_scanner:set_interval(infinity)).
 
 active_runner_wakes_retry_without_scanner_tick() ->
-    {ok, Registry} = beamtrail_run_registry:start_link(),
-    unlink(Registry),
-    {ok, RunSup} = beamtrail_run_sup:start_link(),
-    unlink(RunSup),
+    ensure_runner_infra(),
     Input = #{order_id => <<"o-active-retry-1">>, test_pid => self()},
     {ok, RunId} = beamtrail:start_workflow(bt_retry_backoff_workflow, Input,
                                            #{run_id => <<"active-retry-run-1">>,
@@ -589,10 +631,7 @@ active_runner_wakes_retry_without_scanner_tick() ->
 
 active_runner_retry_timer_survives_heartbeat_and_lookup() ->
     ok = application:set_env(beamtrail, lease_ttl_ms, 60),
-    {ok, Registry} = beamtrail_run_registry:start_link(),
-    unlink(Registry),
-    {ok, RunSup} = beamtrail_run_sup:start_link(),
-    unlink(RunSup),
+    ensure_runner_infra(),
     Input = #{order_id => <<"o-active-retry-heartbeat-1">>, test_pid => self()},
     {ok, RunId} = beamtrail:start_workflow(bt_retry_heartbeat_backoff_workflow, Input,
                                            #{run_id => <<"active-retry-heartbeat-run-1">>,
@@ -619,10 +658,7 @@ active_runner_retry_timer_survives_heartbeat_and_lookup() ->
     ok = wait_for_status(RunId, completed, 1000).
 
 active_runner_heartbeat_uses_supplied_lease_ttl() ->
-    {ok, Registry} = beamtrail_run_registry:start_link(),
-    unlink(Registry),
-    {ok, RunSup} = beamtrail_run_sup:start_link(),
-    unlink(RunSup),
+    ensure_runner_infra(),
     Input = #{order_id => <<"o-active-short-lease-1">>, test_pid => self(),
               sleep_ms => 160},
     {ok, RunId} = beamtrail:start_workflow(bt_slow_success_workflow, Input,
@@ -638,10 +674,7 @@ active_runner_heartbeat_uses_supplied_lease_ttl() ->
 
 active_runner_supervisor_rejects_when_pool_full() ->
     ok = application:set_env(beamtrail, run_max_children, 1),
-    {ok, Registry} = beamtrail_run_registry:start_link(),
-    unlink(Registry),
-    {ok, RunSup} = beamtrail_run_sup:start_link(),
-    unlink(RunSup),
+    ensure_runner_infra(),
     Input1 = #{order_id => <<"o-active-pool-1">>, test_pid => self(),
                sleep_ms => 200},
     Input2 = #{order_id => <<"o-active-pool-2">>, test_pid => self(),
@@ -658,10 +691,7 @@ active_runner_supervisor_rejects_when_pool_full() ->
 
 active_runner_crash_allows_scanner_takeover_after_lease_expiry() ->
     ok = application:set_env(beamtrail, lease_ttl_ms, 80),
-    {ok, Registry} = beamtrail_run_registry:start_link(),
-    unlink(Registry),
-    {ok, RunSup} = beamtrail_run_sup:start_link(),
-    unlink(RunSup),
+    ensure_runner_infra(),
     Input = #{order_id => <<"o-active-crash-1">>, test_pid => self()},
     {ok, RunId} = beamtrail:start_workflow(bt_retry_backoff_workflow, Input,
                                            #{run_id => <<"active-crash-run-1">>,
@@ -682,10 +712,7 @@ active_runner_crash_allows_scanner_takeover_after_lease_expiry() ->
 active_runner_stops_step_when_lease_heartbeat_fails() ->
     ok = application:set_env(beamtrail, storage_adapter, bt_no_renew_storage),
     ok = application:set_env(beamtrail, lease_ttl_ms, 60),
-    {ok, Registry} = beamtrail_run_registry:start_link(),
-    unlink(Registry),
-    {ok, RunSup} = beamtrail_run_sup:start_link(),
-    unlink(RunSup),
+    ensure_runner_infra(),
     Input = #{order_id => <<"o-lease-lost-1">>, test_pid => self(),
               gate => lease_lost_gate},
     {ok, RunId} = beamtrail:start_workflow(bt_blocking_success_workflow, Input,
@@ -700,10 +727,7 @@ active_runner_stops_step_when_lease_heartbeat_fails() ->
                             maps:get(event_type, E) =:= 'step.succeeded'])).
 
 active_runner_records_step_timeout() ->
-    {ok, Registry} = beamtrail_run_registry:start_link(),
-    unlink(Registry),
-    {ok, RunSup} = beamtrail_run_sup:start_link(),
-    unlink(RunSup),
+    ensure_runner_infra(),
     Input = #{order_id => <<"o-active-timeout-1">>},
     {ok, RunId} = beamtrail:start_workflow(bt_timeout_workflow, Input,
                                            #{run_id => <<"active-timeout-run-1">>,
@@ -720,10 +744,7 @@ active_runner_records_step_timeout() ->
                             maps:get(event_type, E) =:= 'step.succeeded'])).
 
 active_runner_registry_exposes_live_state() ->
-    {ok, Registry} = beamtrail_run_registry:start_link(),
-    unlink(Registry),
-    {ok, RunSup} = beamtrail_run_sup:start_link(),
-    unlink(RunSup),
+    ensure_runner_infra(),
     Input = #{order_id => <<"o-active-inspect-1">>, test_pid => self()},
     {ok, RunId} = beamtrail:start_workflow(bt_retry_long_backoff_workflow, Input,
                                            #{run_id => <<"active-inspect-run-1">>,
@@ -744,10 +765,7 @@ active_runner_registry_exposes_live_state() ->
     ?assert(lists:any(fun(#{run_id := R}) -> R =:= RunId end, ActiveRuns)).
 
 query_describe_exposes_active_runner() ->
-    {ok, Registry} = beamtrail_run_registry:start_link(),
-    unlink(Registry),
-    {ok, RunSup} = beamtrail_run_sup:start_link(),
-    unlink(RunSup),
+    ensure_runner_infra(),
     Input = #{order_id => <<"o-query-active-1">>, test_pid => self()},
     {ok, RunId} = beamtrail:start_workflow(bt_retry_long_backoff_workflow, Input,
                                            #{run_id => <<"query-active-run-1">>,
@@ -768,10 +786,7 @@ query_describe_exposes_active_runner() ->
                  maps:get(active_runner, beamtrail_query:describe(RunId))).
 
 active_runner_stays_inspectable_while_step_executes() ->
-    {ok, Registry} = beamtrail_run_registry:start_link(),
-    unlink(Registry),
-    {ok, RunSup} = beamtrail_run_sup:start_link(),
-    unlink(RunSup),
+    ensure_runner_infra(),
     Gate = active_inspect_gate,
     Input = #{order_id => <<"o-active-executing-1">>, test_pid => self(),
               gate => Gate},
@@ -799,10 +814,7 @@ active_runner_stays_inspectable_while_step_executes() ->
 active_runner_reuses_loaded_state_across_steps() ->
     ok = application:set_env(beamtrail, storage_adapter, bt_counting_storage),
     bt_counting_storage:reset_counts(),
-    {ok, Registry} = beamtrail_run_registry:start_link(),
-    unlink(Registry),
-    {ok, RunSup} = beamtrail_run_sup:start_link(),
-    unlink(RunSup),
+    ensure_runner_infra(),
     Input = #{order_id => <<"o-active-state-cache-1">>, test_pid => self()},
     {ok, RunId} = beamtrail:start_workflow(bt_success_workflow, Input,
                                            #{run_id => <<"active-state-cache-run-1">>,
@@ -1168,6 +1180,7 @@ scanner_uses_indexed_recoverable_without_per_run_replay() ->
                 Input = #{order_id => OrderId, test_pid => self()},
                 {ok, RunId} = beamtrail:start_workflow(bt_success_workflow, Input),
                 _ = receive_exec(), _ = receive_exec(),
+                ok = wait_for_status(RunId, completed, 1000),
                 ?assertEqual(completed,
                              maps:get(status, beamtrail:get_state(RunId))),
                 RunId
@@ -1192,6 +1205,7 @@ recover_unfinished_uses_index_without_full_replay() ->
                 Input = #{order_id => OrderId, test_pid => self()},
                 {ok, RunId} = beamtrail:start_workflow(bt_success_workflow, Input),
                 _ = receive_exec(), _ = receive_exec(),
+                ok = wait_for_status(RunId, completed, 1000),
                 ?assertEqual(completed,
                              maps:get(status, beamtrail:get_state(RunId))),
                 RunId
@@ -1366,6 +1380,22 @@ wait_until_dead(Pid, Remaining) ->
         true ->
             timer:sleep(20),
             wait_until_dead(Pid, Remaining - 20)
+    end.
+
+ensure_runner_infra() ->
+    case whereis(beamtrail_run_registry) of
+        undefined ->
+            {ok, Registry} = beamtrail_run_registry:start_link(),
+            unlink(Registry);
+        _ ->
+            ok
+    end,
+    case whereis(beamtrail_run_sup) of
+        undefined ->
+            {ok, RunSup} = beamtrail_run_sup:start_link(),
+            unlink(RunSup);
+        _ ->
+            ok
     end.
 
 stop_registered(Name) ->
