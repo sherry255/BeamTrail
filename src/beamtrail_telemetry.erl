@@ -4,15 +4,20 @@
 
 execute(EventName, Measurements, Metadata) ->
     bump_storage_counter(EventName, Measurements),
-    case code:ensure_loaded(telemetry) of
-        {module, telemetry} ->
-            case erlang:function_exported(telemetry, execute, 3) of
-                true -> telemetry:execute(EventName, Measurements, Metadata);
+    Mod = telemetry_module(),
+    case code:ensure_loaded(Mod) of
+        {module, Mod} ->
+            case erlang:function_exported(Mod, execute, 3) of
+                true -> erlang:apply(Mod, execute,
+                                      [EventName, Measurements, Metadata]);
                 false -> ok
             end;
         _ ->
             ok
     end.
+
+telemetry_module() ->
+    list_to_atom("telemetry").
 
 %% Counters are an optional capability of the storage adapter. Adapters that
 %% want in-process counters (e.g. beamtrail_memory_storage) export

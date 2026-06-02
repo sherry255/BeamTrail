@@ -39,6 +39,23 @@ jobs:
       - name: Run unit tests
         run: rebar3 eunit
 
+  xref:
+    name: Xref
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Erlang/OTP
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: "28"
+          rebar3-version: "3.27.0"
+
+      - name: Run cross-reference analysis
+        run: rebar3 xref
+
   postgres:
     name: PostgreSQL Integration
     runs-on: ubuntu-latest
