@@ -37,19 +37,31 @@ Not in scope yet:
 
 ## Why BeamTrail
 
-BeamTrail is aimed at Erlang systems that want durable step execution without
-running a separate workflow service. Temporal and Cadence are broader systems:
-they provide service boundaries, SDKs, queues, visibility APIs, and richer
-workflow semantics. BeamTrail keeps the surface smaller and stays inside an OTP
-release.
+BeamTrail's goal is to become the Erlang/OTP-native durable step runner: smaller
+than Temporal, embedded in the BEAM, and built around OTP supervision plus a
+durable event log.
+
+Temporal and Cadence are broad workflow platforms. They provide service
+boundaries, SDKs, queues, visibility APIs, and rich workflow semantics. BeamTrail
+starts from the opposite direction: an Erlang application that already has an
+OTP release, supervisors, telemetry, and PostgreSQL, and wants durable business
+process execution without adding a separate workflow service.
 
 Oban is a durable job queue for Elixir. BeamTrail is lower level: each run is an
 event stream with replayed state, leases, fencing, snapshots, and supervised
 active runners. It is useful when the workflow history itself is the primary
 artifact, not only a queued job record.
 
+BeamTrail aims to win on the BEAM-specific axis first: embedded deployment, OTP
+process ownership, transparent failure semantics, and a small operational
+surface. It is not trying to match every Temporal feature before it becomes
+useful.
+
 For the OTP/process boundary and recovery model, see [Architecture and Failure
 Model](ARCHITECTURE.md).
+
+For planned work and contribution areas, see [Roadmap](ROADMAP.md) and
+[Contributing](CONTRIBUTING.md).
 
 ## Guarantees
 
