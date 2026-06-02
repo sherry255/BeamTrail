@@ -13,24 +13,12 @@ start_link(RunId, Lease) ->
     {ok, proc_lib:spawn_link(?MODULE, run, [RunId, Lease])}.
 
 run(RunId) ->
-    try dispatch_run(RunId, undefined) of
-        _ -> ok
-    catch
-        Class:Reason:Stack ->
-            error_logger:warning_msg(
-              "beamtrail_worker dispatch failed for ~p: ~p:~p ~p~n",
-              [RunId, Class, Reason, Stack])
-    end.
+    _ = dispatch_run(RunId, undefined),
+    ok.
 
 run(RunId, Lease) ->
-    try dispatch_run(RunId, Lease) of
-        _ -> ok
-    catch
-        Class:Reason:Stack ->
-            error_logger:warning_msg(
-              "beamtrail_worker dispatch failed for ~p: ~p:~p ~p~n",
-              [RunId, Class, Reason, Stack])
-    end.
+    _ = dispatch_run(RunId, Lease),
+    ok.
 
 dispatch_run(RunId, undefined) ->
     case whereis(beamtrail_run_registry) of
