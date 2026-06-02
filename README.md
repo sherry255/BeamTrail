@@ -266,6 +266,16 @@ Set application environment before starting `beamtrail`:
 rebar3 eunit
 ```
 
+Crash recovery demo:
+
+```sh
+examples/crash_recovery/run.sh
+```
+
+The demo starts PostgreSQL, kills an Erlang VM while a step attempt is open, then
+starts a second VM and uses the scanner's recovery primitive to complete the same
+attempt. See `examples/crash_recovery/README.md`.
+
 PostgreSQL integration tests:
 
 ```sh
