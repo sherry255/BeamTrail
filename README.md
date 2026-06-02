@@ -293,8 +293,9 @@ examples/pg_stress/run.sh
 ```
 
 The stress harness runs many short workflows against a real PostgreSQL adapter
-and prints completion counts, elapsed time, and pool state. It is a pressure
-smoke test, not a benchmark. See `examples/pg_stress/README.md`.
+and prints completion counts, terminal latency percentiles, sampled
+`describe/1` latency, elapsed time, and pool state. It is a pressure smoke test,
+not a benchmark. See `examples/pg_stress/README.md`.
 
 PostgreSQL integration tests:
 
