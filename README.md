@@ -5,8 +5,9 @@
 BeamTrail is a PostgreSQL-backed durable workflow runtime for Erlang/OTP.
 
 It records each workflow run as an append-only event stream, rebuilds state by
-reducing events, and executes a linear list of workflow steps with retries,
-timeouts, leases, fencing, snapshots, active runners, and scanner recovery.
+reducing events, and executes workflow steps with retries, timeouts, leases,
+fencing, snapshots, active runners, scanner recovery, and an optional
+event-sourced decider callback.
 
 ## Status
 
@@ -29,11 +30,13 @@ Current scope:
 - Inspector data through `beamtrail_query:describe/1`
 - Step result history exposed through the reducer state and inspector
 - Per-attempt step inputs persisted on `attempt.started`
+- Optional deterministic `decide/1` callback for one-command-at-a-time
+  step selection, completion, failure, and explicit step inputs
 
 Not in scope yet:
 
-- Branching, DAGs, or fan-out
-- Passing prior step results as later step inputs
+- DAGs, fan-out/fan-in, or parallel command batches
+- Durable timers, signals, or child workflows
 - HTTP API or browser UI
 - SQL-native JSON inspection
 - Built-in external side-effect deduplication
@@ -64,7 +67,7 @@ useful.
 For the OTP/process boundary and recovery model, see [Architecture and Failure
 Model](ARCHITECTURE.md).
 
-For the planned decider and step-result dataflow layer, see
+For the decider and step-result dataflow layer, see
 [Decider and Dataflow Design](DECIDER.md).
 
 For planned work and contribution areas, see [Roadmap](ROADMAP.md) and

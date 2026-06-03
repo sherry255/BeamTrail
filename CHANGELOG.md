@@ -17,6 +17,8 @@ are pre-stable and may include breaking API or storage changes.
   workflow input.
 - Internal legacy decider adapter that represents linear workflow progress as
   `run_step` or `complete` commands without changing existing behavior.
+- Optional workflow `decide/1` callback with command validation and dispatch
+  routing for one-command-at-a-time dataflow.
 
 ## [0.2.0-pre.1] - 2026-06-03
 

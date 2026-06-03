@@ -108,9 +108,21 @@ dispatch_not_timed_out(RunId, State, Lease, Options) ->
     end.
 
 dispatch_decision(RunId, State, Lease, Options) ->
-    case beamtrail_decider:legacy_decide(State) of
+    case beamtrail_decider:decide(State) of
+        {ok, Command} ->
+            dispatch_command(RunId, State, Lease, Options, Command);
+        {error, FailurePayload} ->
+            append_decider_failure(RunId, State, Lease, FailurePayload)
+    end.
+
+dispatch_command(RunId, State, Lease, Options, Command) ->
+    case Command of
         complete ->
             complete_if_needed(RunId, State, Lease);
+        {complete, Result} ->
+            complete_with_result(RunId, State, Lease, Result);
+        {fail, Reason} ->
+            fail_with_decider_reason(RunId, State, Lease, Reason);
         {run_step, StepId, StepInput} ->
             run_step(RunId, State, StepId, StepInput, Lease, Options)
     end.
@@ -177,6 +189,41 @@ complete_if_needed(RunId, State, Lease) ->
                 {error, _} = Error ->
                     Error
             end
+    end.
+
+complete_with_result(RunId, State, Lease, Result) ->
+    append_terminal_decision(
+      RunId, State, Lease, 'workflow.completed', undefined,
+      #{completed_at => erlang:system_time(millisecond),
+        result => Result}).
+
+fail_with_decider_reason(RunId, State, Lease, Reason) ->
+    append_terminal_decision(
+      RunId, State, Lease, 'workflow.failed', undefined,
+      #{reason => Reason,
+        class => error_key(Reason),
+        failed_at => erlang:system_time(millisecond)}).
+
+append_decider_failure(RunId, State, Lease, FailurePayload) ->
+    append_terminal_decision(
+      RunId, State, Lease, 'workflow.failed', undefined, FailurePayload).
+
+append_terminal_decision(RunId, State, Lease, EventType, StepId, Payload) ->
+    case append_event(
+           RunId,
+           maps:get(last_event_seq, State, 0),
+           Lease,
+           EventType,
+           StepId,
+           undefined,
+           undefined,
+           Payload) of
+        {ok, Event} ->
+            State1 = apply_runtime_event(State, Event),
+            _ = maybe_snapshot_state(RunId, State1, true),
+            {ok, State1};
+        {error, _} = Error ->
+            Error
     end.
 
 run_step(RunId, State, StepId, StepInput, Lease, Options) ->

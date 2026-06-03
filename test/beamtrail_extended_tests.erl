@@ -37,6 +37,11 @@ extended_test_() ->
       fun reducer_records_step_results_and_workflow_result/0,
       fun reducer_applies_cancelled_parked_and_resumed/0,
       fun legacy_decider_returns_linear_commands/0,
+      fun workflow_decider_validates_commands/0,
+      fun workflow_decider_catches_callback_errors/0,
+      fun workflow_decider_run_step_uses_command_step_input/0,
+      fun workflow_decider_invalid_command_fails_terminally/0,
+      fun workflow_decider_callback_error_fails_terminally/0,
       fun storage_lists_run_ids_with_cursor/0,
       fun storage_append_events_validates_each_event_fence/0,
       fun storage_rejects_expected_seq_conflict/0,
@@ -697,6 +702,87 @@ legacy_decider_returns_linear_commands() ->
                                             ChargeSucceeded, ShipStarted,
                                             ShipSucceeded]),
     ?assertEqual(complete, beamtrail_decider:legacy_decide(State2)).
+
+workflow_decider_validates_commands() ->
+    State = decider_state({run_step, charge, #{order_id => <<"o-step-input">>}}),
+    ?assertEqual({ok, {run_step, charge, #{order_id => <<"o-step-input">>}}},
+                 beamtrail_decider:decide(State)),
+    ?assertMatch(
+       {error, #{reason := invalid_decider_command,
+                 command := {run_step, refund, #{}}}},
+       beamtrail_decider:decide(decider_state({run_step, refund, #{}}))),
+    ?assertMatch(
+       {error, #{reason := invalid_decider_command,
+                 command := {sleep_until, retry_later, 1000}}},
+       beamtrail_decider:decide(
+         decider_state({sleep_until, retry_later, 1000}))),
+    ?assertMatch(
+       {error, #{reason := invalid_decider_command,
+                 command := <<"bad">>}},
+       beamtrail_decider:decide(decider_state(<<"bad">>))).
+
+workflow_decider_catches_callback_errors() ->
+    ?assertMatch(
+       {error, #{reason := bad_workflow_callback,
+                 callback := decide,
+                 callback_error := #{class := error, reason := decider_crash}}},
+       beamtrail_decider:decide(decider_state(crash))).
+
+workflow_decider_run_step_uses_command_step_input() ->
+    RunId = <<"decider-run-step-run-1">>,
+    StepInput = #{order_id => <<"o-decider-step-input-1">>,
+                  test_pid => self()},
+    Input = #{order_id => <<"o-decider-root-1">>,
+              command => {run_step, ship, StepInput}},
+    {ok, RunId} = beamtrail:start_workflow(bt_decider_workflow, Input,
+                                           #{run_id => RunId}),
+    ?assertMatch({executed, ship, 1,
+                  {ship, <<"o-decider-step-input-1">>},
+                  StepInput},
+                 receive_exec()),
+    {ok, State} = beamtrail:await_terminal(RunId, 1000),
+    ?assertEqual(completed, maps:get(status, State)),
+    {ok, Events} = beamtrail:events(RunId),
+    [Started] = [E || E <- Events, maps:get(event_type, E) =:= 'attempt.started'],
+    ?assertEqual(ship, maps:get(step_id, Started)),
+    ?assertEqual(StepInput, maps:get(step_input, maps:get(payload, Started))),
+    ?assertEqual(
+       ['workflow.instance.created', 'attempt.started', 'step.succeeded',
+        'workflow.completed'],
+       [maps:get(event_type, E) || E <- Events]).
+
+workflow_decider_invalid_command_fails_terminally() ->
+    RunId = <<"decider-invalid-run-1">>,
+    Input = #{order_id => <<"o-decider-invalid-1">>,
+              command => {run_step, refund, #{}}},
+    {ok, RunId} = beamtrail:start_workflow(bt_decider_workflow, Input,
+                                           #{run_id => RunId}),
+    {ok, State} = beamtrail:await_terminal(RunId, 1000),
+    ?assertEqual(failed, maps:get(status, State)),
+    ?assertEqual(true, maps:get(terminal, State)),
+    ?assertMatch(#{reason := invalid_decider_command,
+                   command := {run_step, refund, #{}}},
+                 maps:get(failure, State)),
+    {ok, Events} = beamtrail:events(RunId),
+    ?assertEqual(0, length([E || E <- Events,
+                            maps:get(event_type, E) =:= 'attempt.started'])).
+
+workflow_decider_callback_error_fails_terminally() ->
+    RunId = <<"decider-crash-run-1">>,
+    Input = #{order_id => <<"o-decider-crash-1">>, command => crash},
+    {ok, RunId} = beamtrail:start_workflow(bt_decider_workflow, Input,
+                                           #{run_id => RunId}),
+    {ok, State} = beamtrail:await_terminal(RunId, 1000),
+    ?assertEqual(failed, maps:get(status, State)),
+    ?assertEqual(true, maps:get(terminal, State)),
+    ?assertMatch(#{reason := bad_workflow_callback,
+                   callback := decide,
+                   callback_error := #{class := error,
+                                       reason := decider_crash}},
+                 maps:get(failure, State)),
+    {ok, Events} = beamtrail:events(RunId),
+    ?assertEqual(0, length([E || E <- Events,
+                            maps:get(event_type, E) =:= 'attempt.started'])).
 
 storage_lists_run_ids_with_cursor() ->
     {ok, _} = beamtrail:start_workflow(bt_timeout_workflow, #{order_id => <<"o-page-2">>},
@@ -1847,6 +1933,19 @@ seed_created(RunId, Workflow, Steps) ->
                 #{workflow => Workflow, input => #{order_id => RunId},
                   steps => Steps}),
     ok.
+
+decider_state(Command) ->
+    RunId = <<"decider-validation-run-1">>,
+    Input = #{order_id => <<"o-decider-validation-1">>,
+              command => Command},
+    beamtrail_reducer:from_events(
+      [#{run_id => RunId,
+         event_seq => 1,
+         event_type => 'workflow.instance.created',
+         payload => #{workflow => bt_decider_workflow,
+                      input => Input,
+                      steps => [charge, ship]},
+         occurred_at => 1}]).
 
 seed_migration_blocked(RunId) ->
     seed_created(RunId, bt_versioned_workflow, [charge]),

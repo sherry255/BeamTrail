@@ -97,10 +97,13 @@ future decider workflows can choose a different input before crossing the
 execution boundary. Recovery of an open attempt reuses the persisted
 `step_input` and does not re-run the decider.
 
-The current linear plan is already routed through an internal legacy decider
-adapter. That adapter turns the reduced state into `complete` or
+The current linear plan is routed through an internal legacy decider adapter.
+That adapter turns the reduced state into `complete` or
 `{run_step, StepId, StepInput}` commands, preserving the old behavior while
-making the transition loop decider-shaped.
+making the transition loop decider-shaped. Workflow modules may also implement
+optional `decide/1`; BeamTrail validates its command before appending anything,
+and invalid commands or decider callback crashes become terminal workflow
+failures before an attempt is opened.
 
 Workflow callback errors are captured at the engine boundary. `steps/1` errors
 return a structured create failure before the run is written. Runtime callback
@@ -212,17 +215,17 @@ parked runs. Recovery budgets still apply to automatic recovery decisions.
 
 ## Current Limits
 
-BeamTrail currently supports linear step lists. Step results are retained and
-queryable, and each attempt persists its chosen `step_input`, but legacy linear
-workflows still pass the original workflow input to every step. BeamTrail does
-not yet support dynamic workflow control flow, branching, DAGs, fan-out/fan-in,
-child workflows, or signals.
+BeamTrail supports linear step lists and an optional event-sourced decider that
+returns one durable command at a time. Step results are retained and queryable,
+and each attempt persists its chosen `step_input`. Legacy linear workflows still
+pass the original workflow input to every step; decider workflows can choose
+explicit step inputs from the reduced view.
 
-The planned next orchestration boundary is an event-sourced decider plus
-step-result dataflow. The decider is deliberately not a Temporal-style arbitrary
-workflow-code replay system; it is a deterministic callback over a reduced view
-that returns the next durable command. See [Decider and Dataflow
-Design](DECIDER.md).
+The decider is deliberately not a Temporal-style arbitrary workflow-code replay
+system; it is a deterministic callback over a reduced view that returns the next
+durable command. BeamTrail does not yet support DAGs, fan-out/fan-in, parallel
+command batches, child workflows, durable timers, or signals. See
+[Decider and Dataflow Design](DECIDER.md).
 
 The recovery scan is driven by the `run projection` index (see Recovery), so it
 avoids snapshot/replay work for every historical run. The PostgreSQL adapter
