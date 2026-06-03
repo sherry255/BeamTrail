@@ -85,7 +85,8 @@ process ownership, transparent failure semantics, and a small operational
 surface. It is not trying to match every Temporal feature before it becomes
 useful.
 
-Design docs: [Architecture and Failure Model](ARCHITECTURE.md),
+Design docs: [Design Rationale](design-rationale.md),
+[Architecture and Failure Model](ARCHITECTURE.md),
 [Decider and Dataflow Design](DECIDER.md), [Durable Timer Design](TIMER.md),
 [Human Approval Deadline Pattern](APPROVAL.md), [Roadmap](ROADMAP.md), and
 [Contributing](CONTRIBUTING.md).
