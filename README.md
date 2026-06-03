@@ -36,11 +36,14 @@ Current scope:
   version exposed through `beamtrail_query:describe/1`
 - Minimal durable signals: `signal_run/3` records `signal.received`, while
   decider workflows can return `{wait, Reason}` to stop until a signal arrives
+- Scanner-driven durable timers: decider workflows can return `{sleep, TimerId,
+  DelayMs}` or `{sleep_until, TimerId, FireAtMs}`; due timers materialize as
+  `timer.fired` events before the decider continues
 
 Not in scope yet:
 
 - DAGs, fan-out/fan-in, or parallel command batches
-- Durable timers or child workflows
+- Timer cancellation, recurring timers, or child workflows
 - HTTP API or browser UI
 - SQL-native JSON inspection
 - Built-in external side-effect deduplication
@@ -74,7 +77,7 @@ Model](ARCHITECTURE.md).
 For the decider and step-result dataflow layer, see
 [Decider and Dataflow Design](DECIDER.md).
 
-For the next durable timer primitive, see [Durable Timer Design](TIMER.md).
+For the durable timer primitive, see [Durable Timer Design](TIMER.md).
 
 For planned work and contribution areas, see [Roadmap](ROADMAP.md) and
 [Contributing](CONTRIBUTING.md).

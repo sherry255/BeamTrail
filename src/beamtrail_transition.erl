@@ -30,7 +30,13 @@ dispatch_unparked_locked(RunId, State, Lease, Options) ->
                 true ->
                     {error, {migration_required, State}};
                 false ->
-                    dispatch_ready(RunId, State, Lease, Options)
+                    case fire_due_timers(RunId, State, Lease) of
+                        {ok, State1} ->
+                            dispatch_ready(RunId, State1, Lease,
+                                           Options#{runner_state => State1});
+                        {error, _} = Error ->
+                            Error
+                    end
             end
     end.
 
@@ -125,8 +131,117 @@ dispatch_command(RunId, State, Lease, Options, Command) ->
             fail_with_decider_reason(RunId, State, Lease, Reason);
         {wait, Reason} ->
             wait_for_signal(RunId, State, Lease, Reason);
+        {sleep, TimerId, DelayMs} ->
+            schedule_timer(RunId, State, Lease, Options, sleep, TimerId,
+                           erlang:system_time(millisecond) + DelayMs);
+        {sleep_until, TimerId, FireAtMs} ->
+            schedule_timer(RunId, State, Lease, Options, sleep_until, TimerId,
+                           FireAtMs);
         {run_step, StepId, StepInput} ->
             run_step(RunId, State, StepId, StepInput, Lease, Options)
+    end.
+
+fire_due_timers(RunId, State, Lease) ->
+    Now = erlang:system_time(millisecond),
+    Due = due_timers(State, Now),
+    case Due of
+        [] ->
+            {ok, State};
+        _ ->
+            RemainingWake = next_wake_after_firing(State, Due),
+            EventSpecs =
+                [event_spec('timer.fired', undefined, undefined, undefined,
+                            #{timer_id => TimerId,
+                              fire_at_ms => FireAtMs,
+                              fired_at => Now,
+                              next_wake_at => RemainingWake})
+                 || {TimerId, FireAtMs} <- Due],
+            case append_events(RunId, maps:get(last_event_seq, State, 0),
+                               Lease, EventSpecs) of
+                {ok, Events} when length(Events) =:= length(EventSpecs) ->
+                    State1 = apply_runtime_events(State, Events),
+                    _ = maybe_snapshot_state(RunId, State1, false),
+                    {ok, State1};
+                {ok, Events} ->
+                    {error, {unexpected_append_result, Events}};
+                {error, _} = Error ->
+                    Error
+            end
+    end.
+
+due_timers(State, Now) ->
+    Timers = maps:get(timers, State, #{}),
+    lists:sort(
+      [{TimerId, FireAtMs}
+       || {TimerId, #{status := scheduled, fire_at_ms := FireAtMs}} <- maps:to_list(Timers),
+          is_integer(FireAtMs),
+          FireAtMs =< Now]).
+
+next_wake_after_firing(State, Due) ->
+    DueIds = maps:from_list([{TimerId, true} || {TimerId, _FireAtMs} <- Due]),
+    Pending =
+        [FireAtMs
+         || {TimerId, #{status := scheduled, fire_at_ms := FireAtMs}}
+                <- maps:to_list(maps:get(timers, State, #{})),
+            maps:is_key(TimerId, DueIds) =:= false,
+            is_integer(FireAtMs)],
+    case Pending of
+        [] -> undefined;
+        _ -> lists:min(Pending)
+    end.
+
+schedule_timer(RunId, State, Lease, Options, SourceCommand, TimerId, FireAtMs) ->
+    Timers = maps:get(timers, State, #{}),
+    case maps:get(TimerId, Timers, undefined) of
+        undefined ->
+            append_timer_scheduled(RunId, State, Lease, Options, SourceCommand,
+                                   TimerId, FireAtMs);
+        #{status := scheduled, fire_at_ms := FireAtMs} ->
+            dispatch_decision(RunId, State, Lease, Options);
+        #{status := scheduled} ->
+            append_decider_failure(
+              RunId, State, Lease,
+              #{reason => invalid_decider_command,
+                class => invalid_decider_command,
+                command => {SourceCommand, TimerId, FireAtMs},
+                timer_error => conflicting_timer_deadline});
+        #{status := fired} ->
+            append_decider_failure(
+              RunId, State, Lease,
+              #{reason => invalid_decider_command,
+                class => invalid_decider_command,
+                command => {SourceCommand, TimerId, FireAtMs},
+                timer_error => timer_already_fired})
+    end.
+
+append_timer_scheduled(RunId, State, Lease, Options, SourceCommand, TimerId,
+                       FireAtMs) ->
+    Now = erlang:system_time(millisecond),
+    NextWakeAt = next_wake_after_scheduling(State, FireAtMs),
+    Payload =
+        #{timer_id => TimerId,
+          fire_at_ms => FireAtMs,
+          scheduled_at => Now,
+          source_command => SourceCommand,
+          next_wake_at => NextWakeAt},
+    case append_event(RunId, maps:get(last_event_seq, State, 0), Lease,
+                      'timer.scheduled', undefined, undefined, undefined,
+                      Payload) of
+        {ok, Event} ->
+            State1 = apply_runtime_event(State, Event),
+            _ = maybe_snapshot_state(RunId, State1, false),
+            dispatch_decision(RunId, State1, Lease,
+                              Options#{runner_state => State1});
+        {error, _} = Error ->
+            Error
+    end.
+
+next_wake_after_scheduling(State, FireAtMs) ->
+    case maps:get(next_wake_at, State, undefined) of
+        Existing when is_integer(Existing), Existing =< FireAtMs ->
+            Existing;
+        _ ->
+            FireAtMs
     end.
 
 workflow_timeout_exceeded(State) ->

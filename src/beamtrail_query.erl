@@ -88,6 +88,8 @@ describe_loaded_events(RunId, Mod, State, Events) ->
       signals => maps:get(signals, State, []),
       wait_reason => maps:get(wait_reason, State, undefined),
       waiting_since => maps:get(waiting_since, State, undefined),
+      timers => maps:get(timers, State, #{}),
+      next_wake_at => maps:get(next_wake_at, State, undefined),
       migration_required_for_version_change =>
           maps:get(migration_required_for_version_change, State, false),
       pending_attempt => maps:get(pending_attempt, State, undefined),
@@ -273,6 +275,7 @@ instance_from_state(State) ->
       current_step => maps:get(current_step, State),
       last_event_seq => maps:get(last_event_seq, State, 0),
       next_retry_at => maps:get(next_retry_at, State, undefined),
+      next_wake_at => maps:get(next_wake_at, State, undefined),
       failure => maps:get(failure, State, undefined),
       parked => maps:get(parked, State, false),
       parked_reason => maps:get(parked_reason, State, undefined),

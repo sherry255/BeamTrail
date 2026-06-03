@@ -236,7 +236,7 @@ list_recoverable_run_ids(Cursor, Limit, NowMs) ->
       end).
 
 %% Coarse recovery candidates at NowMs: not terminal, not parked, not waiting
-%% for a signal, not waiting on a future retry, and not currently leased. The
+%% on a future retry/timer wake, and not currently leased. The
 %% lease is read live via LEFT JOIN (never denormalized into workflow_runs,
 %% which is updated in a different transaction).
 %% Mirrors beamtrail:recoverable_by_status/1 + lease_recoverable/1, minus the
@@ -246,7 +246,7 @@ recoverable_query(undefined, Limit, NowMs) ->
      "LEFT JOIN workflow_leases l ON l.run_id = r.run_id "
      "WHERE r.terminal = false "
      "AND r.parked = false "
-     "AND r.status <> 'waiting' "
+     "AND (r.status <> 'waiting' OR r.next_wake_at_ms <= $1) "
      "AND (r.status <> 'retrying' OR r.next_retry_at_ms <= $1) "
      "AND (l.lease_until_ms IS NULL OR l.lease_until_ms <= $1) "
      "ORDER BY r.run_id LIMIT $2",
@@ -256,7 +256,7 @@ recoverable_query(Cursor, Limit, NowMs) ->
      "LEFT JOIN workflow_leases l ON l.run_id = r.run_id "
      "WHERE r.terminal = false "
      "AND r.parked = false "
-     "AND r.status <> 'waiting' "
+     "AND (r.status <> 'waiting' OR r.next_wake_at_ms <= $1) "
      "AND (r.status <> 'retrying' OR r.next_retry_at_ms <= $1) "
      "AND (l.lease_until_ms IS NULL OR l.lease_until_ms <= $1) "
      "AND r.run_id > $2 "
@@ -480,6 +480,23 @@ update_run_after_append(C, RunId, Events, UpdatedAt) ->
         #{status := Status,
           terminal := Terminal,
           next_retry_at := NextRetry,
+          next_wake_at := NextWake,
+          parked := Parked} ->
+            case epgsql:equery(
+                   C,
+                   "UPDATE workflow_runs SET updated_at_ms = $2, status = $3, "
+                   "terminal = $4, next_retry_at_ms = $5, "
+                   "next_wake_at_ms = $6, parked = $7 "
+                   "WHERE run_id = $1",
+                   [RunId, UpdatedAt, Status, Terminal, NextRetry, NextWake,
+                    Parked]) of
+                {ok, 1} -> ok;
+                {ok, 0} -> {error, run_lock_missing};
+                {error, Reason} -> {error, Reason}
+            end;
+        #{status := Status,
+          terminal := Terminal,
+          next_retry_at := NextRetry,
           parked := Parked} ->
             case epgsql:equery(
                    C,
@@ -487,6 +504,16 @@ update_run_after_append(C, RunId, Events, UpdatedAt) ->
                    "terminal = $4, next_retry_at_ms = $5, parked = $6 "
                    "WHERE run_id = $1",
                    [RunId, UpdatedAt, Status, Terminal, NextRetry, Parked]) of
+                {ok, 1} -> ok;
+                {ok, 0} -> {error, run_lock_missing};
+                {error, Reason} -> {error, Reason}
+            end;
+        #{next_wake_at := NextWake} ->
+            case epgsql:equery(
+                   C,
+                   "UPDATE workflow_runs SET updated_at_ms = $2, "
+                   "next_wake_at_ms = $3 WHERE run_id = $1",
+                   [RunId, UpdatedAt, NextWake]) of
                 {ok, 1} -> ok;
                 {ok, 0} -> {error, run_lock_missing};
                 {error, Reason} -> {error, Reason}
@@ -512,41 +539,56 @@ run_projection(Events) ->
 
 project_event(#{event_type := 'workflow.instance.created'}, _Acc) ->
     #{status => <<"running">>, terminal => false,
-      next_retry_at => null, parked => false};
-project_event(#{event_type := 'attempt.started'}, _Acc) ->
-    #{status => <<"running">>, terminal => false,
-      next_retry_at => null, parked => false};
-project_event(#{event_type := 'step.succeeded'}, _Acc) ->
-    #{status => <<"running">>, terminal => false,
-      next_retry_at => null, parked => false};
-project_event(#{event_type := 'step.failed'}, _Acc) ->
-    #{status => <<"failed">>, terminal => false,
-      next_retry_at => null, parked => false};
-project_event(#{event_type := 'retry.scheduled', payload := Payload}, _Acc) ->
-    #{status => <<"retrying">>, terminal => false,
-      next_retry_at => maps:get(next_retry_at, Payload, null),
-      parked => false};
-project_event(#{event_type := 'workflow.waiting'}, _Acc) ->
-    #{status => <<"waiting">>, terminal => false,
-      next_retry_at => null, parked => false};
-project_event(#{event_type := 'signal.received'}, _Acc) ->
-    #{status => <<"running">>, terminal => false,
-      next_retry_at => null, parked => false};
+      next_retry_at => null, next_wake_at => null, parked => false};
+project_event(#{event_type := 'attempt.started'}, Acc) ->
+    project_status(<<"running">>, false, null, false, Acc);
+project_event(#{event_type := 'step.succeeded'}, Acc) ->
+    project_status(<<"running">>, false, null, false, Acc);
+project_event(#{event_type := 'timer.scheduled', payload := Payload}, Acc) ->
+    project_next_wake(maps:get(next_wake_at, Payload,
+                               maps:get(fire_at_ms, Payload, null)),
+                      Acc);
+project_event(#{event_type := 'timer.fired', payload := Payload}, Acc) ->
+    project_next_wake(maps:get(next_wake_at, Payload, null), Acc);
+project_event(#{event_type := 'step.failed'}, Acc) ->
+    project_status(<<"failed">>, false, null, false, Acc);
+project_event(#{event_type := 'retry.scheduled', payload := Payload}, Acc) ->
+    project_status(<<"retrying">>, false,
+                   maps:get(next_retry_at, Payload, null), false, Acc);
+project_event(#{event_type := 'workflow.waiting'}, Acc) ->
+    project_status(<<"waiting">>, false, null, false, Acc);
+project_event(#{event_type := 'signal.received'}, Acc) ->
+    project_status(<<"running">>, false, null, false, Acc);
 project_event(#{event_type := 'workflow.completed'}, _Acc) ->
     #{status => <<"completed">>, terminal => true,
-      next_retry_at => null, parked => false};
+      next_retry_at => null, next_wake_at => null, parked => false};
 project_event(#{event_type := 'workflow.failed'}, _Acc) ->
     #{status => <<"failed">>, terminal => true,
-      next_retry_at => null, parked => false};
+      next_retry_at => null, next_wake_at => null, parked => false};
 project_event(#{event_type := 'workflow.cancelled'}, _Acc) ->
     #{status => <<"cancelled">>, terminal => true,
-      next_retry_at => null, parked => false};
+      next_retry_at => null, next_wake_at => null, parked => false};
 project_event(#{event_type := 'workflow.parked'}, _Acc) ->
     #{parked => true};
 project_event(#{event_type := 'workflow.resumed'}, _Acc) ->
     #{parked => false};
 project_event(_Event, Acc) ->
     Acc.
+
+project_status(Status, Terminal, NextRetry, Parked, Acc) ->
+    Base = #{status => Status, terminal => Terminal,
+             next_retry_at => NextRetry, parked => Parked},
+    case Acc of
+        #{next_wake_at := NextWake} ->
+            Base#{next_wake_at => NextWake};
+        _ ->
+            Base
+    end.
+
+project_next_wake(NextWake, no_change) ->
+    #{next_wake_at => NextWake};
+project_next_wake(NextWake, Acc) ->
+    Acc#{next_wake_at => NextWake}.
 
 %% One-time normalization for runs that predate the projection columns: replays
 %% each run through the reducer and writes its current projection. Safe to run
@@ -599,14 +641,19 @@ write_backfill_projection(RunId, State) ->
                     undefined -> null;
                     N -> N
                 end,
+    NextWake = case maps:get(next_wake_at, State, undefined) of
+                   undefined -> null;
+                   W -> W
+               end,
     case with_connection(
            fun(C) ->
                    epgsql:equery(
                      C,
                      "UPDATE workflow_runs SET status = $2, "
-                     "terminal = $3, next_retry_at_ms = $4, parked = $5 "
+                     "terminal = $3, next_retry_at_ms = $4, "
+                     "next_wake_at_ms = $5, parked = $6 "
                      "WHERE run_id = $1",
-                     [RunId, Status, Terminal, NextRetry, Parked])
+                     [RunId, Status, Terminal, NextRetry, NextWake, Parked])
            end) of
         {ok, 1} ->
             ok;
@@ -772,6 +819,10 @@ decode_event_type(<<"step.failed">>) ->
     {ok, 'step.failed'};
 decode_event_type(<<"retry.scheduled">>) ->
     {ok, 'retry.scheduled'};
+decode_event_type(<<"timer.scheduled">>) ->
+    {ok, 'timer.scheduled'};
+decode_event_type(<<"timer.fired">>) ->
+    {ok, 'timer.fired'};
 decode_event_type(<<"workflow.waiting">>) ->
     {ok, 'workflow.waiting'};
 decode_event_type(<<"signal.received">>) ->

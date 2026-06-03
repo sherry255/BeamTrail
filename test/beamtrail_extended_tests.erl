@@ -47,6 +47,11 @@ extended_test_() ->
       fun workflow_decider_run_step_uses_command_step_input/0,
       fun workflow_decider_branches_on_prior_step_result/0,
       fun workflow_decider_waits_for_durable_signal/0,
+      fun workflow_decider_schedules_timer_then_waits/0,
+      fun waiting_timer_becomes_recoverable_when_due/0,
+      fun due_timer_fires_before_decider_continues/0,
+      fun conflicting_timer_deadline_fails_terminally/0,
+      fun fired_timer_id_reuse_fails_terminally/0,
       fun workflow_decider_invalid_command_fails_terminally/0,
       fun workflow_decider_callback_error_fails_terminally/0,
       fun storage_lists_run_ids_with_cursor/0,
@@ -790,11 +795,22 @@ workflow_decider_validates_commands() ->
        {error, #{reason := invalid_decider_command,
                  command := {run_step, refund, #{}}}},
        beamtrail_decider:decide(decider_state({run_step, refund, #{}}))),
+    ?assertEqual({ok, {sleep_until, retry_later, 1000}},
+                 beamtrail_decider:decide(
+                   decider_state({sleep_until, retry_later, 1000}))),
+    ?assertEqual({ok, {sleep, retry_later, 1000}},
+                 beamtrail_decider:decide(
+                   decider_state({sleep, retry_later, 1000}))),
     ?assertMatch(
        {error, #{reason := invalid_decider_command,
-                 command := {sleep_until, retry_later, 1000}}},
+                 command := {sleep, {bad, id}, 1000}}},
        beamtrail_decider:decide(
-         decider_state({sleep_until, retry_later, 1000}))),
+         decider_state({sleep, {bad, id}, 1000}))),
+    ?assertMatch(
+       {error, #{reason := invalid_decider_command,
+                 command := {sleep_until, retry_later, -1}}},
+       beamtrail_decider:decide(
+         decider_state({sleep_until, retry_later, -1}))),
     ?assertMatch(
        {error, #{reason := invalid_decider_command,
                  command := <<"bad">>}},
@@ -905,6 +921,105 @@ workflow_decider_waits_for_durable_signal() ->
                     payload := #{approved_by := <<"ops">>}}],
                  maps:get(signals, Q)),
     ?assertEqual(waiting_for_approval, maps:get(wait_reason, Q)).
+
+workflow_decider_schedules_timer_then_waits() ->
+    RunId = <<"decider-timer-wait-run-1">>,
+    Before = erlang:system_time(millisecond),
+    Input = #{order_id => <<"o-timer-wait-1">>,
+              timer_id => approval_deadline,
+              delay_ms => 60000},
+    {ok, RunId} = beamtrail:start_workflow(bt_timer_workflow, Input,
+                                           #{run_id => RunId}),
+    {ok, Waiting} = wait_for_state(RunId, waiting, 1000),
+    ?assertMatch(#{terminal := false,
+                   wait_reason := waiting_for_timer,
+                   next_wake_at := WakeAt,
+                   timers := #{approval_deadline :=
+                                   #{status := scheduled,
+                                     fire_at_ms := WakeAt}}}
+                   when is_integer(WakeAt) andalso WakeAt >= Before + 60000,
+                 Waiting),
+    {ok, Events} = beamtrail:events(RunId),
+    ?assertEqual(
+       ['workflow.instance.created',
+        'timer.scheduled',
+        'workflow.waiting'],
+       [maps:get(event_type, E) || E <- Events]),
+    Q = beamtrail_query:describe(RunId),
+    ?assertMatch(#{approval_deadline := #{status := scheduled}},
+                 maps:get(timers, Q)),
+    ?assertEqual(maps:get(next_wake_at, Waiting), maps:get(next_wake_at, Q)).
+
+waiting_timer_becomes_recoverable_when_due() ->
+    Now = erlang:system_time(millisecond),
+    seed_waiting_timer(<<"timer-recoverable-future">>, Now + 60000),
+    seed_waiting_timer(<<"timer-recoverable-due">>, Now - 1000),
+    {ok, #{run_ids := Recoverable}} = beamtrail:list_recoverable(undefined, 100),
+    ?assertNot(lists:member(<<"timer-recoverable-future">>, Recoverable)),
+    ?assert(lists:member(<<"timer-recoverable-due">>, Recoverable)).
+
+due_timer_fires_before_decider_continues() ->
+    {ok, _Pid} = beamtrail_worker_sup:start_link(),
+    RunId = <<"decider-timer-fired-run-1">>,
+    Input = #{order_id => <<"o-timer-fired-1">>,
+              timer_id => approval_deadline,
+              fire_at_ms => erlang:system_time(millisecond) - 1},
+    {ok, RunId} = beamtrail:start_workflow(bt_timer_workflow, Input,
+                                           #{run_id => RunId}),
+    {ok, Waiting} = wait_for_state(RunId, waiting, 1000),
+    ?assertMatch(#{next_wake_at := WakeAt} when is_integer(WakeAt), Waiting),
+    {ok, _Scanner} = beamtrail_scanner:start_link(#{interval_ms => infinity,
+                                                    batch_size => 100}),
+    {ok, [RunId]} = beamtrail_scanner:scan_now(),
+    {ok, State} = beamtrail:await_terminal(RunId, 1000),
+    ?assertMatch(#{status := completed,
+                   workflow_result := #{timer_id := approval_deadline,
+                                        fired := true}},
+                 State),
+    {ok, Events} = beamtrail:events(RunId),
+    ?assertEqual(
+       ['workflow.instance.created',
+        'timer.scheduled',
+        'workflow.waiting',
+        'recovery.requeued',
+        'timer.fired',
+       'workflow.completed'],
+       [maps:get(event_type, E) || E <- Events]).
+
+conflicting_timer_deadline_fails_terminally() ->
+    RunId = <<"decider-timer-conflict-run-1">>,
+    Input = #{order_id => <<"o-timer-conflict-1">>,
+              timer_id => approval_deadline,
+              fire_at_ms => erlang:system_time(millisecond) + 60000,
+              conflict_after_schedule => true},
+    {ok, RunId} = beamtrail:start_workflow(bt_timer_workflow, Input,
+                                           #{run_id => RunId}),
+    {ok, State} = beamtrail:await_terminal(RunId, 1000),
+    ?assertMatch(#{status := failed,
+                   terminal := true,
+                   failure := #{reason := invalid_decider_command,
+                                timer_error := conflicting_timer_deadline}},
+                 State).
+
+fired_timer_id_reuse_fails_terminally() ->
+    {ok, _Pid} = beamtrail_worker_sup:start_link(),
+    RunId = <<"decider-timer-reuse-run-1">>,
+    Input = #{order_id => <<"o-timer-reuse-1">>,
+              timer_id => approval_deadline,
+              fire_at_ms => erlang:system_time(millisecond) - 1,
+              reuse_after_fired => true},
+    {ok, RunId} = beamtrail:start_workflow(bt_timer_workflow, Input,
+                                           #{run_id => RunId}),
+    {ok, _Waiting} = wait_for_state(RunId, waiting, 1000),
+    {ok, _Scanner} = beamtrail_scanner:start_link(#{interval_ms => infinity,
+                                                    batch_size => 100}),
+    {ok, [RunId]} = beamtrail_scanner:scan_now(),
+    {ok, State} = beamtrail:await_terminal(RunId, 1000),
+    ?assertMatch(#{status := failed,
+                   terminal := true,
+                   failure := #{reason := invalid_decider_command,
+                                timer_error := timer_already_fired}},
+                 State).
 
 workflow_decider_invalid_command_fails_terminally() ->
     RunId = <<"decider-invalid-run-1">>,
@@ -2168,6 +2283,31 @@ seed_retrying(RunId, NextRetryAt) ->
                    step_version => 1, idempotency_key => {charge, RunId},
                    payload => #{reason => transient, class => transient,
                                 attempt => 1, next_retry_at => NextRetryAt}}]),
+    ok.
+
+seed_waiting_timer(RunId, FireAtMs) ->
+    seed_created(RunId, bt_timer_workflow, []),
+    {ok, Lease} = beamtrail_memory_storage:acquire_lease(RunId, timer_owner, 1000),
+    Fence = maps:get(fencing_token, Lease),
+    {ok, _Events} =
+        beamtrail_memory_storage:append_events(
+          RunId, 1, Fence,
+          [#{event_type => 'timer.scheduled',
+             step_id => undefined,
+             step_version => undefined,
+             idempotency_key => undefined,
+             payload => #{timer_id => approval_deadline,
+                          fire_at_ms => FireAtMs,
+                          scheduled_at => FireAtMs - 1000,
+                          source_command => sleep_until,
+                          next_wake_at => FireAtMs}},
+           #{event_type => 'workflow.waiting',
+             step_id => undefined,
+             step_version => undefined,
+             idempotency_key => undefined,
+             payload => #{reason => waiting_for_timer,
+                          waiting_since => FireAtMs - 1000}}]),
+    ok = beamtrail_memory_storage:release_lease(RunId, Fence),
     ok.
 
 seed_terminal_failed(RunId) ->

@@ -236,17 +236,20 @@ explicit step inputs from the reduced view.
 
 The decider is deliberately not a Temporal-style arbitrary workflow-code replay
 system; it is a deterministic callback over a reduced view that returns the next
-durable command. BeamTrail does not yet support DAGs, fan-out/fan-in, parallel
-command batches, child workflows, or durable timers. Minimal durable signals are
-implemented through `signal.received` events and `{wait, Reason}` commands. See
+durable command. Minimal durable signals are implemented through
+`signal.received` events and `{wait, Reason}` commands. Scanner-driven durable
+timers are implemented through `timer.scheduled` and `timer.fired` events, with
+`next_wake_at` projected for recovery scans. BeamTrail does not yet support
+DAGs, fan-out/fan-in, parallel command batches, child workflows, timer
+cancellation, recurring timers, or local active-runner timer wakeups. See
 [Decider and Dataflow Design](DECIDER.md) and [Durable Timer Design](TIMER.md).
 
 The recovery scan is driven by the `run projection` index (see Recovery), so it
 avoids snapshot/replay work for every historical run. The PostgreSQL adapter
-keeps `status`, `terminal`, `next_retry_at_ms`, and `parked` columns on
-`workflow_runs`, updated in the same transaction as the append, with a partial
-index on non-terminal, non-parked runs and an index on lease expiry. Adapters
-that do not implement the optional
+keeps `status`, `terminal`, `next_retry_at_ms`, `next_wake_at_ms`, and `parked`
+columns on `workflow_runs`, updated in the same transaction as the append, with
+a partial index on non-terminal, non-parked runs and an index on lease expiry.
+Adapters that do not implement the optional
 `list_recoverable_run_ids/3` callback fall back to paging all run ids and
 replaying each, which is still correct. Runs created before the projection
 columns existed default to a safe over-approximating state and can be normalized

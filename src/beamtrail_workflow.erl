@@ -29,6 +29,8 @@
       workflow_result := term(),
       signals := [map()],
       wait_reason := term(),
+      timers := map(),
+      next_wake_at := undefined | non_neg_integer(),
       attempts := [map()],
       failure := term()}.
 -type decision_command() ::
@@ -37,7 +39,9 @@
     | {run_step, step_id()}
     | {run_step, step_id(), term()}
     | {fail, term()}
-    | {wait, term()}.
+    | {wait, term()}
+    | {sleep, atom() | binary(), non_neg_integer()}
+    | {sleep_until, atom() | binary(), non_neg_integer()}.
 
 -callback steps(Input :: term()) -> [step_id()].
 -callback step_version(StepId :: step_id()) -> step_version().

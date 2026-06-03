@@ -335,9 +335,15 @@ candidate_status(Reduced, NowMs) ->
         false ->
             case maps:get(status, Reduced) of
                 retrying -> maps:get(next_retry_at, Reduced, 0) =< NowMs;
-                waiting -> false;
+                waiting -> wake_due(Reduced, NowMs);
                 _ -> true
             end
+    end.
+
+wake_due(Reduced, NowMs) ->
+    case maps:get(next_wake_at, Reduced, undefined) of
+        WakeAt when is_integer(WakeAt) -> WakeAt =< NowMs;
+        _ -> false
     end.
 
 lease_open(undefined, _NowMs) -> true;

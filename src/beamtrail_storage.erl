@@ -50,8 +50,8 @@
     {ok, run_id_page()} | {error, term()}.
 
 %% Optional indexed recovery scan. Returns a page of run ids that are coarse
-%% recovery candidates at NowMs: not terminal, not parked, not waiting for an
-%% external signal, not waiting on a future retry, and not currently leased.
+%% recovery candidates at NowMs: not terminal, not parked, not waiting on a
+%% future retry, not waiting on a future timer wake, and not currently leased.
 %% This avoids per-run snapshot/replay during scans; the event log remains the
 %% source of truth, and
 %% beamtrail:list_recoverable/2 still applies the precise recoverable/2 check

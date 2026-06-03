@@ -35,6 +35,9 @@ The first dataflow foundation is implemented:
   prior `charge` result and passes a derived shipment input to `ship`
 - minimal signal delivery is implemented with `signal.received` events,
   `{wait, Reason}` commands, and ordered `signals` in the decision view
+- scanner-driven durable timers are implemented with `{sleep, TimerId, DelayMs}`
+  / `{sleep_until, TimerId, FireAtMs}` commands, `timer.scheduled` and
+  `timer.fired` events, and `timers` / `next_wake_at` in the decision view
 - snapshot schema revision includes the new state keys and attempt keys, so old
   snapshots replay from events instead of loading an incompatible shape
 
@@ -62,7 +65,8 @@ The design is intentionally narrower:
 - no fan-out/fan-in yet
 - only minimal external signal delivery; no signal subscriptions, cursors, or
   typed mailbox API yet
-- no first-class durable timers yet
+- only scanner-driven durable timers; no timer cancellation, recurring timers,
+  or local active-runner wakeup yet
 - no separate activity task queues yet
 
 Those features should grow from the same command boundary later.
@@ -147,17 +151,18 @@ complete
 {run_step, StepId, StepInput}
 {fail, Reason}
 {wait, Reason}
+{sleep, TimerId, DelayMs}
+{sleep_until, TimerId, UnixMs}
 ```
 
 Reserved future commands:
 
 ```erlang
-{sleep_until, TimerId, UnixMs}
 {run_many, [StepCommand]}
 ```
 
 Reserved commands must be rejected with a structured engine error until their
-subsystems exist. The timer command design is tracked in
+subsystems exist. Timer command semantics are tracked in
 [Durable Timer Design](TIMER.md).
 
 ## Step Input

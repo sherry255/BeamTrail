@@ -46,6 +46,8 @@ decision_view(State) ->
       workflow_result => maps:get(workflow_result, State, undefined),
       signals => maps:get(signals, State, []),
       wait_reason => maps:get(wait_reason, State, undefined),
+      timers => maps:get(timers, State, #{}),
+      next_wake_at => maps:get(next_wake_at, State, undefined),
       attempts => maps:get(attempts, State, []),
       failure => maps:get(failure, State, undefined)}.
 
@@ -57,6 +59,10 @@ validate_command({fail, _Reason} = Command, _State) ->
     {ok, Command};
 validate_command({wait, _Reason} = Command, _State) ->
     {ok, Command};
+validate_command({sleep, TimerId, DelayMs} = Command, _State) ->
+    validate_timer_command(Command, TimerId, DelayMs);
+validate_command({sleep_until, TimerId, FireAtMs} = Command, _State) ->
+    validate_timer_command(Command, TimerId, FireAtMs);
 validate_command({run_step, StepId}, State) ->
     validate_run_step({run_step, StepId, maps:get(input, State)}, State);
 validate_command({run_step, _StepId, _StepInput} = Command, State) ->
@@ -72,3 +78,12 @@ validate_run_step({run_step, StepId, _StepInput} = Command, State) ->
 
 invalid_command(Command) ->
     {error, #{reason => invalid_decider_command, command => Command}}.
+
+validate_timer_command(Command, TimerId, TimeMs) ->
+    case valid_timer_id(TimerId) andalso is_integer(TimeMs) andalso TimeMs >= 0 of
+        true -> {ok, Command};
+        false -> invalid_command(Command)
+    end.
+
+valid_timer_id(TimerId) ->
+    is_atom(TimerId) orelse is_binary(TimerId).

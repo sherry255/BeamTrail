@@ -14,6 +14,7 @@ postgres_integration_test_() ->
               fun postgres_recovery_replays_unfinished_attempt_after_restart/0,
               fun postgres_recovery_budget_exceeded_fails_open_attempt/0,
               fun postgres_signal_wakes_waiting_workflow/0,
+              fun postgres_timer_wakes_waiting_workflow/0,
               fun postgres_list_recoverable_uses_indexed_projection/0,
               fun postgres_release_lease_preserves_fencing/0,
               fun postgres_recoverable_index_excludes_parked_runs/0,
@@ -147,6 +148,31 @@ postgres_signal_wakes_waiting_workflow() ->
         'signal.received',
         'attempt.started',
         'step.succeeded',
+       'workflow.completed'],
+       [maps:get(event_type, E) || E <- Events]).
+
+postgres_timer_wakes_waiting_workflow() ->
+    RunId = unique_run_id("pg-timer-wake"),
+    Input = #{order_id => RunId,
+              timer_id => approval_deadline,
+              fire_at_ms => erlang:system_time(millisecond) - 1},
+    {ok, RunId} = beamtrail:start_workflow(bt_timer_workflow, Input,
+                                           #{run_id => RunId}),
+    {ok, Waiting} = wait_for_state(RunId, waiting, 1000),
+    ?assertMatch(#{next_wake_at := WakeAt} when is_integer(WakeAt), Waiting),
+    {ok, [RunId]} = beamtrail_scanner:scan_now(),
+    {ok, State} = beamtrail:await_terminal(RunId, 1000),
+    ?assertMatch(#{status := completed,
+                   workflow_result := #{timer_id := approval_deadline,
+                                        fired := true}},
+                 State),
+    {ok, Events} = beamtrail:events(RunId),
+    ?assertEqual(
+       ['workflow.instance.created',
+        'timer.scheduled',
+        'workflow.waiting',
+        'recovery.requeued',
+        'timer.fired',
         'workflow.completed'],
        [maps:get(event_type, E) || E <- Events]).
 
@@ -168,6 +194,10 @@ postgres_list_recoverable_uses_indexed_projection() ->
                 <<"pg-rec-3-livelease">>, live_owner, 30000),
     %% waiting for signal -> not recoverable
     seed_waiting_pg(<<"pg-rec-3b-waiting">>),
+    %% waiting for signal with future timer -> not recoverable yet
+    seed_waiting_timer_pg(<<"pg-rec-3c-waiting-timer-future">>, Now + 60000),
+    %% waiting for signal with due timer -> recoverable
+    seed_waiting_timer_pg(<<"pg-rec-3d-waiting-timer-due">>, Now - 1000),
     %% retrying, next_retry in the future -> not recoverable yet
     seed_retry_pg(<<"pg-rec-4-retry-future">>, Now + 60000),
     %% retrying, next_retry past, lease expired -> recoverable
@@ -176,19 +206,31 @@ postgres_list_recoverable_uses_indexed_projection() ->
     %% terminal failure -> not recoverable
     seed_terminal_failed_pg(<<"pg-rec-6-terminal-failed">>),
     {ok, #{run_ids := Recoverable}} = beamtrail:list_recoverable(undefined, 100),
-    ?assertEqual([<<"pg-rec-1-running">>, <<"pg-rec-5-retry-due">>], Recoverable),
+    ?assertEqual([<<"pg-rec-1-running">>,
+                  <<"pg-rec-3d-waiting-timer-due">>,
+                  <<"pg-rec-5-retry-due">>],
+                 Recoverable),
     IndexedNow = erlang:system_time(millisecond),
     {ok, #{run_ids := IndexedCandidates}} =
         beamtrail_postgres_storage:list_recoverable_run_ids(undefined, 100, IndexedNow),
     ?assertNot(lists:member(<<"pg-rec-3b-waiting">>, IndexedCandidates)),
+    ?assertNot(lists:member(<<"pg-rec-3c-waiting-timer-future">>, IndexedCandidates)),
+    ?assert(lists:member(<<"pg-rec-3d-waiting-timer-due">>, IndexedCandidates)),
     %% Projection columns mirror the reduced state derived by the reducer.
-    ?assertEqual({<<"completed">>, true, null, false},
+    ?assertEqual({<<"completed">>, true, null, null, false},
                  run_projection_row(Config, <<"pg-rec-2-completed">>)),
-    ?assertMatch({<<"retrying">>, false, NextRetry, false} when is_integer(NextRetry),
+    ?assertMatch({<<"retrying">>, false, NextRetry, null, false}
+                   when is_integer(NextRetry),
                  run_projection_row(Config, <<"pg-rec-4-retry-future">>)),
-    ?assertEqual({<<"waiting">>, false, null, false},
+    ?assertEqual({<<"waiting">>, false, null, null, false},
                  run_projection_row(Config, <<"pg-rec-3b-waiting">>)),
-    ?assertEqual({<<"failed">>, true, null, false},
+    ?assertMatch({<<"waiting">>, false, null, FutureWake, false}
+                   when is_integer(FutureWake),
+                 run_projection_row(Config, <<"pg-rec-3c-waiting-timer-future">>)),
+    ?assertMatch({<<"waiting">>, false, null, DueWake, false}
+                   when is_integer(DueWake),
+                 run_projection_row(Config, <<"pg-rec-3d-waiting-timer-due">>)),
+    ?assertEqual({<<"failed">>, true, null, null, false},
                  run_projection_row(Config, <<"pg-rec-6-terminal-failed">>)).
 
 postgres_release_lease_preserves_fencing() ->
@@ -486,6 +528,30 @@ seed_waiting_pg(RunId) ->
     ok = beamtrail_postgres_storage:release_lease(RunId, Fence),
     ok.
 
+seed_waiting_timer_pg(RunId, FireAtMs) ->
+    seed_created_pg(RunId, []),
+    {ok, Lease} = beamtrail_postgres_storage:acquire_lease(RunId, timer_owner, 1000),
+    Fence = maps:get(fencing_token, Lease),
+    {ok, _} = beamtrail_postgres_storage:append_events(
+                RunId, 1, Fence,
+                [#{event_type => 'timer.scheduled',
+                   step_id => undefined,
+                   step_version => undefined,
+                   idempotency_key => undefined,
+                   payload => #{timer_id => approval_deadline,
+                                fire_at_ms => FireAtMs,
+                                scheduled_at => FireAtMs - 1000,
+                                source_command => sleep_until,
+                                next_wake_at => FireAtMs}},
+                 #{event_type => 'workflow.waiting',
+                   step_id => undefined,
+                   step_version => undefined,
+                   idempotency_key => undefined,
+                   payload => #{reason => waiting_for_timer,
+                                waiting_since => FireAtMs - 1000}}]),
+    ok = beamtrail_postgres_storage:release_lease(RunId, Fence),
+    ok.
+
 seed_terminal_failed_pg(RunId) ->
     seed_created_pg(RunId, [charge]),
     {ok, Lease} = beamtrail_postgres_storage:acquire_lease(RunId, fail_owner, 1000),
@@ -509,7 +575,8 @@ run_projection_row(Config, RunId) ->
                     {ok, _Cols, [Row]} =
                         epgsql:equery(
                           C,
-                          "SELECT status, terminal, next_retry_at_ms, parked "
+                          "SELECT status, terminal, next_retry_at_ms, "
+                          "next_wake_at_ms, parked "
                           "FROM workflow_runs WHERE run_id = $1",
                           [RunId]),
                     Row

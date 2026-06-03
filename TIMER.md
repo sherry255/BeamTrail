@@ -61,7 +61,8 @@ timer.scheduled
 #{timer_id => TimerId,
   fire_at_ms => FireAtMs,
   scheduled_at => NowMs,
-  source_command => sleep | sleep_until}
+  source_command => sleep | sleep_until,
+  next_wake_at => NextWakeAt}
 ```
 
 Timer firing is persisted as:
@@ -70,7 +71,8 @@ Timer firing is persisted as:
 timer.fired
 #{timer_id => TimerId,
   fire_at_ms => FireAtMs,
-  fired_at => NowMs}
+  fired_at => NowMs,
+  next_wake_at => NextWakeAt}
 ```
 
 `timer.fired` is the only way a decider observes a timer as fired. The decider

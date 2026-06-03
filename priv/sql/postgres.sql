@@ -21,7 +21,8 @@ CREATE TABLE IF NOT EXISTS workflow_runs (
   status text NOT NULL DEFAULT 'running',
   terminal boolean NOT NULL DEFAULT false,
   parked boolean NOT NULL DEFAULT false,
-  next_retry_at_ms bigint
+  next_retry_at_ms bigint,
+  next_wake_at_ms bigint
 );
 
 -- Recovery-scan projection columns. The event log stays authoritative; these
@@ -34,6 +35,7 @@ ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 
 ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS terminal boolean NOT NULL DEFAULT false;
 ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS parked boolean NOT NULL DEFAULT false;
 ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS next_retry_at_ms bigint;
+ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS next_wake_at_ms bigint;
 
 INSERT INTO workflow_runs (run_id, created_at_ms, updated_at_ms)
 SELECT run_id, MIN(occurred_at_ms), MAX(occurred_at_ms)

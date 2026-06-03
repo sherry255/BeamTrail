@@ -740,9 +740,17 @@ recoverable_by_status(State) ->
         retrying ->
             maps:get(next_retry_at, State, 0) =< erlang:system_time(millisecond);
         waiting ->
-            false;
+            wake_due(State);
         _ ->
             true
+    end.
+
+wake_due(State) ->
+    case maps:get(next_wake_at, State, undefined) of
+        WakeAt when is_integer(WakeAt) ->
+            WakeAt =< erlang:system_time(millisecond);
+        _ ->
+            false
     end.
 
 lease_recoverable(RunId) ->

@@ -27,6 +27,10 @@ are pre-stable and may include breaking API or storage changes.
 - Minimal durable signal support: `beamtrail:signal_run/3` appends
   `signal.received`, `{wait, Reason}` appends `workflow.waiting`, and deciders
   can resume from persisted signals.
+- Scanner-driven durable timers: deciders can return `{sleep, TimerId,
+  DelayMs}` or `{sleep_until, TimerId, FireAtMs}`, the runtime appends
+  `timer.scheduled`, due timers materialize as `timer.fired` under lease and
+  fencing, and `next_wake_at_ms` drives recovery scans for waiting runs.
 
 ## [0.2.0-pre.1] - 2026-06-03
 

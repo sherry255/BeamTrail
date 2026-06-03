@@ -18,6 +18,8 @@ new() ->
       signals => [],
       wait_reason => undefined,
       waiting_since => undefined,
+      timers => #{},
+      next_wake_at => undefined,
       attempt_counts => #{},
       attempts => [],
       pending_attempt => undefined,
@@ -113,6 +115,43 @@ apply_event_type('step.succeeded', State, Event) ->
            results => maps:get(results, State) ++
                [result_entry(StepId, Result, Event, State)],
            failure => undefined};
+apply_event_type('timer.scheduled', State, Event) ->
+    Payload = maps:get(payload, Event),
+    TimerId = maps:get(timer_id, Payload),
+    FireAtMs = maps:get(fire_at_ms, Payload),
+    Timer =
+        #{timer_id => TimerId,
+          status => scheduled,
+          fire_at_ms => FireAtMs,
+          scheduled_event_seq => maps:get(event_seq, Event),
+          scheduled_at => maps:get(scheduled_at, Payload,
+                                   maps:get(occurred_at, Event, undefined)),
+          fired_event_seq => undefined,
+          fired_at => undefined},
+    Timers = maps:put(TimerId, Timer, maps:get(timers, State, #{})),
+    State#{status => running,
+           timers => Timers,
+           next_wake_at => next_wake_at(Timers),
+           next_retry_at => undefined};
+apply_event_type('timer.fired', State, Event) ->
+    Payload = maps:get(payload, Event),
+    TimerId = maps:get(timer_id, Payload),
+    Timers0 = maps:get(timers, State, #{}),
+    Timer0 = maps:get(TimerId, Timers0,
+                      #{timer_id => TimerId,
+                        status => scheduled,
+                        fire_at_ms => maps:get(fire_at_ms, Payload),
+                        scheduled_event_seq => undefined,
+                        scheduled_at => undefined}),
+    Timer = Timer0#{status => fired,
+                    fired_event_seq => maps:get(event_seq, Event),
+                    fired_at => maps:get(fired_at, Payload,
+                                         maps:get(occurred_at, Event, undefined))},
+    Timers = maps:put(TimerId, Timer, Timers0),
+    State#{status => running,
+           timers => Timers,
+           next_wake_at => next_wake_at(Timers),
+           next_retry_at => undefined};
 apply_event_type('step.failed', State, Event) ->
     StepId = maps:get(step_id, Event),
     Payload = maps:get(payload, Event),
@@ -222,4 +261,14 @@ result_entry(StepId, Result, Event, State) ->
     #{step_id => StepId,
       attempt => maps:get(attempt, Attempt, undefined),
       event_seq => maps:get(event_seq, Event),
-      result => Result}.
+     result => Result}.
+
+next_wake_at(Timers) ->
+    Scheduled =
+        [FireAt || #{status := scheduled, fire_at_ms := FireAt}
+                       <- maps:values(Timers),
+                   is_integer(FireAt)],
+    case Scheduled of
+        [] -> undefined;
+        _ -> lists:min(Scheduled)
+    end.
