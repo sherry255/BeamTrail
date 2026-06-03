@@ -27,6 +27,8 @@
       current_step := step_id() | undefined,
       results := [map()],
       workflow_result := term(),
+      signals := [map()],
+      wait_reason := term(),
       attempts := [map()],
       failure := term()}.
 -type decision_command() ::
@@ -34,7 +36,8 @@
     | {complete, term()}
     | {run_step, step_id()}
     | {run_step, step_id(), term()}
-    | {fail, term()}.
+    | {fail, term()}
+    | {wait, term()}.
 
 -callback steps(Input :: term()) -> [step_id()].
 -callback step_version(StepId :: step_id()) -> step_version().
@@ -47,7 +50,8 @@
 
 %% Optional deterministic orchestration callback. BeamTrail calls decide/1 only
 %% when no attempt is open, validates the returned command, and persists the
-%% command boundary as workflow.completed, workflow.failed, or attempt.started.
+%% command boundary as workflow.completed, workflow.failed, workflow.waiting, or
+%% attempt.started.
 -callback decide(View :: decision_view()) -> decision_command().
 -callback decider_version() -> decider_version().
 

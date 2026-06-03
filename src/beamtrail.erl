@@ -5,6 +5,7 @@
          recover_unfinished/0]).
 -export([get_state/1, await_terminal/2, events/1, storage/0]).
 -export([cancel_run/2, park_run/2, resume_run/1, requeue_run/2]).
+-export([signal_run/3]).
 -export([list_recoverable/0, list_recoverable/2,
          mark_recovery_requeued/1, mark_recovery_requeued_with_lease/1]).
 
@@ -282,6 +283,55 @@ resume_run(RunId) ->
         {error, _} = Error ->
             Error
     end.
+
+-spec signal_run(run_id(), atom(), map()) -> state_result().
+signal_run(RunId, SignalName, Payload)
+  when is_atom(SignalName), is_map(Payload) ->
+    ok = ensure_storage(),
+    case load_state(RunId) of
+        {ok, #{terminal := true}} ->
+            {error, terminal};
+        {ok, #{parked := true}} ->
+            {error, parked};
+        {ok, State} ->
+            append_signal_event(RunId, State, SignalName, Payload);
+        {error, _} = Error ->
+            Error
+    end.
+
+append_signal_event(RunId, State, SignalName, Payload) ->
+    Now = erlang:system_time(millisecond),
+    case (storage()):append_event(
+           RunId,
+           maps:get(last_event_seq, State, 0),
+           undefined,
+           'signal.received',
+           undefined,
+           undefined,
+           undefined,
+           #{name => SignalName,
+             payload => Payload,
+             received_at => Now}) of
+        {ok, Event} ->
+            State1 = beamtrail_state:apply_event(State, Event),
+            _ = beamtrail_state:maybe_snapshot(RunId, State1, false, storage()),
+            _ = release_waiting_lease(RunId, State),
+            _ = dispatch_supervised(RunId),
+            {ok, State1};
+        {error, _} = Error ->
+            Error
+    end.
+
+release_waiting_lease(RunId, #{status := waiting}) ->
+    case (storage()):read_lease(RunId) of
+        {ok, Lease} ->
+            beamtrail_lease_manager:release(
+              RunId, beamtrail_lease_manager:fencing_token(Lease));
+        _ ->
+            ok
+    end;
+release_waiting_lease(_RunId, _State) ->
+    ok.
 
 cancel_run_with_new_lease(RunId, Reason) ->
     append_control_with_new_lease(
@@ -689,6 +739,8 @@ recoverable_by_status(State) ->
             maps:get(terminal, State, false) =/= true;
         retrying ->
             maps:get(next_retry_at, State, 0) =< erlang:system_time(millisecond);
+        waiting ->
+            false;
         _ ->
             true
     end.

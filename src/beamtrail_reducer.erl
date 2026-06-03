@@ -15,6 +15,9 @@ new() ->
       completed_steps => 0,
       results => [],
       workflow_result => undefined,
+      signals => [],
+      wait_reason => undefined,
+      waiting_since => undefined,
       attempt_counts => #{},
       attempts => [],
       pending_attempt => undefined,
@@ -123,6 +126,25 @@ apply_event_type('retry.scheduled', State, Event) ->
            current_step => maps:get(step_id, Event),
            next_retry_at => maps:get(next_retry_at, Payload),
            failure => Payload};
+apply_event_type('workflow.waiting', State, Event) ->
+    Payload = maps:get(payload, Event),
+    State#{status => waiting,
+           wait_reason => maps:get(reason, Payload, undefined),
+           waiting_since => maps:get(waiting_since, Payload,
+                                     maps:get(occurred_at, Event, undefined)),
+           pending_attempt => undefined,
+           next_retry_at => undefined};
+apply_event_type('signal.received', State, Event) ->
+    Payload = maps:get(payload, Event),
+    Signal =
+        #{name => maps:get(name, Payload),
+          payload => maps:get(payload, Payload, #{}),
+          event_seq => maps:get(event_seq, Event),
+          received_at => maps:get(received_at, Payload,
+                                  maps:get(occurred_at, Event, undefined))},
+    State#{status => running,
+           signals => maps:get(signals, State, []) ++ [Signal],
+           next_retry_at => undefined};
 apply_event_type('workflow.completed', State, Event) ->
     Payload = maps:get(payload, Event, #{}),
     State#{status => completed,

@@ -34,11 +34,13 @@ Current scope:
   step selection, completion, failure, and explicit step inputs
 - Optional `decider_version/0` gate for decider workflows, with the recorded
   version exposed through `beamtrail_query:describe/1`
+- Minimal durable signals: `signal_run/3` records `signal.received`, while
+  decider workflows can return `{wait, Reason}` to stop until a signal arrives
 
 Not in scope yet:
 
 - DAGs, fan-out/fan-in, or parallel command batches
-- Durable timers, signals, or child workflows
+- Durable timers or child workflows
 - HTTP API or browser UI
 - SQL-native JSON inspection
 - Built-in external side-effect deduplication
@@ -174,6 +176,8 @@ Run control APIs are durable events, not in-memory flags:
 {ok, Parked} = beamtrail:park_run(RunId, maintenance).
 {ok, Resumed} = beamtrail:resume_run(RunId).
 {ok, requeued} = beamtrail:requeue_run(RunId, manual).
+{ok, Signalled} = beamtrail:signal_run(RunId, approved,
+                                       #{approved_by => <<"ops">>}).
 ```
 
 `cancel_run/2` writes a terminal `workflow.cancelled` event. `park_run/2`
@@ -186,6 +190,12 @@ Control calls first target a live active runner on the local BEAM node. If there
 is no local runner, they acquire the storage lease and append directly. They do
 not force-control a live runner on another node; in that case fencing and lease
 expiry remain the handoff boundary.
+
+Signals are external durable input events. `signal_run/3` appends
+`signal.received` without taking over an executing attempt, then asks the
+supervised runner path to continue the run. Decider workflows can return
+`{wait, Reason}` to append `workflow.waiting`; a waiting runner releases its
+lease so a later signal can wake the run immediately.
 
 Clean up the local container:
 
@@ -262,7 +272,8 @@ View = beamtrail_query:describe(RunId).
 `beamtrail_query:describe/1` returns the current reduced state, attempts,
 pending attempt metadata, snapshot metadata, replay tail length, lease/fencing
 metadata, active runner metadata, run-control metadata, recovery metadata, and
-the event list.
+the event list. Decider views include ordered `signals`, and the inspector
+exposes `signals`, `wait_reason`, and `waiting_since`.
 
 ## Configuration
 

@@ -202,9 +202,19 @@ after_dispatch_nonterminal(State, Data) ->
             end;
         retrying ->
             schedule_retry_or_dispatch(State, Data);
+        waiting ->
+            stop_after_releasing_lease(Data);
         _ ->
             schedule_immediate(Data)
     end.
+
+stop_after_releasing_lease(#{run_id := RunId, lease := Lease} = Data)
+  when is_map(Lease) ->
+    FencingToken = beamtrail_lease_manager:fencing_token(Lease),
+    _ = beamtrail_lease_manager:release(RunId, FencingToken),
+    {stop, normal, Data#{lease := undefined}};
+stop_after_releasing_lease(Data) ->
+    {stop, normal, Data}.
 
 schedule_retry_or_dispatch(State, Data) ->
     Now = erlang:system_time(millisecond),

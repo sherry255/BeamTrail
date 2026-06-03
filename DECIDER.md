@@ -26,13 +26,15 @@ The first dataflow foundation is implemented:
 - workflow modules may implement optional `decide/1`
 - decider commands are validated before appending anything
 - dispatch routes validated commands through `run_step`, `complete`,
-  `{complete, Result}`, or `{fail, Reason}`
+  `{complete, Result}`, `{fail, Reason}`, or `{wait, Reason}`
 - invalid decider commands and decider callback crashes terminally fail the run
   before opening an attempt
 - `beamtrail_query:describe/1` exposes results, workflow result, and the
   current pending attempt
 - test coverage includes a result-branching decider workflow that reads a
   prior `charge` result and passes a derived shipment input to `ship`
+- minimal signal delivery is implemented with `signal.received` events,
+  `{wait, Reason}` commands, and ordered `signals` in the decision view
 - snapshot schema revision includes the new state keys and attempt keys, so old
   snapshots replay from events instead of loading an incompatible shape
 
@@ -58,7 +60,8 @@ The design is intentionally narrower:
 
 - one command at a time in v0.3
 - no fan-out/fan-in yet
-- no external signal delivery yet
+- only minimal external signal delivery; no signal subscriptions, cursors, or
+  typed mailbox API yet
 - no first-class durable timers yet
 - no separate activity task queues yet
 
@@ -115,6 +118,8 @@ metadata:
   current_step := atom() | undefined,
   results := [map()],
   workflow_result := term() | undefined,
+  signals := [map()],
+  wait_reason := term() | undefined,
   attempts := [map()],
   failure := term() | undefined}.
 ```
@@ -141,13 +146,13 @@ complete
 {run_step, StepId}
 {run_step, StepId, StepInput}
 {fail, Reason}
+{wait, Reason}
 ```
 
 Reserved future commands:
 
 ```erlang
 {sleep_until, TimerId, UnixMs}
-{wait_signal, SignalName}
 {run_many, [StepCommand]}
 ```
 
@@ -231,6 +236,7 @@ The transition loop becomes:
 6. Append the event implied by the command:
    - `complete` / `{complete, Result}` -> `workflow.completed`
    - `{fail, Reason}` -> `workflow.failed`
+   - `{wait, Reason}` -> `workflow.waiting`
    - `{run_step, StepId, StepInput}` -> `attempt.started`
 7. Execute the attempt only after `attempt.started` is durably appended.
 
@@ -324,7 +330,7 @@ v0.3 should not implement:
 - Temporal-style arbitrary workflow code replay
 - parallel command batches
 - durable timers
-- signal delivery
+- typed mailbox cursors or signal subscription helpers
 - child workflows
 - activity task queues
 - automatic workflow code migration
@@ -344,6 +350,7 @@ the current recovery and append semantics intact.
 7. Done: expose decider metadata in `beamtrail_query:describe/1`.
 8. Done: add an executable result-branching example test that uses previous
    step results to select the next step input.
+9. Done: add minimal durable signal delivery and `{wait, Reason}` commands.
 
 Each step should keep the event log replayable and PostgreSQL/memory adapters in
 lockstep.

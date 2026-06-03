@@ -46,6 +46,7 @@ extended_test_() ->
       fun workflow_decider_catches_callback_errors/0,
       fun workflow_decider_run_step_uses_command_step_input/0,
       fun workflow_decider_branches_on_prior_step_result/0,
+      fun workflow_decider_waits_for_durable_signal/0,
       fun workflow_decider_invalid_command_fails_terminally/0,
       fun workflow_decider_callback_error_fails_terminally/0,
       fun storage_lists_run_ids_with_cursor/0,
@@ -862,6 +863,48 @@ workflow_decider_branches_on_prior_step_result() ->
                   #{step_id := ship,
                     result := #{shipped := true}}],
                  maps:get(results, Q)).
+
+workflow_decider_waits_for_durable_signal() ->
+    RunId = <<"decider-signal-run-1">>,
+    Input = #{order_id => <<"o-signal-1">>, test_pid => self()},
+    {ok, RunId} = beamtrail:start_workflow(
+                    bt_signal_workflow,
+                    Input,
+                    #{run_id => RunId}),
+    {ok, Waiting} = wait_for_state(RunId, waiting, 1000),
+    ?assertMatch(#{terminal := false, wait_reason := waiting_for_approval},
+                 Waiting),
+    {ok, Signalled} = beamtrail:signal_run(
+                        RunId,
+                        approved,
+                        #{approved_by => <<"ops">>}),
+    ?assertMatch(#{status := running,
+                   signals := [#{name := approved,
+                                 payload := #{approved_by := <<"ops">>}}]},
+                 Signalled),
+    ?assertEqual({signal_workflow_executed,
+                  fulfill,
+                  #{order_id => <<"o-signal-1">>, approved_by => <<"ops">>,
+                    test_pid => self()}},
+                 receive_exec()),
+    {ok, State} = beamtrail:await_terminal(RunId, 1000),
+    ?assertMatch(#{status := completed,
+                   workflow_result := #{approved_by := <<"ops">>}},
+                 State),
+    {ok, Events} = beamtrail:events(RunId),
+    ?assertEqual(
+       ['workflow.instance.created',
+        'workflow.waiting',
+        'signal.received',
+        'attempt.started',
+        'step.succeeded',
+        'workflow.completed'],
+       [maps:get(event_type, E) || E <- Events]),
+    Q = beamtrail_query:describe(RunId),
+    ?assertMatch([#{name := approved,
+                    payload := #{approved_by := <<"ops">>}}],
+                 maps:get(signals, Q)),
+    ?assertEqual(waiting_for_approval, maps:get(wait_reason, Q)).
 
 workflow_decider_invalid_command_fails_terminally() ->
     RunId = <<"decider-invalid-run-1">>,

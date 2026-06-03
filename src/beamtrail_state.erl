@@ -37,9 +37,12 @@ snapshot_schema_definition() ->
            pending_attempt,
            results,
            run_id,
+           signals,
            status,
            steps,
            terminal,
+           wait_reason,
+           waiting_since,
            workflow,
            workflow_result],
       attempt_keys => beamtrail_reducer:attempt_keys()}.

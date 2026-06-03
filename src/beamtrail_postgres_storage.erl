@@ -236,9 +236,9 @@ list_recoverable_run_ids(Cursor, Limit, NowMs) ->
       end).
 
 %% Coarse recovery candidates at NowMs: not terminal, not parked, not waiting
-%% on a future retry, and not currently leased. The lease is read live via LEFT
-%% JOIN (never denormalized into workflow_runs, which is updated in a different
-%% transaction).
+%% for a signal, not waiting on a future retry, and not currently leased. The
+%% lease is read live via LEFT JOIN (never denormalized into workflow_runs,
+%% which is updated in a different transaction).
 %% Mirrors beamtrail:recoverable_by_status/1 + lease_recoverable/1, minus the
 %% migration gate, which beamtrail re-checks per candidate from live code.
 recoverable_query(undefined, Limit, NowMs) ->
@@ -246,6 +246,7 @@ recoverable_query(undefined, Limit, NowMs) ->
      "LEFT JOIN workflow_leases l ON l.run_id = r.run_id "
      "WHERE r.terminal = false "
      "AND r.parked = false "
+     "AND r.status <> 'waiting' "
      "AND (r.status <> 'retrying' OR r.next_retry_at_ms <= $1) "
      "AND (l.lease_until_ms IS NULL OR l.lease_until_ms <= $1) "
      "ORDER BY r.run_id LIMIT $2",
@@ -255,6 +256,7 @@ recoverable_query(Cursor, Limit, NowMs) ->
      "LEFT JOIN workflow_leases l ON l.run_id = r.run_id "
      "WHERE r.terminal = false "
      "AND r.parked = false "
+     "AND r.status <> 'waiting' "
      "AND (r.status <> 'retrying' OR r.next_retry_at_ms <= $1) "
      "AND (l.lease_until_ms IS NULL OR l.lease_until_ms <= $1) "
      "AND r.run_id > $2 "
@@ -524,6 +526,12 @@ project_event(#{event_type := 'retry.scheduled', payload := Payload}, _Acc) ->
     #{status => <<"retrying">>, terminal => false,
       next_retry_at => maps:get(next_retry_at, Payload, null),
       parked => false};
+project_event(#{event_type := 'workflow.waiting'}, _Acc) ->
+    #{status => <<"waiting">>, terminal => false,
+      next_retry_at => null, parked => false};
+project_event(#{event_type := 'signal.received'}, _Acc) ->
+    #{status => <<"running">>, terminal => false,
+      next_retry_at => null, parked => false};
 project_event(#{event_type := 'workflow.completed'}, _Acc) ->
     #{status => <<"completed">>, terminal => true,
       next_retry_at => null, parked => false};
@@ -620,6 +628,8 @@ current_event_seq(C, RunId) ->
     end.
 
 validate_fencing(_C, _RunId, 'workflow.instance.created', undefined) ->
+    ok;
+validate_fencing(_C, _RunId, 'signal.received', undefined) ->
     ok;
 validate_fencing(C, RunId, _EventType, FencingToken) when is_integer(FencingToken) ->
     Now = now_ms(),
@@ -762,6 +772,10 @@ decode_event_type(<<"step.failed">>) ->
     {ok, 'step.failed'};
 decode_event_type(<<"retry.scheduled">>) ->
     {ok, 'retry.scheduled'};
+decode_event_type(<<"workflow.waiting">>) ->
+    {ok, 'workflow.waiting'};
+decode_event_type(<<"signal.received">>) ->
+    {ok, 'signal.received'};
 decode_event_type(<<"workflow.completed">>) ->
     {ok, 'workflow.completed'};
 decode_event_type(<<"workflow.failed">>) ->

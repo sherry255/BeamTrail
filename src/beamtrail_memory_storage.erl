@@ -335,6 +335,7 @@ candidate_status(Reduced, NowMs) ->
         false ->
             case maps:get(status, Reduced) of
                 retrying -> maps:get(next_retry_at, Reduced, 0) =< NowMs;
+                waiting -> false;
                 _ -> true
             end
     end.
@@ -349,6 +350,8 @@ next_fencing_token(undefined) -> 1;
 next_fencing_token(Lease) -> maps:get(fencing_token, Lease) + 1.
 
 validate_fencing(_RunId, 'workflow.instance.created', undefined, _State) ->
+    ok;
+validate_fencing(_RunId, 'signal.received', undefined, _State) ->
     ok;
 validate_fencing(RunId, _EventType, FencingToken, State) when is_integer(FencingToken) ->
     Now = erlang:system_time(millisecond),

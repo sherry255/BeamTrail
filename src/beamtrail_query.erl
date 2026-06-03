@@ -85,6 +85,9 @@ describe_loaded_events(RunId, Mod, State, Events) ->
       parked => Parked,
       parked_reason => maps:get(parked_reason, State, undefined),
       parked_at => maps:get(parked_at, State, undefined),
+      signals => maps:get(signals, State, []),
+      wait_reason => maps:get(wait_reason, State, undefined),
+      waiting_since => maps:get(waiting_since, State, undefined),
       migration_required_for_version_change =>
           maps:get(migration_required_for_version_change, State, false),
       pending_attempt => maps:get(pending_attempt, State, undefined),

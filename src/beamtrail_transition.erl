@@ -123,6 +123,8 @@ dispatch_command(RunId, State, Lease, Options, Command) ->
             complete_with_result(RunId, State, Lease, Result);
         {fail, Reason} ->
             fail_with_decider_reason(RunId, State, Lease, Reason);
+        {wait, Reason} ->
+            wait_for_signal(RunId, State, Lease, Reason);
         {run_step, StepId, StepInput} ->
             run_step(RunId, State, StepId, StepInput, Lease, Options)
     end.
@@ -204,11 +206,26 @@ fail_with_decider_reason(RunId, State, Lease, Reason) ->
         class => error_key(Reason),
         failed_at => erlang:system_time(millisecond)}).
 
+wait_for_signal(_RunId, #{status := waiting, wait_reason := Reason} = State,
+                _Lease, Reason) ->
+    {ok, State};
+wait_for_signal(RunId, State, Lease, Reason) ->
+    append_event_decision(
+      RunId, State, Lease, 'workflow.waiting', undefined,
+      #{reason => Reason,
+        waiting_since => erlang:system_time(millisecond)}).
+
 append_decider_failure(RunId, State, Lease, FailurePayload) ->
     append_terminal_decision(
       RunId, State, Lease, 'workflow.failed', undefined, FailurePayload).
 
 append_terminal_decision(RunId, State, Lease, EventType, StepId, Payload) ->
+    append_event_decision(RunId, State, Lease, EventType, StepId, Payload, true).
+
+append_event_decision(RunId, State, Lease, EventType, StepId, Payload) ->
+    append_event_decision(RunId, State, Lease, EventType, StepId, Payload, false).
+
+append_event_decision(RunId, State, Lease, EventType, StepId, Payload, ForceSnapshot) ->
     case append_event(
            RunId,
            maps:get(last_event_seq, State, 0),
@@ -220,7 +237,7 @@ append_terminal_decision(RunId, State, Lease, EventType, StepId, Payload) ->
            Payload) of
         {ok, Event} ->
             State1 = apply_runtime_event(State, Event),
-            _ = maybe_snapshot_state(RunId, State1, true),
+            _ = maybe_snapshot_state(RunId, State1, ForceSnapshot),
             {ok, State1};
         {error, _} = Error ->
             Error

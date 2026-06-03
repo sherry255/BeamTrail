@@ -44,6 +44,8 @@ decision_view(State) ->
       current_step => maps:get(current_step, State, undefined),
       results => maps:get(results, State, []),
       workflow_result => maps:get(workflow_result, State, undefined),
+      signals => maps:get(signals, State, []),
+      wait_reason => maps:get(wait_reason, State, undefined),
       attempts => maps:get(attempts, State, []),
       failure => maps:get(failure, State, undefined)}.
 
@@ -52,6 +54,8 @@ validate_command(complete, _State) ->
 validate_command({complete, _Result} = Command, _State) ->
     {ok, Command};
 validate_command({fail, _Reason} = Command, _State) ->
+    {ok, Command};
+validate_command({wait, _Reason} = Command, _State) ->
     {ok, Command};
 validate_command({run_step, StepId}, State) ->
     validate_run_step({run_step, StepId, maps:get(input, State)}, State);
