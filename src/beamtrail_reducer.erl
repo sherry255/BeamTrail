@@ -6,6 +6,8 @@
 new() ->
     #{run_id => undefined,
       workflow => undefined,
+      decider => legacy,
+      decider_version => 1,
       input => undefined,
       steps => [],
       status => new,
@@ -65,6 +67,8 @@ apply_event_type('workflow.instance.created', State, Event) ->
     Steps = maps:get(steps, Payload, []),
     State#{run_id => maps:get(run_id, Event),
            workflow => maps:get(workflow, Payload),
+           decider => maps:get(decider, Payload, legacy),
+           decider_version => maps:get(decider_version, Payload, 1),
            input => maps:get(input, Payload),
            steps => Steps,
            status => running,

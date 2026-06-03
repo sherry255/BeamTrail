@@ -24,6 +24,8 @@ snapshot_schema_definition() ->
            completed_steps,
            created_at,
            current_step,
+           decider,
+           decider_version,
            failure,
            input,
            last_event_seq,
@@ -131,13 +133,15 @@ enrich_version_migration(State) ->
     %% documented replay policy ("recover and retry in-flight work with
     %% recorded step_version").
     Workflow = maps:get(workflow, State),
-    MigrationRequired =
+    AttemptMigrationRequired =
         case maps:get(pending_attempt, State, undefined) of
             #{step_id := StepId, step_version := RecordedVersion} ->
                 current_step_version(Workflow, StepId) =/= RecordedVersion;
             _ ->
                 false
         end,
+    DeciderMigrationRequired = decider_version_changed(State, Workflow),
+    MigrationRequired = AttemptMigrationRequired orelse DeciderMigrationRequired,
     State#{migration_required_for_version_change => MigrationRequired}.
 
 current_step_version(Workflow, StepId) ->
@@ -145,4 +149,24 @@ current_step_version(Workflow, StepId) ->
         Version -> Version
     catch
         _:_ -> undefined
+    end.
+
+decider_version_changed(#{decider := module,
+                          decider_version := RecordedVersion}, Workflow) ->
+    current_decider_version(Workflow) =/= RecordedVersion;
+decider_version_changed(_State, _Workflow) ->
+    false.
+
+current_decider_version(Workflow) ->
+    _ = code:ensure_loaded(Workflow),
+    case erlang:function_exported(Workflow, decider_version, 0) of
+        true ->
+            try Workflow:decider_version() of
+                Version when is_integer(Version), Version >= 0 -> Version;
+                _Other -> undefined
+            catch
+                _:_ -> undefined
+            end;
+        false ->
+            1
     end.

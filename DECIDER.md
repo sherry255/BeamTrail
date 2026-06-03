@@ -36,8 +36,8 @@ The first dataflow foundation is implemented:
 
 The fields are durable and inspectable today. Legacy linear workflows still set
 `StepInput = WorkflowInput`. Decider workflows can choose explicit step inputs
-from the reduced view. The next implementation step is adding `decider_version/0`
-and exposing decider metadata in `beamtrail_query:describe/1`.
+from the reduced view. Decider mode and `decider_version` are persisted on run
+creation and exposed through `beamtrail_query:describe/1`.
 
 ## Position
 
@@ -259,7 +259,7 @@ Full static verification of determinism is out of scope.
 Dynamic deciders make workflow definition versioning more important than static
 linear plans.
 
-The proposed v0.3 rule is conservative:
+The implemented v0.3 rule is conservative:
 
 - Add optional `decider_version/0`.
 - If `decide/1` is implemented, record the current `decider_version` in
@@ -269,7 +269,11 @@ The proposed v0.3 rule is conservative:
 - If they differ, set the existing migration-required gate and refuse automatic
   progress.
 
-Default version is `1` when the callback is absent.
+Default version is `1` when the callback is absent. A run created without
+decider metadata is treated as `decider => legacy, decider_version => 1`, so old
+logs do not start using a newly-added `decide/1` callback by accident. If
+`decider_version/0` raises or returns a value that is not a non-negative integer,
+run creation fails before `workflow.instance.created` is appended.
 
 This is not a migration system. It is a safety gate. Actual migration can later
 be implemented through explicit operator actions or workflow-defined migration
@@ -334,8 +338,8 @@ the current recovery and append semantics intact.
 3. Done: add the legacy decider adapter and keep existing tests green.
 4. Done: add optional `decide/1` behaviour callback and command validation.
 5. Done: route dispatch through decider commands when no attempt is pending.
-6. Add `decider_version/0` safety gate.
-7. Expose decider metadata in `beamtrail_query:describe/1`.
+6. Done: add `decider_version/0` safety gate.
+7. Done: expose decider metadata in `beamtrail_query:describe/1`.
 8. Add examples that branch on previous step results.
 
 Each step should keep the event log replayable and PostgreSQL/memory adapters in

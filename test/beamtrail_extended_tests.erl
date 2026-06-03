@@ -18,6 +18,7 @@ extended_test_() ->
       fun await_terminal_returns_terminal_state/0,
       fun await_terminal_times_out_for_nonterminal_run/0,
       fun query_describe_exposes_read_model/0,
+      fun query_describe_exposes_decider_metadata/0,
       fun query_describe_exposes_step_results/0,
       fun query_describe_exposes_pending_step_input/0,
       fun query_instance_current_step_matches_reducer/0,
@@ -35,8 +36,12 @@ extended_test_() ->
       fun load_state_ignores_obsolete_snapshot_revision/0,
       fun snapshot_schema_contract_pins_revision_to_state_shape/0,
       fun reducer_records_step_results_and_workflow_result/0,
+      fun reducer_tracks_decider_metadata/0,
       fun reducer_applies_cancelled_parked_and_resumed/0,
       fun legacy_decider_returns_linear_commands/0,
+      fun start_workflow_records_module_decider_metadata/0,
+      fun start_workflow_records_custom_decider_version/0,
+      fun legacy_created_runs_ignore_later_decider_callback/0,
       fun workflow_decider_validates_commands/0,
       fun workflow_decider_catches_callback_errors/0,
       fun workflow_decider_run_step_uses_command_step_input/0,
@@ -75,9 +80,11 @@ extended_test_() ->
       fun active_runner_reuses_loaded_state_across_steps/0,
       fun query_describe_exposes_run_control_state/0,
       fun dispatch_refuses_version_mismatch_without_migration/0,
+      fun dispatch_refuses_decider_version_mismatch_without_migration/0,
       fun completed_step_version_change_does_not_block_next_step/0,
       fun scanner_skips_migration_blocked_runs/0,
       fun start_workflow_returns_structured_steps_callback_error/0,
+      fun start_workflow_returns_structured_decider_version_callback_error/0,
       fun start_workflow_rejects_non_atom_step_ids/0,
       fun step_version_callback_error_fails_terminally/0,
       fun idempotency_key_callback_error_fails_terminally/0,
@@ -141,6 +148,7 @@ cleanup(_) ->
     ok = application:unset_env(beamtrail, lease_ttl_ms),
     ok = application:unset_env(beamtrail, max_recoveries_per_attempt),
     ok = application:unset_env(beamtrail, workflow_modules),
+    ok = application:unset_env(beamtrail, bt_decider_versioned_workflow_version),
     ok = application:unset_env(beamtrail, storage_adapter),
     ok = beamtrail_memory_storage:reset().
 
@@ -333,6 +341,19 @@ query_describe_exposes_read_model() ->
     ?assertMatch(#{api := <<"beamtrail_query:describe/1">>,
                    run_id := RunId}, maps:get(query, Q)),
     ?assertEqual(false, maps:get(migration_required_for_version_change, Q)).
+
+query_describe_exposes_decider_metadata() ->
+    RunId = <<"query-decider-metadata-run-1">>,
+    ok = application:set_env(beamtrail,
+                             bt_decider_versioned_workflow_version,
+                             7),
+    {ok, RunId} = beamtrail:start_workflow(
+                    bt_decider_versioned_workflow,
+                    #{order_id => <<"o-query-decider-metadata-1">>},
+                    #{run_id => RunId, auto_dispatch => false}),
+    Q = beamtrail_query:describe(RunId),
+    ?assertEqual(module, maps:get(decider, Q)),
+    ?assertEqual(7, maps:get(decider_version, Q)).
 
 query_describe_exposes_step_results() ->
     Input = #{order_id => <<"o-q-results-1">>, test_pid => self()},
@@ -590,6 +611,21 @@ reducer_records_step_results_and_workflow_result() ->
                  maps:get(results, State)),
     ?assertEqual(#{ok => true}, maps:get(workflow_result, State)).
 
+reducer_tracks_decider_metadata() ->
+    RunId = <<"reducer-decider-run-1">>,
+    State = beamtrail_reducer:from_events(
+              [#{run_id => RunId,
+                 event_seq => 1,
+                 event_type => 'workflow.instance.created',
+                 payload => #{workflow => bt_decider_workflow,
+                              input => #{},
+                              steps => [charge],
+                              decider => module,
+                              decider_version => 7},
+                 occurred_at => 1}]),
+    ?assertEqual(module, maps:get(decider, State)),
+    ?assertEqual(7, maps:get(decider_version, State)).
+
 reducer_applies_cancelled_parked_and_resumed() ->
     Created =
         #{run_id => <<"control-run">>,
@@ -702,6 +738,47 @@ legacy_decider_returns_linear_commands() ->
                                             ChargeSucceeded, ShipStarted,
                                             ShipSucceeded]),
     ?assertEqual(complete, beamtrail_decider:legacy_decide(State2)).
+
+start_workflow_records_module_decider_metadata() ->
+    RunId = <<"decider-metadata-run-1">>,
+    Input = #{order_id => <<"o-decider-metadata-1">>,
+              command => {run_step, charge}},
+    {ok, RunId} = beamtrail:start_workflow(bt_decider_workflow, Input,
+                                           #{run_id => RunId,
+                                             auto_dispatch => false}),
+    {ok, [#{event_type := 'workflow.instance.created',
+            payload := Payload}]} = beamtrail:events(RunId),
+    ?assertEqual(module, maps:get(decider, Payload)),
+    ?assertEqual(1, maps:get(decider_version, Payload)).
+
+start_workflow_records_custom_decider_version() ->
+    RunId = <<"decider-versioned-run-1">>,
+    ok = application:set_env(beamtrail,
+                             bt_decider_versioned_workflow_version,
+                             7),
+    {ok, RunId} = beamtrail:start_workflow(
+                    bt_decider_versioned_workflow,
+                    #{order_id => <<"o-decider-versioned-1">>},
+                    #{run_id => RunId, auto_dispatch => false}),
+    {ok, [#{event_type := 'workflow.instance.created',
+            payload := Payload}]} = beamtrail:events(RunId),
+    ?assertEqual(module, maps:get(decider, Payload)),
+    ?assertEqual(7, maps:get(decider_version, Payload)).
+
+legacy_created_runs_ignore_later_decider_callback() ->
+    RunId = <<"legacy-created-decider-run-1">>,
+    Input = #{order_id => <<"o-legacy-created-decider-1">>,
+              command => {run_step, ship, #{order_id => <<"wrong">>}}},
+    State = beamtrail_reducer:from_events(
+              [#{run_id => RunId,
+                 event_seq => 1,
+                 event_type => 'workflow.instance.created',
+                 payload => #{workflow => bt_decider_workflow,
+                              input => Input,
+                              steps => [charge, ship]},
+                 occurred_at => 1}]),
+    ?assertEqual({ok, {run_step, charge, Input}},
+                 beamtrail_decider:decide(State)).
 
 workflow_decider_validates_commands() ->
     State = decider_state({run_step, charge, #{order_id => <<"o-step-input">>}}),
@@ -1416,6 +1493,30 @@ dispatch_refuses_version_mismatch_without_migration() ->
     ?assertEqual(0, length([E || E <- Events,
                             maps:get(event_type, E) =:= 'step.succeeded'])).
 
+dispatch_refuses_decider_version_mismatch_without_migration() ->
+    RunId = <<"decider-version-gate-run-1">>,
+    Input = #{order_id => <<"o-decider-version-gate-1">>,
+              test_pid => self()},
+    {ok, _} = beamtrail_memory_storage:append_event(
+                RunId, 0, undefined,
+                'workflow.instance.created', undefined, undefined,
+                undefined,
+                #{workflow => bt_decider_versioned_workflow,
+                  input => Input,
+                  steps => [charge],
+                  decider => module,
+                  decider_version => 1}),
+    ok = application:set_env(beamtrail,
+                             bt_decider_versioned_workflow_version,
+                             2),
+    ?assertMatch({error, {migration_required, _}}, beamtrail:dispatch(RunId)),
+    ?assertEqual(timeout, receive_exec_short()),
+    State = beamtrail:get_state(RunId),
+    ?assertEqual(true, maps:get(migration_required_for_version_change, State)),
+    {ok, Events} = beamtrail:events(RunId),
+    ?assertEqual(0, length([E || E <- Events,
+                            maps:get(event_type, E) =:= 'attempt.started'])).
+
 completed_step_version_change_does_not_block_next_step() ->
     RunId = <<"completed-version-change-run-1">>,
     Input = #{order_id => <<"o-completed-version-1">>, test_pid => self()},
@@ -1475,6 +1576,20 @@ start_workflow_returns_structured_steps_callback_error() ->
                  beamtrail:start_workflow(bt_bad_steps_workflow,
                                           #{order_id => <<"o-bad-steps-1">>},
                                           #{run_id => RunId})),
+    ?assertEqual({ok, []}, beamtrail:events(RunId)).
+
+start_workflow_returns_structured_decider_version_callback_error() ->
+    RunId = <<"bad-decider-version-run-1">>,
+    ?assertMatch({error,
+                  {create_failed, RunId,
+                   {bad_workflow_callback, decider_version,
+                    #{callback := decider_version,
+                      class := error,
+                      reason := bad_decider_version_crash}}}},
+                 beamtrail:start_workflow(
+                   bt_bad_decider_version_workflow,
+                   #{order_id => <<"o-bad-decider-version-1">>},
+                   #{run_id => RunId})),
     ?assertEqual({ok, []}, beamtrail:events(RunId)).
 
 start_workflow_rejects_non_atom_step_ids() ->
@@ -1944,7 +2059,9 @@ decider_state(Command) ->
          event_type => 'workflow.instance.created',
          payload => #{workflow => bt_decider_workflow,
                       input => Input,
-                      steps => [charge, ship]},
+                      steps => [charge, ship],
+                      decider => module,
+                      decider_version => 1},
          occurred_at => 1}]).
 
 seed_migration_blocked(RunId) ->

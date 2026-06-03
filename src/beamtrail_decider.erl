@@ -3,12 +3,13 @@
 -export([decide/1, legacy_decide/1]).
 
 decide(State) ->
-    Workflow = maps:get(workflow, State),
-    _ = code:ensure_loaded(Workflow),
-    case erlang:function_exported(Workflow, decide, 1) of
-        true ->
+    case maps:get(decider, State, legacy) of
+        module ->
+            Workflow = maps:get(workflow, State),
             decide_with_workflow(State, Workflow);
-        false ->
+        legacy ->
+            {ok, legacy_decide(State)};
+        _Other ->
             {ok, legacy_decide(State)}
     end.
 

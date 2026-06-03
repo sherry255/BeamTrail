@@ -19,6 +19,9 @@ are pre-stable and may include breaking API or storage changes.
   `run_step` or `complete` commands without changing existing behavior.
 - Optional workflow `decide/1` callback with command validation and dispatch
   routing for one-command-at-a-time dataflow.
+- Optional workflow `decider_version/0` callback. Decider mode and version are
+  recorded at creation, exposed through `beamtrail_query:describe/1`, and used
+  to gate old histories as migration-required when orchestration logic changes.
 
 ## [0.2.0-pre.1] - 2026-06-03
 

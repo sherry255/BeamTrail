@@ -32,6 +32,8 @@ Current scope:
 - Per-attempt step inputs persisted on `attempt.started`
 - Optional deterministic `decide/1` callback for one-command-at-a-time
   step selection, completion, failure, and explicit step inputs
+- Optional `decider_version/0` gate for decider workflows, with the recorded
+  version exposed through `beamtrail_query:describe/1`
 
 Not in scope yet:
 
@@ -92,6 +94,9 @@ With the PostgreSQL adapter, BeamTrail guarantees:
 - Workflow callback failures are captured as structured engine failures.
   `steps/1` failures return a structured create error before a run is written;
   runtime callback failures terminally fail the run.
+- Decider workflows record their decider mode and version at creation. If the
+  current `decider_version/0` differs from the recorded version, BeamTrail marks
+  the run as requiring migration and refuses automatic progress.
 
 BeamTrail does not guarantee exactly-once side effects. Workflow code must use
 the idempotency key in the execution context when it calls external systems.
@@ -239,6 +244,11 @@ storage adapters on the same contract and avoids hidden replay incompatibilities
 
 `execute/4` should treat `Ctx.idempotency_key` as the key for any external
 side effect.
+
+Workflow modules may also implement a deterministic `decide/1` callback to
+choose one durable command at a time. If `decide/1` is present, optional
+`decider_version/0` defaults to `1`; changing it gates old runs as requiring
+migration instead of silently replaying them through new orchestration logic.
 
 ## Querying
 

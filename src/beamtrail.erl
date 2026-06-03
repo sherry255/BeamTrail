@@ -48,20 +48,10 @@ start_workflow(Workflow, Input, Options) ->
         {ok, Steps} ->
             case validate_steps(Steps) of
                 ok ->
-                    case (storage()):append_event(
-                           RunId,
-                           0,
-                           undefined,
-                           'workflow.instance.created',
-                           undefined,
-                           undefined,
-                           undefined,
-                           #{workflow => Workflow, input => Input, steps => Steps}) of
-                        {ok, _Event} ->
-                            case maybe_snapshot(RunId, false) of
-                                ok -> start_workflow_dispatch(RunId, Options);
-                                {error, Reason} -> {error, {create_failed, RunId, Reason}}
-                            end;
+                    case workflow_decider_metadata(Workflow) of
+                        {ok, DeciderMetadata} ->
+                            append_created_event(RunId, Workflow, Input, Steps,
+                                                 DeciderMetadata, Options);
                         {error, Reason} ->
                             {error, {create_failed, RunId, Reason}}
                     end;
@@ -92,6 +82,61 @@ validate_step_list(Tail) ->
     {error, #{class => bad_steps,
               reason => improper_list,
               tail => Tail}}.
+
+append_created_event(RunId, Workflow, Input, Steps, DeciderMetadata, Options) ->
+    case (storage()):append_event(
+           RunId,
+           0,
+           undefined,
+           'workflow.instance.created',
+           undefined,
+           undefined,
+           undefined,
+           maps:merge(#{workflow => Workflow,
+                        input => Input,
+                        steps => Steps},
+                      DeciderMetadata)) of
+        {ok, _Event} ->
+            case maybe_snapshot(RunId, false) of
+                ok -> start_workflow_dispatch(RunId, Options);
+                {error, Reason} -> {error, {create_failed, RunId, Reason}}
+            end;
+        {error, Reason} ->
+            {error, {create_failed, RunId, Reason}}
+    end.
+
+workflow_decider_metadata(Workflow) ->
+    _ = code:ensure_loaded(Workflow),
+    case erlang:function_exported(Workflow, decide, 1) of
+        true ->
+            case workflow_decider_version(Workflow) of
+                {ok, Version} ->
+                    {ok, #{decider => module, decider_version => Version}};
+                {error, _} = Error ->
+                    Error
+            end;
+        false ->
+            {ok, #{decider => legacy, decider_version => 1}}
+    end.
+
+workflow_decider_version(Workflow) ->
+    case erlang:function_exported(Workflow, decider_version, 0) of
+        true ->
+            case safe_workflow_callback(decider_version,
+                                        fun() -> Workflow:decider_version() end) of
+                {ok, Version} when is_integer(Version), Version >= 0 ->
+                    {ok, Version};
+                {ok, Other} ->
+                    {error, {bad_decider_version,
+                             #{reason => not_a_non_negative_integer,
+                               value => Other}}};
+                {error, CallbackError} ->
+                    {error, {bad_workflow_callback, decider_version,
+                             CallbackError}}
+            end;
+        false ->
+            {ok, 1}
+    end.
 
 start_workflow_dispatch(RunId, Options) ->
     case maps:get(auto_dispatch, Options, true) of

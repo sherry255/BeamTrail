@@ -76,6 +76,8 @@ describe_loaded_events(RunId, Mod, State, Events) ->
       current_step => maps:get(current_step, State),
       workflow => Workflow,
       module => Workflow,
+      decider => maps:get(decider, State, legacy),
+      decider_version => maps:get(decider_version, State, 1),
       last_event_seq => LastSeq,
       next_retry_at => maps:get(next_retry_at, State, undefined),
       failure => maps:get(failure, State, undefined),

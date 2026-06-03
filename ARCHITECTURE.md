@@ -105,6 +105,12 @@ optional `decide/1`; BeamTrail validates its command before appending anything,
 and invalid commands or decider callback crashes become terminal workflow
 failures before an attempt is opened.
 
+Decider mode is recorded at creation as `legacy` or `module`. Runs created
+without decider metadata remain `legacy`, even if a later release adds
+`decide/1` to the workflow module. Decider workflows also record
+`decider_version`; a mismatch with the current `decider_version/0` gates the run
+as migration-required before the decider is called.
+
 Workflow callback errors are captured at the engine boundary. `steps/1` errors
 return a structured create failure before the run is written. Runtime callback
 errors from `step_version/1`, `idempotency_key/3`, or `timeout_ms/1` are written
@@ -197,6 +203,13 @@ and refuses to advance it automatically.
 
 Completed steps are not re-executed, so completed-step version changes do not
 block later steps.
+
+For decider workflows, `workflow.instance.created` records the decider mode and
+`decider_version`. If the currently deployed `decider_version/0` differs from
+the recorded version, BeamTrail sets the same migration-required gate and
+refuses automatic progress. This prevents old histories from being interpreted
+by changed orchestration logic. Legacy runs stay on the legacy decider adapter
+and are not switched to a newly-added `decide/1` callback automatically.
 
 ## Run Control Boundary
 
