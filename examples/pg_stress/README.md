@@ -37,6 +37,7 @@ runs=32 pool_size=5 sleep_ms=100 describe_sample=8 elapsed_ms=...
 completed=32 failed=0 timeout=0 other=0
 terminal_latency_ms=samples=32 p50=... p95=... max=...
 describe_ms=calls=... errors=0 samples=... p50=... p95=... max=...
+active_runner_statuses=#{executing => ...,not_found => ...}
 pool=#{busy => ...,size => ...,waiting => ...,available => ...,checkouts => ...}
 ```
 
@@ -46,6 +47,11 @@ PostgreSQL availability.
 
 `terminal_latency_ms` measures time from accepted `start_workflow/3` to terminal
 state. `describe_ms` is sampled while runs are in flight and exercises
-`beamtrail_query:describe/1` under the same pool pressure. Non-zero
-`describe_ms` errors or high p95/max values are a signal that active runner
-inspection is getting stuck behind storage I/O or connection checkout pressure.
+`beamtrail_query:describe/1` under the same pool pressure. The
+`active_runner_statuses` map is derived from the `active_runner` block in
+`describe/1`; non-zero `unresponsive` counts mean the registry found a live
+runner, but `beamtrail_run:info/1` could not answer within its timeout.
+
+Non-zero `describe_ms` errors, `active_runner_statuses.unresponsive`, or high
+p95/max values are a signal that active runner inspection is getting stuck
+behind storage I/O or connection checkout pressure.

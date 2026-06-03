@@ -146,6 +146,7 @@ result_latencies(Results) ->
 empty_probe_stats() ->
     #{calls => 0,
       errors => 0,
+      active_runner => #{},
       latencies => []}.
 
 probe_pending(_Pending, SampleSize, Stats) when SampleSize =< 0 ->
@@ -166,10 +167,18 @@ probe_runs([#{run_id := RunId} | Rest], Stats) ->
             #{run_id := RunId} -> Errors0;
             _ -> Errors0 + 1
         end,
+    ActiveRunnerStats = record_active_runner(Result,
+                                             maps:get(active_runner, Stats)),
     Stats1 = Stats#{calls => Calls,
                     errors => Errors,
+                    active_runner => ActiveRunnerStats,
                     latencies => [LatencyMs | maps:get(latencies, Stats)]},
     probe_runs(Rest, Stats1).
+
+record_active_runner(#{active_runner := #{status := Status}}, Stats) ->
+    bump(Status, Stats);
+record_active_runner(_Result, Stats) ->
+    Stats.
 
 take(_N, []) ->
     [];
@@ -182,7 +191,9 @@ print_probe_stats(Stats) ->
     Latencies = maps:get(latencies, Stats),
     io:format("describe_ms=calls=~p errors=~p ",
               [maps:get(calls, Stats), maps:get(errors, Stats)]),
-    print_latency_values(Latencies).
+    print_latency_values(Latencies),
+    io:format("active_runner_statuses=~p~n",
+              [maps:get(active_runner, Stats)]).
 
 print_latency(Label, Latencies) ->
     io:format("~s=", [Label]),
