@@ -31,6 +31,8 @@ The first dataflow foundation is implemented:
   before opening an attempt
 - `beamtrail_query:describe/1` exposes results, workflow result, and the
   current pending attempt
+- test coverage includes a result-branching decider workflow that reads a
+  prior `charge` result and passes a derived shipment input to `ship`
 - snapshot schema revision includes the new state keys and attempt keys, so old
   snapshots replay from events instead of loading an incompatible shape
 
@@ -340,7 +342,8 @@ the current recovery and append semantics intact.
 5. Done: route dispatch through decider commands when no attempt is pending.
 6. Done: add `decider_version/0` safety gate.
 7. Done: expose decider metadata in `beamtrail_query:describe/1`.
-8. Add examples that branch on previous step results.
+8. Done: add an executable result-branching example test that uses previous
+   step results to select the next step input.
 
 Each step should keep the event log replayable and PostgreSQL/memory adapters in
 lockstep.

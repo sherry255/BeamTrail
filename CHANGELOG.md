@@ -22,6 +22,8 @@ are pre-stable and may include breaking API or storage changes.
 - Optional workflow `decider_version/0` callback. Decider mode and version are
   recorded at creation, exposed through `beamtrail_query:describe/1`, and used
   to gate old histories as migration-required when orchestration logic changes.
+- Executable decider dataflow coverage showing a workflow that reads a prior
+  step result and passes a derived input into the next step.
 
 ## [0.2.0-pre.1] - 2026-06-03
 

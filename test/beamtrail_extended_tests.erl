@@ -45,6 +45,7 @@ extended_test_() ->
       fun workflow_decider_validates_commands/0,
       fun workflow_decider_catches_callback_errors/0,
       fun workflow_decider_run_step_uses_command_step_input/0,
+      fun workflow_decider_branches_on_prior_step_result/0,
       fun workflow_decider_invalid_command_fails_terminally/0,
       fun workflow_decider_callback_error_fails_terminally/0,
       fun storage_lists_run_ids_with_cursor/0,
@@ -827,6 +828,40 @@ workflow_decider_run_step_uses_command_step_input() ->
        ['workflow.instance.created', 'attempt.started', 'step.succeeded',
         'workflow.completed'],
        [maps:get(event_type, E) || E <- Events]).
+
+workflow_decider_branches_on_prior_step_result() ->
+    RunId = <<"decider-result-branch-run-1">>,
+    ShipInput = #{order_id => <<"o-decider-result-branch-1">>,
+                  address => <<"1 OTP Way">>,
+                  carrier => <<"beam-post">>,
+                  test_pid => self()},
+    Input = #{order_id => <<"o-decider-result-branch-1">>,
+              amount => 5000,
+              ship_to => <<"1 OTP Way">>,
+              test_pid => self()},
+    {ok, RunId} = beamtrail:start_workflow(
+                    bt_result_branching_workflow,
+                    Input,
+                    #{run_id => RunId}),
+    ?assertEqual({result_branch_executed, charge, Input}, receive_exec()),
+    ?assertEqual({result_branch_executed, ship, ShipInput}, receive_exec()),
+    {ok, State} = beamtrail:await_terminal(RunId, 1000),
+    ?assertMatch(#{status := completed,
+                   workflow_result := #{fulfilled := true,
+                                        shipment := ShipInput}},
+                 State),
+    {ok, Events} = beamtrail:events(RunId),
+    Started = [E || E <- Events, maps:get(event_type, E) =:= 'attempt.started'],
+    ?assertMatch([_, _], Started),
+    [ChargeStarted, ShipStarted] = Started,
+    ?assertEqual(Input, maps:get(step_input, maps:get(payload, ChargeStarted))),
+    ?assertEqual(ShipInput, maps:get(step_input, maps:get(payload, ShipStarted))),
+    Q = beamtrail_query:describe(RunId),
+    ?assertMatch([#{step_id := charge,
+                    result := #{paid := true, shipment := ShipInput}},
+                  #{step_id := ship,
+                    result := #{shipped := true}}],
+                 maps:get(results, Q)).
 
 workflow_decider_invalid_command_fails_terminally() ->
     RunId = <<"decider-invalid-run-1">>,
