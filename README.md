@@ -2,45 +2,56 @@
 
 [![CI](https://github.com/sherry255/BeamTrail/actions/workflows/ci.yml/badge.svg)](https://github.com/sherry255/BeamTrail/actions/workflows/ci.yml)
 
-BeamTrail is a PostgreSQL-backed durable workflow runtime for Erlang/OTP.
+BeamTrail is a BEAM-native durable step runner for Erlang/OTP systems.
 
-It records each workflow run as an append-only event stream, rebuilds state by
-reducing events, and executes workflow steps with retries, timeouts, leases,
-fencing, snapshots, active runners, scanner recovery, and an optional
-event-sourced decider callback.
+It is not a Temporal clone and not a job queue. BeamTrail is an embedded OTP
+library for business processes that need a durable identity, an event history,
+supervised execution, retries, timers, signals, and crash recovery without
+running a separate workflow service.
 
-## Status
+Active runs are ordinary supervised OTP processes. Durable truth lives in
+PostgreSQL as append-only events, snapshots, leases, and fencing tokens. If the
+VM dies, another runner can rebuild the run from the event log and continue from
+the last recorded boundary.
 
-BeamTrail is an MVP. The durable path is implemented through
-`beamtrail_postgres_storage`; the default `beamtrail_memory_storage` adapter is
+## What It Is
+
+- A PostgreSQL-backed event log with expected-sequence append checks and
+  per-run locking.
+- A supervised active runner per live run, with scanner recovery for abandoned
+  runs.
+- A deterministic decider path for one-command-at-a-time orchestration,
+  explicit step inputs, durable signals, durable timers, and waits.
+- Durable run control: cancel, park/resume, and manual requeue.
+- Inspector data through `beamtrail_query:describe/1`.
+- A memory adapter for local development and tests.
+
+## When To Use It
+
+Use BeamTrail when an Erlang/OTP application already has PostgreSQL and needs a
+small embedded runtime for long-running business steps: order fulfillment,
+approval deadlines, webhook-driven flows, retryable external calls, or
+agent-like runs that must survive VM restart.
+
+Do not use it when you need a mature multi-language workflow platform, a hosted
+control plane, a general DAG scheduler, or exactly-once side effects.
+
+## Current Status
+
+BeamTrail is an MVP with a working PostgreSQL durability path through
+`beamtrail_postgres_storage`. The default `beamtrail_memory_storage` adapter is
 for local development and tests only.
 
-Current scope:
+Available now:
 
-- Linear step lists
+- Linear step lists and an optional decider callback
 - Durable event log and snapshots
-- Expected-sequence append checks
-- Per-run PostgreSQL append locking
-- Leases and fencing tokens
+- Leases, fencing tokens, and PostgreSQL append locking
 - Supervised active run processes
-- Retry backoff and step/workflow timeouts
-- Scanner recovery for unfinished attempts
+- Retry backoff, step/workflow timeouts, and crash recovery
 - Version mismatch gating during replay
-- Durable run control: cancel, park/resume, and manual requeue
-- Inspector data through `beamtrail_query:describe/1`
-- Step result history exposed through the reducer state and inspector
-- Per-attempt step inputs persisted on `attempt.started`
-- Optional deterministic `decide/1` callback for one-command-at-a-time
-  step selection, completion, failure, and explicit step inputs
-- Optional `decider_version/0` gate for decider workflows, with the recorded
-  version exposed through `beamtrail_query:describe/1`
-- Minimal durable signals: `signal_run/3` records `signal.received`, while
-  decider workflows can return `{wait, Reason}` to stop until a signal arrives
-- Scanner-driven durable timers: decider workflows can return `{sleep, TimerId,
-  DelayMs}` or `{sleep_until, TimerId, FireAtMs}`; due timers materialize as
-  `timer.fired` events before the decider continues
-- Executable human approval deadline pattern built from durable signals,
-  durable timers, and `{wait, Reason}`
+- Durable signals and scanner-driven durable timers
+- Executable human approval deadline pattern
 
 Not in scope yet:
 
@@ -74,18 +85,9 @@ process ownership, transparent failure semantics, and a small operational
 surface. It is not trying to match every Temporal feature before it becomes
 useful.
 
-For the OTP/process boundary and recovery model, see [Architecture and Failure
-Model](ARCHITECTURE.md).
-
-For the decider and step-result dataflow layer, see
-[Decider and Dataflow Design](DECIDER.md).
-
-For the durable timer primitive, see [Durable Timer Design](TIMER.md).
-
-For the human approval deadline pattern, see
-[Human Approval Deadline Pattern](APPROVAL.md).
-
-For planned work and contribution areas, see [Roadmap](ROADMAP.md) and
+Design docs: [Architecture and Failure Model](ARCHITECTURE.md),
+[Decider and Dataflow Design](DECIDER.md), [Durable Timer Design](TIMER.md),
+[Human Approval Deadline Pattern](APPROVAL.md), [Roadmap](ROADMAP.md), and
 [Contributing](CONTRIBUTING.md).
 
 ## Guarantees
