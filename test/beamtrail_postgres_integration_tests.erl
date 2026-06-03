@@ -15,6 +15,7 @@ postgres_integration_test_() ->
               fun postgres_recovery_budget_exceeded_fails_open_attempt/0,
               fun postgres_signal_wakes_waiting_workflow/0,
               fun postgres_timer_wakes_waiting_workflow/0,
+              fun postgres_approval_signal_before_deadline_completes/0,
               fun postgres_list_recoverable_uses_indexed_projection/0,
               fun postgres_release_lease_preserves_fencing/0,
               fun postgres_recoverable_index_excludes_parked_runs/0,
@@ -173,6 +174,38 @@ postgres_timer_wakes_waiting_workflow() ->
         'workflow.waiting',
         'recovery.requeued',
         'timer.fired',
+       'workflow.completed'],
+       [maps:get(event_type, E) || E <- Events]).
+
+postgres_approval_signal_before_deadline_completes() ->
+    RunId = unique_run_id("pg-approval"),
+    Input = #{order_id => RunId,
+              deadline_at_ms => erlang:system_time(millisecond) + 60000,
+              test_pid => self()},
+    {ok, RunId} = beamtrail:start_workflow(
+                    bt_approval_deadline_workflow,
+                    Input,
+                    #{run_id => RunId}),
+    {ok, Waiting} = wait_for_state(RunId, waiting, 1000),
+    ?assertMatch(#{wait_reason := waiting_for_approval,
+                   next_wake_at := WakeAt} when is_integer(WakeAt),
+                 Waiting),
+    {ok, _Signalled} = beamtrail:signal_run(
+                         RunId, approved, #{approved_by => <<"ops">>}),
+    ?assertMatch({approval_workflow_executed, fulfill, _}, receive_exec()),
+    {ok, State} = beamtrail:await_terminal(RunId, 1000),
+    ?assertMatch(#{status := completed,
+                   workflow_result := #{fulfilled := true,
+                                        approved_by := <<"ops">>}},
+                 State),
+    {ok, Events} = beamtrail:events(RunId),
+    ?assertEqual(
+       ['workflow.instance.created',
+        'timer.scheduled',
+        'workflow.waiting',
+        'signal.received',
+        'attempt.started',
+        'step.succeeded',
         'workflow.completed'],
        [maps:get(event_type, E) || E <- Events]).
 

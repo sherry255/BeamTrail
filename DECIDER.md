@@ -67,6 +67,8 @@ The design is intentionally narrower:
   typed mailbox API yet
 - only scanner-driven durable timers; no timer cancellation, recurring timers,
   or local active-runner wakeup yet
+- human approval is currently an executable pattern built from signals, timers,
+  and waiting states, not a first-class task assignment subsystem
 - no separate activity task queues yet
 
 Those features should grow from the same command boundary later.

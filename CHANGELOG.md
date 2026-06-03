@@ -31,6 +31,8 @@ are pre-stable and may include breaking API or storage changes.
   DelayMs}` or `{sleep_until, TimerId, FireAtMs}`, the runtime appends
   `timer.scheduled`, due timers materialize as `timer.fired` under lease and
   fencing, and `next_wake_at_ms` drives recovery scans for waiting runs.
+- Human approval deadline pattern coverage showing signals and timers composed
+  into approve, reject, timeout, and stale-terminal safety paths.
 
 ## [0.2.0-pre.1] - 2026-06-03
 

@@ -39,11 +39,14 @@ Current scope:
 - Scanner-driven durable timers: decider workflows can return `{sleep, TimerId,
   DelayMs}` or `{sleep_until, TimerId, FireAtMs}`; due timers materialize as
   `timer.fired` events before the decider continues
+- Executable human approval deadline pattern built from durable signals,
+  durable timers, and `{wait, Reason}`
 
 Not in scope yet:
 
 - DAGs, fan-out/fan-in, or parallel command batches
 - Timer cancellation, recurring timers, or child workflows
+- First-class human task assignment, forms, escalation, or RBAC
 - HTTP API or browser UI
 - SQL-native JSON inspection
 - Built-in external side-effect deduplication
@@ -78,6 +81,9 @@ For the decider and step-result dataflow layer, see
 [Decider and Dataflow Design](DECIDER.md).
 
 For the durable timer primitive, see [Durable Timer Design](TIMER.md).
+
+For the human approval deadline pattern, see
+[Human Approval Deadline Pattern](APPROVAL.md).
 
 For planned work and contribution areas, see [Roadmap](ROADMAP.md) and
 [Contributing](CONTRIBUTING.md).
