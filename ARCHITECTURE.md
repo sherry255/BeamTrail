@@ -237,8 +237,9 @@ explicit step inputs from the reduced view.
 The decider is deliberately not a Temporal-style arbitrary workflow-code replay
 system; it is a deterministic callback over a reduced view that returns the next
 durable command. BeamTrail does not yet support DAGs, fan-out/fan-in, parallel
-command batches, child workflows, durable timers, or signals. See
-[Decider and Dataflow Design](DECIDER.md).
+command batches, child workflows, or durable timers. Minimal durable signals are
+implemented through `signal.received` events and `{wait, Reason}` commands. See
+[Decider and Dataflow Design](DECIDER.md) and [Durable Timer Design](TIMER.md).
 
 The recovery scan is driven by the `run projection` index (see Recovery), so it
 avoids snapshot/replay work for every historical run. The PostgreSQL adapter

@@ -74,6 +74,8 @@ Model](ARCHITECTURE.md).
 For the decider and step-result dataflow layer, see
 [Decider and Dataflow Design](DECIDER.md).
 
+For the next durable timer primitive, see [Durable Timer Design](TIMER.md).
+
 For planned work and contribution areas, see [Roadmap](ROADMAP.md) and
 [Contributing](CONTRIBUTING.md).
 

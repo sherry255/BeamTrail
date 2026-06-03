@@ -27,9 +27,12 @@ BeamTrail is a serious MVP. It has the core durable runtime shape:
 - durable run control APIs (`cancel_run/2`, `park_run/2`, `resume_run/1`,
   `requeue_run/2`)
 - structured workflow callback failure handling
+- event-sourced decider dataflow, explicit step inputs, and minimal durable
+  signals
 
-It is still early. It supports linear step lists, not DAGs, fan-out, signals,
-child workflows, HTTP APIs, or a browser UI.
+It is still early. It supports linear step lists and one-command-at-a-time
+deciders, not DAGs, fan-out, durable timers, child workflows, HTTP APIs, or a
+browser UI.
 
 ## Near Term: v0.2.x Library Credibility
 
@@ -70,9 +73,10 @@ Remaining:
 BeamTrail should grow workflow semantics carefully, without losing replay
 clarity.
 
-- Implement the v0.3 event-sourced decider described in
-  [DECIDER.md](DECIDER.md).
-- Pass prior step results into later steps through an explicit dataflow model.
+- Keep the v0.3 event-sourced decider described in [DECIDER.md](DECIDER.md)
+  small and deterministic.
+- Implement durable timers as described in [TIMER.md](TIMER.md), starting with
+  scanner-driven sleeps and waiting-run deadlines.
 - Add conditional steps through decider commands before adding arbitrary dynamic
   control flow.
 - Add compensation hooks for saga-style workflows.

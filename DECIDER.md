@@ -157,7 +157,8 @@ Reserved future commands:
 ```
 
 Reserved commands must be rejected with a structured engine error until their
-subsystems exist.
+subsystems exist. The timer command design is tracked in
+[Durable Timer Design](TIMER.md).
 
 ## Step Input
 
