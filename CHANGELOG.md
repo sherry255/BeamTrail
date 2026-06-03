@@ -33,6 +33,8 @@ are pre-stable and may include breaking API or storage changes.
   fencing, and `next_wake_at_ms` drives recovery scans for waiting runs.
 - Human approval deadline pattern coverage showing signals and timers composed
   into approve, reject, timeout, and stale-terminal safety paths.
+- Crash recovery demo approval scenario showing a waiting approval run surviving
+  VM death, then resuming through either an approval signal or a deadline timer.
 
 ## [0.2.0-pre.1] - 2026-06-03
 

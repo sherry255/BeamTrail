@@ -322,11 +322,14 @@ Crash recovery demo:
 
 ```sh
 examples/crash_recovery/run.sh
+examples/crash_recovery/run.sh approval
 ```
 
-The demo starts PostgreSQL, kills an Erlang VM while a step attempt is open, then
-starts a second VM and uses the scanner's recovery primitive to complete the same
-attempt. See `examples/crash_recovery/README.md`.
+The default demo starts PostgreSQL, kills an Erlang VM while a step attempt is
+open, then starts a second VM and uses the scanner's recovery primitive to
+complete the same attempt. The `approval` scenario kills VMs while approval
+workflows are waiting, then demonstrates both signal-driven completion and
+timer-driven timeout recovery. See `examples/crash_recovery/README.md`.
 
 PostgreSQL stress harness:
 
