@@ -95,12 +95,24 @@ dispatch_ready(RunId, State, Lease, Options) ->
         true ->
             fail_workflow_with_timeout(RunId, State, Lease);
         false ->
-            case maps:get(current_step, State) of
-                undefined ->
-                    complete_if_needed(RunId, State, Lease);
-                StepId ->
-                    run_step(RunId, State, StepId, Lease, Options)
-            end
+            dispatch_not_timed_out(RunId, State, Lease, Options)
+    end.
+
+dispatch_not_timed_out(RunId, State, Lease, Options) ->
+    case maps:get(pending_attempt, State, undefined) of
+        #{step_id := StepId} = Attempt ->
+            StepInput = maps:get(step_input, Attempt, maps:get(input, State)),
+            run_step(RunId, State, StepId, StepInput, Lease, Options);
+        _ ->
+            dispatch_decision(RunId, State, Lease, Options)
+    end.
+
+dispatch_decision(RunId, State, Lease, Options) ->
+    case beamtrail_decider:legacy_decide(State) of
+        complete ->
+            complete_if_needed(RunId, State, Lease);
+        {run_step, StepId, StepInput} ->
+            run_step(RunId, State, StepId, StepInput, Lease, Options)
     end.
 
 workflow_timeout_exceeded(State) ->
@@ -167,10 +179,9 @@ complete_if_needed(RunId, State, Lease) ->
             end
     end.
 
-run_step(RunId, State, StepId, Lease, Options) ->
+run_step(RunId, State, StepId, StepInput, Lease, Options) ->
     Workflow = maps:get(workflow, State),
-    Input = maps:get(input, State),
-    case ensure_attempt_started(RunId, Workflow, Input, State, StepId, Lease) of
+    case ensure_attempt_started(RunId, Workflow, StepInput, State, StepId, Lease) of
         {ok, Attempt, StartedNow, State1} ->
             Options1 = Options#{runner_state => State1},
             case StartedNow of
@@ -182,7 +193,7 @@ run_step(RunId, State, StepId, Lease, Options) ->
             end,
             case maps:get(runner_mode, Options, dispatch) of
                 prepare ->
-                    case execution_spec(RunId, Workflow, StepId, Input, Attempt) of
+                    case execution_spec(RunId, Workflow, StepId, StepInput, Attempt) of
                         {ok, ExecSpec} ->
                             {ok, {execute, Attempt, ExecSpec, State1}};
                         {error, {bad_workflow_callback, Callback, CallbackError}} ->
@@ -190,7 +201,7 @@ run_step(RunId, State, StepId, Lease, Options) ->
                               RunId, State1, Attempt, Callback, CallbackError, Lease)
                     end;
                 _ ->
-                    Result = execute_attempt(RunId, Workflow, Input, Attempt, Lease),
+                    Result = execute_attempt(RunId, Workflow, StepInput, Attempt, Lease),
                     case Result of
                         {ok, Value} ->
                             handle_step_success(RunId, Attempt, Value, Lease, Options1);

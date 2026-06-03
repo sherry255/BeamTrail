@@ -21,15 +21,17 @@ The first dataflow foundation is implemented:
 - `attempt.started` now persists the exact `step_input` for the attempt
 - open-attempt replay reuses the persisted `step_input`
 - old logs without `step_input` fall back to the original workflow input
+- the legacy linear plan is represented as decider commands internally:
+  `{run_step, StepId, StepInput}` or `complete`
 - `beamtrail_query:describe/1` exposes results, workflow result, and the
   current pending attempt
 - snapshot schema revision includes the new state keys and attempt keys, so old
   snapshots replay from events instead of loading an incompatible shape
 
 The fields are durable and inspectable today. Legacy linear workflows still set
-`StepInput = WorkflowInput`; the next implementation step is introducing the
-legacy decider adapter and command validation so new decider workflows can choose
-step inputs from the reduced view.
+`StepInput = WorkflowInput`; the next implementation step is adding optional
+`decide/1` and command validation so new decider workflows can choose step inputs
+from the reduced view.
 
 ## Position
 
@@ -323,7 +325,7 @@ the current recovery and append semantics intact.
 1. Done: add reducer `results` state and snapshot schema coverage.
 2. Done: persist `step_input` in `attempt.started`, defaulting to original input
    for legacy logs.
-3. Add the legacy decider adapter and keep existing tests green.
+3. Done: add the legacy decider adapter and keep existing tests green.
 4. Add optional `decide/1` behaviour callback and command validation.
 5. Route dispatch through decider commands when no attempt is pending.
 6. Add `decider_version/0` safety gate.

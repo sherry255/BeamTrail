@@ -97,6 +97,11 @@ future decider workflows can choose a different input before crossing the
 execution boundary. Recovery of an open attempt reuses the persisted
 `step_input` and does not re-run the decider.
 
+The current linear plan is already routed through an internal legacy decider
+adapter. That adapter turns the reduced state into `complete` or
+`{run_step, StepId, StepInput}` commands, preserving the old behavior while
+making the transition loop decider-shaped.
+
 Workflow callback errors are captured at the engine boundary. `steps/1` errors
 return a structured create failure before the run is written. Runtime callback
 errors from `step_version/1`, `idempotency_key/3`, or `timeout_ms/1` are written

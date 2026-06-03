@@ -15,6 +15,8 @@ are pre-stable and may include breaking API or storage changes.
 - Per-attempt `step_input` persisted on `attempt.started` and exposed through
   the pending attempt query view, with legacy logs falling back to the original
   workflow input.
+- Internal legacy decider adapter that represents linear workflow progress as
+  `run_step` or `complete` commands without changing existing behavior.
 
 ## [0.2.0-pre.1] - 2026-06-03
 
