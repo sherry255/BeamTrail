@@ -88,9 +88,8 @@ useful.
 Design docs: [Design Rationale](design-rationale.md),
 [Architecture and Failure Model](ARCHITECTURE.md),
 [Decider and Dataflow Design](DECIDER.md), [Durable Timer Design](TIMER.md),
-[Human Approval Deadline Pattern](APPROVAL.md), [Roadmap](ROADMAP.md), and
-
-
+[Human Approval Deadline Pattern](APPROVAL.md), and [Roadmap](ROADMAP.md).
+Contribution guidelines:
 [Contributing](CONTRIBUTING.md).
 
 ## Guarantees
