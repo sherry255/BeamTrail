@@ -8,6 +8,7 @@ RUNS="${BEAMTRAIL_STRESS_RUNS:-32}"
 SLEEP_MS="${BEAMTRAIL_STRESS_SLEEP_MS:-100}"
 POOL_SIZE="${BEAMTRAIL_STRESS_POOL_SIZE:-5}"
 DESCRIBE_SAMPLE="${BEAMTRAIL_STRESS_DESCRIBE_SAMPLE:-8}"
+SCENARIO="${1:-${BEAMTRAIL_STRESS_SCENARIO:-load}}"
 WORKDIR="${TMPDIR:-/tmp}/beamtrail-pg-stress"
 DEMO_EBIN="${WORKDIR}/ebin"
 
@@ -58,9 +59,22 @@ erlc -pa "$ROOT/_build/default/lib/beamtrail/ebin" \
      -o "$DEMO_EBIN" \
      "$ROOT"/examples/pg_stress/src/*.erl
 
-echo "==> Running ${RUNS} workflows with pool_size=${POOL_SIZE}, sleep_ms=${SLEEP_MS}, describe_sample=${DESCRIBE_SAMPLE}"
-erl -noshell -pa "$DEMO_EBIN" $(code_path_args) \
-    -eval "bt_pg_stress:run(\"${RUNS}\", \"${SLEEP_MS}\", \"${POOL_SIZE}\", \"${PORT}\", \"${DESCRIBE_SAMPLE}\")."
+case "$SCENARIO" in
+    load)
+        echo "==> Running ${RUNS} workflows with pool_size=${POOL_SIZE}, sleep_ms=${SLEEP_MS}, describe_sample=${DESCRIBE_SAMPLE}"
+        erl -noshell -pa "$DEMO_EBIN" $(code_path_args) \
+            -eval "bt_pg_stress:run(\"${RUNS}\", \"${SLEEP_MS}\", \"${POOL_SIZE}\", \"${PORT}\", \"${DESCRIBE_SAMPLE}\")."
+        ;;
+    recovery)
+        echo "==> Running recovery scenarios with pool_size=${POOL_SIZE}"
+        erl -noshell -pa "$DEMO_EBIN" $(code_path_args) \
+            -eval "bt_pg_stress:run_recovery(\"${POOL_SIZE}\", \"${PORT}\", \"${WORKDIR}\")."
+        ;;
+    *)
+        echo "Unknown scenario: ${SCENARIO}. Use load or recovery." >&2
+        exit 64
+        ;;
+esac
 
 echo
 echo "Stress run completed. Set KEEP_BEAMTRAIL_STRESS=1 to keep ${WORKDIR} and ${CONTAINER}."

@@ -7,7 +7,7 @@ append path, and terminal-state polling under concurrent load.
 The current goal is to make pool pressure visible before refactoring the runner
 or storage I/O path.
 
-## Run
+## Load mode
 
 ```sh
 examples/pg_stress/run.sh
@@ -55,3 +55,32 @@ runner, but `beamtrail_run:info/1` could not answer within its timeout.
 Non-zero `describe_ms` errors, `active_runner_statuses.unresponsive`, or high
 p95/max values are a signal that active runner inspection is getting stuck
 behind storage I/O or connection checkout pressure.
+
+## Recovery mode
+
+```sh
+examples/pg_stress/run.sh recovery
+```
+
+Recovery mode uses the same disposable PostgreSQL setup, but exercises failure
+and wake-up paths instead of raw load:
+
+- kill an active runner while an attempt is still open, then recover the same
+  attempt number through scanner takeover;
+- wake a waiting approval run with a durable `approved` signal;
+- let a waiting approval deadline fire through scanner-driven durable timers.
+
+Expected output:
+
+```text
+recovery_scenario=open_attempt status=completed attempts_started=1 callback_entries=2
+recovery_scenario=approval_signal status=completed
+recovery_scenario=approval_deadline status=failed reason=approval_timeout
+recovery_scenarios=3 passed=3 failed=0 elapsed_ms=...
+pool=#{...}
+```
+
+The first scenario intentionally records two callback entries for one
+`attempt.started` event. That is the at-least-once callback boundary: recovery
+re-enters the same attempt with the same idempotency key instead of consuming a
+second attempt number.

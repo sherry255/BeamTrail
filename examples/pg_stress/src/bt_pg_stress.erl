@@ -1,6 +1,6 @@
 -module(bt_pg_stress).
 
--export([run/4, run/5]).
+-export([run/4, run/5, run_recovery/3]).
 
 run(Count0, SleepMs0, PoolSize0, Port0) ->
     run(Count0, SleepMs0, PoolSize0, Port0, "8").
@@ -33,6 +33,27 @@ run(Count0, SleepMs0, PoolSize0, Port0, DescribeSample0) ->
     io:format("pool=~p~n", [beamtrail_postgres_pool:info()]),
     halt(exit_code(Summary)).
 
+run_recovery(PoolSize0, Port0, WorkDir0) ->
+    PoolSize = normalize_int(PoolSize0),
+    Port = normalize_int(Port0),
+    WorkDir = normalize_path(WorkDir0),
+    ok = warmup_atoms(),
+    ok = warmup_recovery_atoms(),
+    configure_recovery(Port, PoolSize),
+    ok = init_runtime(),
+    StartedAt = erlang:monotonic_time(millisecond),
+    Results =
+        [run_open_attempt_recovery(WorkDir),
+         run_approval_signal_recovery(WorkDir),
+         run_approval_deadline_recovery(WorkDir)],
+    FinishedAt = erlang:monotonic_time(millisecond),
+    Passed = length([ok || #{ok := true} <- Results]),
+    Failed = length(Results) - Passed,
+    io:format("recovery_scenarios=~p passed=~p failed=~p elapsed_ms=~p~n",
+              [length(Results), Passed, Failed, FinishedAt - StartedAt]),
+    io:format("pool=~p~n", [beamtrail_postgres_pool:info()]),
+    halt(case Failed of 0 -> 0; _ -> 2 end).
+
 configure(Port, PoolSize, Count) ->
     ok = application:set_env(beamtrail, storage_adapter,
                              beamtrail_postgres_storage),
@@ -48,6 +69,27 @@ configure(Port, PoolSize, Count) ->
                              [bt_pg_stress_workflow]),
     ok = application:set_env(beamtrail, run_max_children, max(Count, 64)),
     ok = application:set_env(beamtrail, scanner_interval_ms, infinity),
+    ok.
+
+configure_recovery(Port, PoolSize) ->
+    ok = application:set_env(beamtrail, storage_adapter,
+                             beamtrail_postgres_storage),
+    ok = application:set_env(beamtrail, postgres,
+                             #{host => "localhost",
+                               port => Port,
+                               username => "beamtrail",
+                               password => "beamtrail",
+                               database => "beamtrail"}),
+    ok = application:set_env(beamtrail, postgres_pool_size, PoolSize),
+    ok = application:set_env(beamtrail, postgres_pool_checkout_timeout_ms, 1000),
+    ok = application:set_env(beamtrail, workflow_modules,
+                             [bt_pg_stress_workflow,
+                              bt_pg_stress_blocking_workflow,
+                              bt_pg_stress_approval_workflow]),
+    ok = application:set_env(beamtrail, run_max_children, 64),
+    ok = application:set_env(beamtrail, scanner_interval_ms, 100),
+    ok = application:set_env(beamtrail, lease_ttl_ms, 500),
+    ok = application:set_env(beamtrail, max_recoveries_per_attempt, 5),
     ok.
 
 init_runtime() ->
@@ -73,6 +115,91 @@ start_run(N, SleepMs) ->
             #{run_id => RunId,
               started_at => erlang:monotonic_time(millisecond)}
     end.
+
+run_open_attempt_recovery(WorkDir) ->
+    RunId = unique_run_id("pg-recovery-open"),
+    ModeFile = filename:join(WorkDir, "open-attempt.mode"),
+    MarkerFile = filename:join(WorkDir, "open-attempt.log"),
+    ok = file:write_file(ModeFile, <<"block\n">>),
+    ok = file:write_file(MarkerFile, <<>>),
+    Input = #{order_id => RunId,
+              mode_file => ModeFile,
+              marker_file => MarkerFile},
+    {ok, RunId} =
+        beamtrail:start_workflow(bt_pg_stress_blocking_workflow, Input,
+                                 #{run_id => RunId}),
+    ok = wait_marker_count(MarkerFile, <<"started ">>, 1, 5000),
+    {ok, RunnerPid} = wait_runner_pid(RunId, executing, 5000),
+    exit(RunnerPid, kill),
+    ok = file:write_file(ModeFile, <<"complete\n">>),
+    {ok, State} = wait_terminal_with_scans(RunId, 12000),
+    {ok, Events} = beamtrail:events(RunId),
+    AttemptsStarted = event_count('attempt.started', Events),
+    CallbackEntries = marker_count(MarkerFile, <<"started ">>),
+    RecoveryMarkers = event_count('recovery.requeued', Events),
+    Status = maps:get(status, State),
+    Ok = Status =:= completed
+        andalso AttemptsStarted =:= 1
+        andalso CallbackEntries >= 2
+        andalso RecoveryMarkers >= 1,
+    io:format("recovery_scenario=open_attempt status=~p attempts_started=~p callback_entries=~p recovery_markers=~p ok=~p~n",
+              [Status, AttemptsStarted, CallbackEntries, RecoveryMarkers, Ok]),
+    #{scenario => open_attempt, ok => Ok}.
+
+run_approval_signal_recovery(WorkDir) ->
+    RunId = unique_run_id("pg-recovery-approval-signal"),
+    MarkerFile = filename:join(WorkDir, "approval-signal.log"),
+    ok = file:write_file(MarkerFile, <<>>),
+    DeadlineAt = erlang:system_time(millisecond) + 60000,
+    Input = #{order_id => RunId,
+              marker_file => MarkerFile,
+              deadline_at_ms => DeadlineAt},
+    {ok, RunId} =
+        beamtrail:start_workflow(bt_pg_stress_approval_workflow, Input,
+                                 #{run_id => RunId}),
+    {ok, _Waiting} = wait_status(RunId, waiting, 5000),
+    {ok, _Signalled} =
+        beamtrail:signal_run(RunId, approved, #{approved_by => <<"stress">>}),
+    {ok, State} = wait_terminal_with_scans(RunId, 10000),
+    {ok, Events} = beamtrail:events(RunId),
+    Status = maps:get(status, State),
+    Signals = event_count('signal.received', Events),
+    Succeeded = event_count('step.succeeded', Events),
+    Completed = event_count('workflow.completed', Events),
+    Ok = Status =:= completed
+        andalso Signals =:= 1
+        andalso Succeeded =:= 1
+        andalso Completed =:= 1,
+    io:format("recovery_scenario=approval_signal status=~p signals=~p step_succeeded=~p workflow_completed=~p ok=~p~n",
+              [Status, Signals, Succeeded, Completed, Ok]),
+    #{scenario => approval_signal, ok => Ok}.
+
+run_approval_deadline_recovery(WorkDir) ->
+    RunId = unique_run_id("pg-recovery-approval-deadline"),
+    MarkerFile = filename:join(WorkDir, "approval-deadline.log"),
+    ok = file:write_file(MarkerFile, <<>>),
+    DeadlineAt = erlang:system_time(millisecond) + 300,
+    Input = #{order_id => RunId,
+              marker_file => MarkerFile,
+              deadline_at_ms => DeadlineAt},
+    {ok, RunId} =
+        beamtrail:start_workflow(bt_pg_stress_approval_workflow, Input,
+                                 #{run_id => RunId}),
+    {ok, _Waiting} = wait_status(RunId, waiting, 5000),
+    timer:sleep(350),
+    {ok, State} = wait_terminal_with_scans(RunId, 10000),
+    {ok, Events} = beamtrail:events(RunId),
+    Status = maps:get(status, State),
+    FailureClass = failure_class(State),
+    TimerFired = event_count('timer.fired', Events),
+    Failed = event_count('workflow.failed', Events),
+    Ok = Status =:= failed
+        andalso FailureClass =:= approval_timeout
+        andalso TimerFired =:= 1
+        andalso Failed =:= 1,
+    io:format("recovery_scenario=approval_deadline status=~p reason=~p timer_fired=~p workflow_failed=~p ok=~p~n",
+              [Status, FailureClass, TimerFired, Failed, Ok]),
+    #{scenario => approval_deadline, ok => Ok}.
 
 wait_runs([], _RemainingMs, Results, ProbeStats, _DescribeSample) ->
     {Results, ProbeStats};
@@ -187,6 +314,84 @@ take(N, _List) when N =< 0 ->
 take(N, [Item | Rest]) ->
     [Item | take(N - 1, Rest)].
 
+unique_run_id(Prefix) ->
+    list_to_binary(
+      io_lib:format("~s-~p-~p",
+                    [Prefix,
+                     erlang:system_time(millisecond),
+                     erlang:unique_integer([positive])])).
+
+wait_runner_pid(_RunId, _Status, RemainingMs) when RemainingMs =< 0 ->
+    {error, timeout};
+wait_runner_pid(RunId, Status, RemainingMs) ->
+    case beamtrail_run_registry:lookup(RunId) of
+        {ok, #{status := Status, pid := Pid}} when is_pid(Pid) ->
+            {ok, Pid};
+        _ ->
+            timer:sleep(50),
+            wait_runner_pid(RunId, Status, RemainingMs - 50)
+    end.
+
+wait_status(_RunId, _Status, RemainingMs) when RemainingMs =< 0 ->
+    {error, timeout};
+wait_status(RunId, Status, RemainingMs) ->
+    case beamtrail:get_state(RunId) of
+        #{status := Status} = State ->
+            {ok, State};
+        _ ->
+            timer:sleep(50),
+            wait_status(RunId, Status, RemainingMs - 50)
+    end.
+
+wait_terminal_with_scans(_RunId, RemainingMs) when RemainingMs =< 0 ->
+    {error, timeout};
+wait_terminal_with_scans(RunId, RemainingMs) ->
+    case beamtrail:get_state(RunId) of
+        #{terminal := true} = State ->
+            {ok, State};
+        _ ->
+            _ = beamtrail_scanner:scan_now(),
+            timer:sleep(100),
+            wait_terminal_with_scans(RunId, RemainingMs - 100)
+    end.
+
+wait_marker_count(_Path, _Pattern, _Expected, RemainingMs)
+  when RemainingMs =< 0 ->
+    {error, timeout};
+wait_marker_count(Path, Pattern, Expected, RemainingMs) ->
+    case marker_count(Path, Pattern) >= Expected of
+        true ->
+            ok;
+        false ->
+            timer:sleep(50),
+            wait_marker_count(Path, Pattern, Expected, RemainingMs - 50)
+    end.
+
+marker_count(Path, Pattern) ->
+    case file:read_file(Path) of
+        {ok, Bin} ->
+            length([Line || Line <- binary:split(Bin, <<"\n">>, [global]),
+                            binary:match(Line, Pattern) =/= nomatch]);
+        {error, _} ->
+            0
+    end.
+
+event_count(EventType, Events) ->
+    length([ok || #{event_type := EventType0} <- Events,
+                  EventType0 =:= EventType]).
+
+failure_class(State) ->
+    case maps:get(failure, State, undefined) of
+        #{class := Class} ->
+            Class;
+        #{reason := #{reason := Reason}} ->
+            Reason;
+        #{reason := Reason} ->
+            Reason;
+        _ ->
+            undefined
+    end.
+
 print_probe_stats(Stats) ->
     Latencies = maps:get(latencies, Stats),
     io:format("describe_ms=calls=~p errors=~p ",
@@ -233,7 +438,31 @@ warmup_atoms() ->
                    "slept_ms"]),
     ok.
 
+warmup_recovery_atoms() ->
+    {module, bt_pg_stress_blocking_workflow} =
+        code:ensure_loaded(bt_pg_stress_blocking_workflow),
+    {module, bt_pg_stress_approval_workflow} =
+        code:ensure_loaded(bt_pg_stress_approval_workflow),
+    lists:foreach(fun(Name) -> _ = list_to_atom(Name), ok end,
+                  ["bt_pg_stress_blocking_workflow", "block", "mode_file",
+                   "marker_file", "step", "attempt", "recovered",
+                   "bt_pg_stress_approval_workflow", "fulfill",
+                   "deadline_at_ms", "timer_id", "approval_deadline",
+                   "waiting_for_approval", "approved", "rejected",
+                   "approved_by", "rejected_by", "fulfilled",
+                   "approval_rejected", "approval_timeout", "fire_at_ms",
+                   "scheduled_at", "source_command", "next_wake_at",
+                   "waiting_since", "scheduled", "fired", "payload",
+                   "name", "received_at", "event_seq", "timer_id",
+                   "result", "reason", "class", "callback_error"]),
+    ok.
+
 normalize_int(N) when is_integer(N) ->
     N;
 normalize_int(N) when is_list(N) ->
     list_to_integer(N).
+
+normalize_path(Path) when is_list(Path) ->
+    Path;
+normalize_path(Path) when is_binary(Path) ->
+    binary_to_list(Path).
