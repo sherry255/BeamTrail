@@ -115,3 +115,20 @@ jobs:
 
       - name: Run PostgreSQL integration tests
         run: rebar3 eunit
+
+  postgres-recovery:
+    name: PostgreSQL Recovery Harness
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Erlang/OTP
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: "28"
+          rebar3-version: "3.27.0"
+
+      - name: Run PostgreSQL recovery harness
+        run: examples/pg_stress/run.sh recovery
