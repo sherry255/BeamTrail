@@ -2,17 +2,19 @@
 
 -export([execute_attempt/1, execute_attempt/3]).
 
-execute_attempt(ExecSpec) when is_map(ExecSpec) ->
-    Workflow = maps:get(workflow, ExecSpec),
-    safe_execute(Workflow,
-                 maps:get(step_id, ExecSpec),
-                 maps:get(step_version, ExecSpec),
-                 maps:get(input, ExecSpec),
-                 maps:get(context, ExecSpec)).
+execute_attempt(Effect) when is_map(Effect) ->
+    case beamtrail_effect:type(Effect) of
+        call_step ->
+            safe_execute(beamtrail_effect:workflow(Effect),
+                         beamtrail_effect:step_id(Effect),
+                         beamtrail_effect:step_version(Effect),
+                         beamtrail_effect:input(Effect),
+                         beamtrail_effect:context(Effect))
+    end.
 
-execute_attempt(RunId, Lease, ExecSpec) when is_map(Lease), is_map(ExecSpec) ->
-    Timeout = maps:get(timeout_ms, ExecSpec),
-    Fun = fun() -> execute_attempt(ExecSpec) end,
+execute_attempt(RunId, Lease, Effect) when is_map(Lease), is_map(Effect) ->
+    Timeout = beamtrail_effect:timeout_ms(Effect),
+    Fun = fun() -> execute_attempt(Effect) end,
     run_with_timeout_and_lease_heartbeat(RunId, Lease, Fun, Timeout).
 
 safe_execute(Workflow, StepId, StepVersion, Input, Context) ->

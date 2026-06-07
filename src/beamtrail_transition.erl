@@ -3,6 +3,7 @@
 -export([owner/0, dispatch_locked/3, dispatch_locked/4,
          dispatch_retrying/4,
          finish_attempt/4, finish_attempt/5,
+         complete_effect/4, complete_effect/5,
          cancel_run/4, park_run/4, resume_run/3]).
 
 dispatch_locked(RunId, State, Lease) ->
@@ -48,10 +49,17 @@ dispatch_retrying(RunId, State, Lease, Options) ->
     end.
 
 finish_attempt(RunId, Lease, Attempt, Result) when is_map(Lease), is_map(Attempt) ->
+    complete_effect(RunId, Lease, Attempt, Result).
+
+finish_attempt(RunId, Lease, Attempt, Result, State)
+  when is_map(Lease), is_map(Attempt), is_map(State) ->
+    complete_effect(RunId, Lease, Attempt, Result, State).
+
+complete_effect(RunId, Lease, Attempt, Result) when is_map(Lease), is_map(Attempt) ->
     Options = #{runner_mode => finish},
     finish_attempt_with_options(RunId, Lease, Attempt, Result, Options).
 
-finish_attempt(RunId, Lease, Attempt, Result, State)
+complete_effect(RunId, Lease, Attempt, Result, State)
   when is_map(Lease), is_map(Attempt), is_map(State) ->
     Options = #{runner_mode => finish, runner_state => State},
     finish_attempt_with_options(RunId, Lease, Attempt, Result, Options).
@@ -373,8 +381,8 @@ run_step(RunId, State, StepId, StepInput, Lease, Options) ->
             case maps:get(runner_mode, Options, dispatch) of
                 prepare ->
                     case execution_spec(RunId, Workflow, StepId, StepInput, Attempt) of
-                        {ok, ExecSpec} ->
-                            {ok, {execute, Attempt, ExecSpec, State1}};
+                        {ok, Effect} ->
+                            {ok, {execute, Attempt, Effect, State1}};
                         {error, {bad_workflow_callback, Callback, CallbackError}} ->
                             append_attempt_callback_failure(
                               RunId, State1, Attempt, Callback, CallbackError, Lease)
@@ -441,12 +449,12 @@ execution_spec(RunId, Workflow, StepId, Input, Attempt) ->
     StepInput = maps:get(step_input, Attempt, Input),
     case safe_workflow_callback(timeout_ms, fun() -> Workflow:timeout_ms(StepId) end) of
         {ok, TimeoutMs} ->
-            {ok, #{workflow => Workflow,
-                   step_id => StepId,
-                   step_version => StepVersion,
-                   input => StepInput,
-                   timeout_ms => TimeoutMs,
-                   context => execution_context(RunId, Attempt)}};
+            {ok, beamtrail_effect:call_step(Workflow,
+                                            StepId,
+                                            StepVersion,
+                                            StepInput,
+                                            TimeoutMs,
+                                            execution_context(RunId, Attempt))};
         {error, CallbackError} ->
             {error, {bad_workflow_callback, timeout_ms, CallbackError}}
     end.
@@ -461,8 +469,8 @@ execution_context(RunId, Attempt) ->
 execute_attempt(RunId, Workflow, Input, Attempt, Lease) ->
     StepId = maps:get(step_id, Attempt),
     case execution_spec(RunId, Workflow, StepId, Input, Attempt) of
-        {ok, ExecSpec} ->
-            beamtrail_executor:execute_attempt(RunId, Lease, ExecSpec);
+        {ok, Effect} ->
+            beamtrail_executor:execute_attempt(RunId, Lease, Effect);
         {error, {bad_workflow_callback, Callback, CallbackError}} ->
             {error, {bad_workflow_callback, Callback, CallbackError}}
     end.

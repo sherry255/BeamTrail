@@ -130,8 +130,8 @@ dispatch_with_lease(#{state := undefined} = Data) ->
     start_load_state(Data);
 dispatch_with_lease(#{run_id := RunId, lease := Lease, state := State} = Data) ->
     case beamtrail_runner_transition:next_action(RunId, Lease, State) of
-        {ok, {execute, Attempt, ExecSpec, State1}} ->
-            start_step_execution(Attempt, ExecSpec, Data#{state := State1});
+        {ok, {execute, Attempt, Effect, State1}} ->
+            start_effect_execution(Attempt, Effect, Data#{state := State1});
         {ok, State1} ->
             after_dispatch(State1, Data);
         {error, _Reason} ->
@@ -152,20 +152,20 @@ handle_load_state_result({ok, State}, Data) ->
 handle_load_state_result({error, _Reason}, Data) ->
     {stop, normal, Data}.
 
-start_step_execution(Attempt, ExecSpec, Data0) ->
+start_effect_execution(Attempt, Effect, Data0) ->
     Ref = make_ref(),
     Parent = self(),
     Pid = spawn_link(
             fun() ->
                     Parent ! {step_result, Ref,
-                              beamtrail_executor:execute_attempt(ExecSpec)}
+                              beamtrail_executor:execute_attempt(Effect)}
             end),
     Data1 = schedule_heartbeat(Data0),
     Data2 = Data1#{dispatch := {Ref, Pid},
                    attempt := Attempt},
     {next_state, executing, Data2,
      heartbeat_timeout_action(Data2) ++
-     step_timeout_action(maps:get(timeout_ms, ExecSpec, infinity), Ref)}.
+     step_timeout_action(beamtrail_effect:timeout_ms(Effect), Ref)}.
 
 handle_step_result(Result, #{run_id := RunId, lease := Lease,
                              state := State, attempt := Attempt} = Data)
@@ -173,7 +173,7 @@ handle_step_result(Result, #{run_id := RunId, lease := Lease,
     Data1 = schedule_heartbeat(Data),
     Data2 = start_storage_op(finish_attempt,
                              fun() ->
-                                     beamtrail_runner_transition:finish_attempt(
+                                     beamtrail_runner_transition:complete_effect(
                                        RunId, Lease, Attempt, Result, State)
                              end,
                              Data1),
