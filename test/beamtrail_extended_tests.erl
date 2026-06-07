@@ -89,6 +89,8 @@ extended_test_() ->
       fun active_runner_registry_exposes_live_state/0,
       fun query_describe_exposes_active_runner/0,
       fun active_runner_stays_inspectable_while_step_executes/0,
+      fun active_runner_stays_inspectable_while_loading_state/0,
+      fun active_runner_stays_inspectable_while_finishing_attempt/0,
       fun active_runner_reuses_loaded_state_across_steps/0,
       fun query_describe_exposes_run_control_state/0,
       fun dispatch_refuses_version_mismatch_without_migration/0,
@@ -1583,6 +1585,7 @@ active_runner_retry_timer_survives_heartbeat_and_lookup() ->
     ?assertMatch({retry_backoff_execute, 1, {charge, <<"o-active-retry-heartbeat-1">>}},
                  receive_exec()),
     ok = wait_for_status(RunId, retrying, 1000),
+    ok = wait_for_runner_status(RunId, waiting_retry, 1000),
     ?assertMatch(
        {ok, #{status := waiting_retry,
               retry_due_in_ms := RetryDueInMs,
@@ -1696,6 +1699,7 @@ active_runner_registry_exposes_live_state() ->
     ?assertMatch({retry_backoff_execute, 1, {charge, <<"o-active-inspect-1">>}},
                  receive_exec()),
     ok = wait_for_status(RunId, retrying, 1000),
+    ok = wait_for_runner_status(RunId, waiting_retry, 1000),
     ?assertMatch(
        {ok, #{run_id := RunId,
               pid := Pid,
@@ -1717,6 +1721,7 @@ query_describe_exposes_active_runner() ->
     ?assertMatch({retry_backoff_execute, 1, {charge, <<"o-query-active-1">>}},
                  receive_exec()),
     ok = wait_for_status(RunId, retrying, 1000),
+    ok = wait_for_runner_status(RunId, waiting_retry, 1000),
     Q = beamtrail_query:describe(RunId),
     ?assertMatch(#{status := waiting_retry,
                    pid := Pid,
@@ -1752,6 +1757,68 @@ active_runner_stays_inspectable_while_step_executes() ->
     ?assertMatch(#{status := executing, pid := Pid},
                  maps:get(active_runner, Q)),
     ExecPid ! {Gate, continue},
+    ?assertMatch({ok, #{status := completed}}, wait_for_state(RunId, completed, 1000)).
+
+active_runner_stays_inspectable_while_loading_state() ->
+    ok = application:set_env(beamtrail, storage_adapter, bt_blocking_storage),
+    ok = bt_blocking_storage:reset(),
+    ensure_runner_infra(),
+    Input = #{order_id => <<"o-active-loading-1">>, test_pid => self()},
+    {ok, RunId} = beamtrail:start_workflow(bt_success_workflow, Input,
+                                           #{run_id => <<"active-loading-run-1">>,
+                                             auto_dispatch => false}),
+    ok = bt_blocking_storage:block_read_snapshot(self()),
+    {ok, Pid} = beamtrail_run_sup:dispatch(RunId),
+    BlockedPid =
+        receive
+            {bt_blocking_storage, read_snapshot_blocked, P} -> P
+        after 1000 ->
+            error(read_snapshot_not_blocked)
+        end,
+    StartedAt = erlang:monotonic_time(millisecond),
+    {ok, Active} = beamtrail_run_registry:lookup(RunId),
+    ?assert(erlang:monotonic_time(millisecond) - StartedAt < 200),
+    ?assertMatch(#{run_id := RunId,
+                   pid := Pid,
+                   status := loading,
+                   storage_op := load_state},
+                 Active),
+    BlockedPid ! {bt_blocking_storage, continue},
+    ?assertMatch({executed, charge, 1, {charge, <<"o-active-loading-1">>}},
+                 receive_exec()),
+    ?assertMatch({executed, ship, 1, {ship, <<"o-active-loading-1">>}},
+                 receive_exec()),
+    ?assertMatch({ok, #{status := completed}}, wait_for_state(RunId, completed, 1000)).
+
+active_runner_stays_inspectable_while_finishing_attempt() ->
+    ok = application:set_env(beamtrail, storage_adapter, bt_blocking_storage),
+    ok = bt_blocking_storage:reset(),
+    ensure_runner_infra(),
+    Gate = active_finishing_gate,
+    Input = #{order_id => <<"o-active-finishing-1">>, test_pid => self(),
+              gate => Gate},
+    {ok, RunId} = beamtrail:start_workflow(bt_blocking_success_workflow, Input,
+                                           #{run_id => <<"active-finishing-run-1">>,
+                                             auto_dispatch => false}),
+    {ok, Pid} = beamtrail_run_sup:dispatch(RunId),
+    {blocking_started, ExecPid, 1} = receive_exec(),
+    ok = bt_blocking_storage:block_append_event(self()),
+    ExecPid ! {Gate, continue},
+    BlockedPid =
+        receive
+            {bt_blocking_storage, append_event_blocked, P} -> P
+        after 1000 ->
+            error(append_event_not_blocked)
+        end,
+    StartedAt = erlang:monotonic_time(millisecond),
+    {ok, Active} = beamtrail_run_registry:lookup(RunId),
+    ?assert(erlang:monotonic_time(millisecond) - StartedAt < 200),
+    ?assertMatch(#{run_id := RunId,
+                   pid := Pid,
+                   status := finishing,
+                   storage_op := finish_attempt},
+                 Active),
+    BlockedPid ! {bt_blocking_storage, continue},
     ?assertMatch({ok, #{status := completed}}, wait_for_state(RunId, completed, 1000)).
 
 active_runner_reuses_loaded_state_across_steps() ->
@@ -2514,6 +2581,17 @@ wait_for_state(RunId, Target, Remaining) ->
         _ ->
             timer:sleep(20),
             wait_for_state(RunId, Target, Remaining - 20)
+    end.
+
+wait_for_runner_status(_RunId, _Target, Remaining) when Remaining =< 0 ->
+    {error, timeout};
+wait_for_runner_status(RunId, Target, Remaining) ->
+    case beamtrail_run_registry:lookup(RunId) of
+        {ok, #{status := Target}} ->
+            ok;
+        _ ->
+            timer:sleep(20),
+            wait_for_runner_status(RunId, Target, Remaining - 20)
     end.
 
 wait_until_lease_expired(_RunId, Remaining) when Remaining =< 0 ->

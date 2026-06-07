@@ -36,11 +36,20 @@ init(RunId) ->
                  retry_due_at => undefined,
                  heartbeat_timer => undefined,
                  dispatch => undefined,
+                 storage_op => undefined,
                  attempt => undefined}}.
 
 handle_event(cast, dispatch, executing, Data) ->
     {keep_state, Data};
 handle_event(cast, {dispatch, _Lease}, executing, Data) ->
+    {keep_state, Data};
+handle_event(cast, dispatch, loading, Data) ->
+    {keep_state, Data};
+handle_event(cast, {dispatch, _Lease}, loading, Data) ->
+    {keep_state, Data};
+handle_event(cast, dispatch, finishing, Data) ->
+    {keep_state, Data};
+handle_event(cast, {dispatch, _Lease}, finishing, Data) ->
     {keep_state, Data};
 handle_event(cast, dispatch, _StateName, Data) ->
     start_dispatch(Data);
@@ -63,6 +72,14 @@ handle_event(info, {step_result, Ref, Result}, _StateName,
     handle_step_result(Result, clear_step_execution(Data));
 handle_event(info, {step_result, _Ref, _Result}, _StateName, Data) ->
     {keep_state, Data};
+handle_event(info, {storage_result, Ref, load_state, Result}, loading,
+             #{storage_op := {Ref, _Pid, load_state}} = Data) ->
+    handle_load_state_result(Result, clear_storage_op(Data));
+handle_event(info, {storage_result, Ref, finish_attempt, Result}, finishing,
+             #{storage_op := {Ref, _Pid, finish_attempt}} = Data) ->
+    handle_finish_attempt_result(Result, clear_storage_op(Data));
+handle_event(info, {storage_result, _Ref, _Op, _Result}, _StateName, Data) ->
+    {keep_state, Data};
 handle_event(state_timeout, {step_timeout, Ref}, _StateName,
              #{dispatch := {Ref, Pid}} = Data) ->
     exit(Pid, kill),
@@ -76,6 +93,12 @@ handle_event(info, {'EXIT', Pid, Reason}, _StateName,
              #{dispatch := {_Ref, Pid}} = Data) ->
     handle_step_result({error, #{class => exit, reason => Reason}},
                        clear_step_execution(Data));
+handle_event(info, {'EXIT', Pid, normal}, _StateName,
+             #{storage_op := {_Ref, Pid, _Op}} = Data) ->
+    {keep_state, Data};
+handle_event(info, {'EXIT', Pid, _Reason}, _StateName,
+             #{storage_op := {_Ref, Pid, _Op}} = Data) ->
+    {stop, normal, clear_storage_op(Data)};
 handle_event(info, {'EXIT', _Pid, _Reason}, _StateName, Data) ->
     {keep_state, Data};
 handle_event({timeout, lease_heartbeat}, {lease_heartbeat, Ref}, StateName,
@@ -88,6 +111,7 @@ handle_event(_, _, _StateName, Data) ->
 
 terminate(_, _, Data) ->
     cancel_dispatch(maps:get(dispatch, Data, undefined)),
+    cancel_storage_op(maps:get(storage_op, Data, undefined)),
     ok.
 
 code_change(_, StateName, Data, _) ->
@@ -96,24 +120,37 @@ code_change(_, StateName, Data, _) ->
 start_dispatch(Data0) ->
     Data1 = cancel_heartbeat_timer(clear_retry_due(Data0)),
     case ensure_lease(Data1) of
-        {ok, #{run_id := RunId, lease := Lease} = Data2} ->
-            case ensure_runner_state(Data2) of
-                {ok, #{state := State} = Data3} ->
-                    case beamtrail_runner_transition:next_action(RunId, Lease, State) of
-                        {ok, {execute, Attempt, ExecSpec, State1}} ->
-                            start_step_execution(Attempt, ExecSpec,
-                                                 Data3#{state := State1});
-                        {ok, State1} ->
-                            after_dispatch(State1, Data3);
-                        {error, _Reason} ->
-                            {stop, normal, Data3}
-                    end;
-                {error, _Reason} ->
-                    {stop, normal, Data2}
-            end;
+        {ok, Data2} ->
+            dispatch_with_lease(Data2);
         {error, _Reason} ->
             {stop, normal, Data1}
     end.
+
+dispatch_with_lease(#{state := undefined} = Data) ->
+    start_load_state(Data);
+dispatch_with_lease(#{run_id := RunId, lease := Lease, state := State} = Data) ->
+    case beamtrail_runner_transition:next_action(RunId, Lease, State) of
+        {ok, {execute, Attempt, ExecSpec, State1}} ->
+            start_step_execution(Attempt, ExecSpec, Data#{state := State1});
+        {ok, State1} ->
+            after_dispatch(State1, Data);
+        {error, _Reason} ->
+            {stop, normal, Data}
+    end.
+
+start_load_state(#{run_id := RunId} = Data0) ->
+    Data1 = schedule_heartbeat(Data0),
+    Data2 = start_storage_op(load_state,
+                             fun() ->
+                                     beamtrail_runner_transition:load_state(RunId)
+                             end,
+                             Data1),
+    {next_state, loading, Data2, heartbeat_timeout_action(Data2)}.
+
+handle_load_state_result({ok, State}, Data) ->
+    dispatch_with_lease(Data#{state := State});
+handle_load_state_result({error, _Reason}, Data) ->
+    {stop, normal, Data}.
 
 start_step_execution(Attempt, ExecSpec, Data0) ->
     Ref = make_ref(),
@@ -133,18 +170,27 @@ start_step_execution(Attempt, ExecSpec, Data0) ->
 handle_step_result(Result, #{run_id := RunId, lease := Lease,
                              state := State, attempt := Attempt} = Data)
   when is_map(Attempt) ->
-    case beamtrail_runner_transition:finish_attempt(RunId, Lease, Attempt, Result, State) of
-        {ok, State1} ->
-            after_dispatch(State1, Data#{attempt := undefined});
-        {error, _Reason} ->
-            {stop, normal, Data#{attempt := undefined}}
-    end;
+    Data1 = schedule_heartbeat(Data),
+    Data2 = start_storage_op(finish_attempt,
+                             fun() ->
+                                     beamtrail_runner_transition:finish_attempt(
+                                       RunId, Lease, Attempt, Result, State)
+                             end,
+                             Data1),
+    {next_state, finishing, Data2, heartbeat_timeout_action(Data2)};
 handle_step_result(_Result, Data) ->
     {stop, normal, Data}.
 
+handle_finish_attempt_result({ok, State}, Data) ->
+    after_dispatch(State, Data#{attempt := undefined});
+handle_finish_attempt_result({error, _Reason}, Data) ->
+    {stop, normal, Data#{attempt := undefined}}.
+
 handle_control(Operation, Reason, From, _StateName, Data0) ->
     cancel_dispatch(maps:get(dispatch, Data0, undefined)),
-    Data1 = cancel_heartbeat_timer(clear_retry_due(clear_step_execution(Data0))),
+    cancel_storage_op(maps:get(storage_op, Data0, undefined)),
+    Data1 = cancel_heartbeat_timer(clear_retry_due(
+                                      clear_storage_op(clear_step_execution(Data0)))),
     case ensure_lease(Data1) of
         {ok, #{run_id := RunId, lease := Lease} = Data2} ->
             case ensure_runner_state(Data2) of
@@ -309,9 +355,24 @@ cancel_heartbeat_timer(Data) ->
 clear_step_execution(Data) ->
     Data#{dispatch := undefined}.
 
+start_storage_op(Op, Fun, Data) ->
+    Ref = make_ref(),
+    Parent = self(),
+    Pid = spawn_link(fun() -> Parent ! {storage_result, Ref, Op, Fun()} end),
+    Data#{storage_op := {Ref, Pid, Op}}.
+
+clear_storage_op(Data) ->
+    Data#{storage_op := undefined}.
+
 cancel_dispatch(undefined) ->
     ok;
 cancel_dispatch({_Ref, Pid}) when is_pid(Pid) ->
+    exit(Pid, kill),
+    ok.
+
+cancel_storage_op(undefined) ->
+    ok;
+cancel_storage_op({_Ref, Pid, _Op}) when is_pid(Pid) ->
     exit(Pid, kill),
     ok.
 
@@ -323,6 +384,8 @@ info_map(StateName, Data) ->
       fencing_token => lease_field(Lease, fencing_token),
       lease_until => lease_field(Lease, lease_until),
       dispatch_pid => dispatch_pid(maps:get(dispatch, Data, undefined)),
+      storage_op => storage_op_name(maps:get(storage_op, Data, undefined)),
+      storage_op_pid => storage_op_pid(maps:get(storage_op, Data, undefined)),
       retry_due_at => maps:get(retry_due_at, Data, undefined),
       retry_due_in_ms => due_in_ms(maps:get(retry_due_at, Data, undefined)),
       heartbeat_due_at => timer_due_at(maps:get(heartbeat_timer, Data, undefined)),
@@ -351,4 +414,14 @@ due_in_ms(_) ->
 dispatch_pid({_Ref, Pid}) ->
     Pid;
 dispatch_pid(_) ->
+    undefined.
+
+storage_op_name({_Ref, _Pid, Op}) ->
+    Op;
+storage_op_name(_) ->
+    undefined.
+
+storage_op_pid({_Ref, Pid, _Op}) ->
+    Pid;
+storage_op_pid(_) ->
     undefined.
