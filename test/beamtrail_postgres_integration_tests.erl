@@ -64,6 +64,7 @@ postgres_workflow_survives_application_restart() ->
                                            #{run_id => RunId}),
     ?assertMatch({executed, charge, 1, {charge, RunId}}, receive_exec()),
     ?assertMatch({executed, ship, 1, {ship, RunId}}, receive_exec()),
+    {ok, #{status := completed}} = beamtrail:await_terminal(RunId, 1000),
     ok = restart_beamtrail(),
     State = beamtrail:get_state(RunId),
     ?assertEqual(completed, maps:get(status, State)),
