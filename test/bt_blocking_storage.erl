@@ -33,6 +33,7 @@ append_event(RunId, ExpectedSeq, FencingToken, EventType, StepId,
                                           IdempotencyKey, Payload).
 
 append_events(RunId, ExpectedSeq, FencingToken, EventSpecs) ->
+    maybe_block_append_event(),
     beamtrail_memory_storage:append_events(RunId, ExpectedSeq, FencingToken,
                                            EventSpecs).
 

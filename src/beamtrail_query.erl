@@ -94,6 +94,7 @@ describe_loaded_events(RunId, Mod, State, Events) ->
           maps:get(migration_required_for_version_change, State, false),
       pending_attempt => maps:get(pending_attempt, State, undefined),
       attempts => Attempts,
+      activities => activities_from_events(Events),
       results => maps:get(results, State, []),
       workflow_result => maps:get(workflow_result, State, undefined),
       snapshot => Snapshot,
@@ -265,6 +266,47 @@ pair_starts([#{event_type := Et, occurred_at := T} | Rest], Pending, _Pair)
     pair_starts(Rest, undefined, {Pending, T});
 pair_starts([_ | Rest], Pending, Pair) ->
     pair_starts(Rest, Pending, Pair).
+
+activities_from_events(Events) ->
+    {Groups, Order} =
+        lists:foldl(fun collect_activity_event/2, {#{}, []}, Events),
+    [maps:get(Key, Groups) || Key <- Order].
+
+collect_activity_event(#{event_type := EventType} = Event, {Groups, Order})
+  when EventType =:= 'activity.scheduled';
+       EventType =:= 'activity.started';
+       EventType =:= 'activity.succeeded';
+       EventType =:= 'activity.failed' ->
+    Payload = maps:get(payload, Event, #{}),
+    StepId = maps:get(step_id, Event, undefined),
+    Attempt = maps:get(attempt, Payload, undefined),
+    Key = {StepId, Attempt},
+    Entry =
+        #{event_type => EventType,
+          event_seq => maps:get(event_seq, Event),
+          status => maps:get(activity_status, Payload,
+                             beamtrail_activity:status(EventType)),
+          occurred_at => maps:get(occurred_at, Event, undefined),
+          payload => Payload},
+    {Existing, Order1} =
+        case maps:find(Key, Groups) of
+            {ok, Group} ->
+                {Group, Order};
+            error ->
+                {#{step_id => StepId,
+                   attempt => Attempt,
+                   step_version => maps:get(step_version, Event, undefined),
+                   idempotency_key => maps:get(idempotency_key, Event, undefined),
+                   status => undefined,
+                   events => []},
+                 Order ++ [Key]}
+        end,
+    Events1 = maps:get(events, Existing) ++ [Entry],
+    Group1 = Existing#{status := maps:get(status, Entry),
+                       events := Events1},
+    {maps:put(Key, Group1, Groups), Order1};
+collect_activity_event(_Event, Acc) ->
+    Acc.
 
 instance_from_state(#{run_id := undefined}) ->
     undefined;

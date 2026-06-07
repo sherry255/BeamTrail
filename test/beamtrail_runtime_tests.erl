@@ -44,15 +44,21 @@ successful_workflow_writes_append_only_events_and_snapshot() ->
     ?assertEqual(
        ['workflow.instance.created',
         'attempt.started',
+        'activity.scheduled',
+        'activity.started',
         'step.succeeded',
+        'activity.succeeded',
         'attempt.started',
+        'activity.scheduled',
+        'activity.started',
         'step.succeeded',
+        'activity.succeeded',
         'workflow.completed'],
        [maps:get(event_type, Event) || Event <- Events]),
-    ?assertEqual([1, 2, 3, 4, 5, 6], [maps:get(event_seq, Event) || Event <- Events]),
+    ?assertEqual(lists:seq(1, 12), [maps:get(event_seq, Event) || Event <- Events]),
 
     {ok, Snapshot} = beamtrail_memory_storage:read_snapshot(RunId),
-    ?assertEqual(6, maps:get(snapshot_seq, Snapshot)),
+    ?assertEqual(12, maps:get(snapshot_seq, Snapshot)),
     ?assertEqual(completed, maps:get(status, maps:get(state, Snapshot))).
 
 retry_uses_stable_idempotency_key_across_attempts() ->
@@ -73,7 +79,38 @@ retry_uses_stable_idempotency_key_across_attempts() ->
     ?assertEqual(
        [{charge, <<"order-2">>}, {charge, <<"order-2">>}],
        [maps:get(idempotency_key, Event) || Event <- Started]),
-    ?assert(lists:member('retry.scheduled', [maps:get(event_type, Event) || Event <- Events])).
+    Types = [maps:get(event_type, Event) || Event <- Events],
+    ?assertMatch(
+       [_,
+        'attempt.started',
+        'activity.scheduled',
+        'activity.started',
+        'step.failed',
+        'activity.failed',
+        'retry.scheduled',
+        'attempt.started',
+        'activity.scheduled',
+        'activity.started',
+        'step.succeeded',
+        'activity.succeeded',
+        'workflow.completed'],
+       Types),
+    ?assert(lists:member('retry.scheduled', Types)),
+    Q = beamtrail_query:describe(RunId),
+    ?assertMatch(
+       [#{step_id := charge,
+          attempt := 1,
+          status := failed,
+          events := [#{event_type := 'activity.scheduled'},
+                     #{event_type := 'activity.started'},
+                     #{event_type := 'activity.failed'}]},
+        #{step_id := charge,
+          attempt := 2,
+          status := succeeded,
+          events := [#{event_type := 'activity.scheduled'},
+                     #{event_type := 'activity.started'},
+                     #{event_type := 'activity.succeeded'}]}],
+       maps:get(activities, Q)).
 
 recovery_replays_unknown_attempt_with_recorded_step_version() ->
     RunId = <<"manual-versioned-run">>,
@@ -122,6 +159,7 @@ step_timeout_records_observable_failure() ->
     ?assertEqual(1, maps:get(slow, maps:get(attempt_counts, State))),
 
     {ok, Events} = beamtrail:events(RunId),
+    ?assert(lists:member('activity.failed', [maps:get(event_type, Event) || Event <- Events])),
     ?assert(lists:member('step.failed', [maps:get(event_type, Event) || Event <- Events])),
     ?assert(lists:member('workflow.failed', [maps:get(event_type, Event) || Event <- Events])).
 

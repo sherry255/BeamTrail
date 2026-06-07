@@ -349,6 +349,20 @@ query_describe_exposes_read_model() ->
     ?assertMatch(#{run_id := RunId}, maps:get(instance, Q)),
     ?assertMatch([#{status := succeeded}, #{status := succeeded}],
                  maps:get(attempts, Q)),
+    ?assertMatch(
+       [#{step_id := charge,
+          attempt := 1,
+          status := succeeded,
+          events := [#{event_type := 'activity.scheduled'},
+                     #{event_type := 'activity.started'},
+                     #{event_type := 'activity.succeeded'}]},
+        #{step_id := ship,
+          attempt := 1,
+          status := succeeded,
+          events := [#{event_type := 'activity.scheduled'},
+                     #{event_type := 'activity.started'},
+                     #{event_type := 'activity.succeeded'}]}],
+       maps:get(activities, Q)),
     Snapshot = maps:get(snapshot, Q),
     ?assert(is_map(Snapshot)),
     ?assert(is_list(maps:get(events, Q))),
@@ -849,7 +863,12 @@ workflow_decider_run_step_uses_command_step_input() ->
     ?assertEqual(ship, maps:get(step_id, Started)),
     ?assertEqual(StepInput, maps:get(step_input, maps:get(payload, Started))),
     ?assertEqual(
-       ['workflow.instance.created', 'attempt.started', 'step.succeeded',
+       ['workflow.instance.created',
+        'attempt.started',
+        'activity.scheduled',
+        'activity.started',
+        'step.succeeded',
+        'activity.succeeded',
         'workflow.completed'],
        [maps:get(event_type, E) || E <- Events]).
 
@@ -920,7 +939,10 @@ workflow_decider_waits_for_durable_signal() ->
         'workflow.waiting',
         'signal.received',
         'attempt.started',
+        'activity.scheduled',
+        'activity.started',
         'step.succeeded',
+        'activity.succeeded',
         'workflow.completed'],
        [maps:get(event_type, E) || E <- Events]),
     Q = beamtrail_query:describe(RunId),
@@ -1059,7 +1081,10 @@ approval_signal_before_deadline_completes() ->
         'workflow.waiting',
         'signal.received',
         'attempt.started',
+        'activity.scheduled',
+        'activity.started',
         'step.succeeded',
+        'activity.succeeded',
         'workflow.completed'],
        [maps:get(event_type, E) || E <- Events]).
 
@@ -1148,7 +1173,10 @@ approval_signal_wins_when_recorded_before_due_timer_fire() ->
         'signal.received',
         'timer.fired',
         'attempt.started',
+        'activity.scheduled',
+        'activity.started',
         'step.succeeded',
+        'activity.succeeded',
         'workflow.completed'],
        [maps:get(event_type, E) || E <- Events]).
 

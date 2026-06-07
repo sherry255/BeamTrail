@@ -406,21 +406,27 @@ ensure_attempt_started(RunId, Workflow, Input, State, StepId, Lease) ->
             StepInput = Input,
             case step_metadata(RunId, Workflow, StepId, StepInput) of
                 {ok, StepVersion, IdempotencyKey} ->
-                    case append_event(
-                           RunId,
-                           maps:get(last_event_seq, State, 0),
-                           Lease,
-                           'attempt.started',
-                           StepId,
-                           StepVersion,
-                           IdempotencyKey,
-                           #{attempt => AttemptNo,
-                             owner_node => owner(),
-                             step_input => StepInput}) of
-                        {ok, Event} ->
-                            State1 = apply_runtime_event(State, Event),
+                    EventSpecs =
+                        [event_spec('attempt.started', StepId, StepVersion,
+                                    IdempotencyKey,
+                                    #{attempt => AttemptNo,
+                                      owner_node => owner(),
+                                      step_input => StepInput}),
+                         activity_event_spec('activity.scheduled', StepId,
+                                             StepVersion, IdempotencyKey,
+                                             AttemptNo),
+                         activity_event_spec('activity.started', StepId,
+                                             StepVersion, IdempotencyKey,
+                                             AttemptNo)],
+                    case append_events(
+                           RunId, maps:get(last_event_seq, State, 0), Lease,
+                           EventSpecs) of
+                        {ok, Events} when length(Events) =:= length(EventSpecs) ->
+                            State1 = apply_runtime_events(State, Events),
                             _ = maybe_snapshot_state(RunId, State1, false),
                             {ok, maps:get(pending_attempt, State1), true, State1};
+                        {ok, Events} ->
+                            {error, {unexpected_append_result, Events}};
                         {error, _} = Error ->
                             Error
                     end;
@@ -482,17 +488,15 @@ handle_step_success_state(RunId, State, Attempt, Value, Lease, Options) ->
     StepId = maps:get(step_id, Attempt),
     case pending_attempt_expected_seq_from_state(State, Attempt) of
         {ok, ExpectedSeq} ->
-            case append_event(
-                   RunId,
-                   ExpectedSeq,
-                   Lease,
-                   'step.succeeded',
-                   StepId,
-                   maps:get(step_version, Attempt),
-                   maps:get(idempotency_key, Attempt),
-                   #{result => Value}) of
-                {ok, Event} ->
-                    State1 = apply_runtime_event(State, Event),
+            EventSpecs =
+                [event_spec('step.succeeded', StepId,
+                            maps:get(step_version, Attempt),
+                            maps:get(idempotency_key, Attempt),
+                            #{result => Value}),
+                 activity_event_spec('activity.succeeded', StepId, Attempt)],
+            case append_events(RunId, ExpectedSeq, Lease, EventSpecs) of
+                {ok, Events} when length(Events) =:= length(EventSpecs) ->
+                    State1 = apply_runtime_events(State, Events),
                     _ = maybe_snapshot_state(RunId, State1, false),
                     case maps:get(runner_mode, Options, dispatch) of
                         finish ->
@@ -501,6 +505,8 @@ handle_step_success_state(RunId, State, Attempt, Value, Lease, Options) ->
                             dispatch_locked(RunId, State1, Lease,
                                             Options#{runner_state := State1})
                     end;
+                {ok, Events} ->
+                    {error, {unexpected_append_result, Events}};
                 {error, _} = Error ->
                     Error
             end;
@@ -567,10 +573,11 @@ append_failed_retry_decision(RunId, State, Attempt, Reason, Policy, Lease,
     EventSpecs =
         [event_spec('step.failed', StepId, maps:get(step_version, Attempt),
                     maps:get(idempotency_key, Attempt), FailurePayload),
+         activity_failed_event_spec(StepId, Attempt, FailurePayload),
          event_spec('retry.scheduled', StepId, maps:get(step_version, Attempt),
                     maps:get(idempotency_key, Attempt), RetryPayload)],
     case append_events(RunId, ExpectedSeq, Lease, EventSpecs) of
-        {ok, [_FailedEvent, _RetryEvent] = Events} ->
+        {ok, [_FailedEvent, _ActivityFailedEvent, _RetryEvent] = Events} ->
             beamtrail_telemetry:execute([beamtrail, retry, scheduled], #{count => 1},
                                         #{run_id => RunId, step_id => StepId,
                                           next_retry_at => NextRetryAt}),
@@ -598,10 +605,11 @@ append_failed_terminal_decision(RunId, State, Attempt, FailurePayload, Lease,
     EventSpecs =
         [event_spec('step.failed', StepId, maps:get(step_version, Attempt),
                     maps:get(idempotency_key, Attempt), FailurePayload),
+         activity_failed_event_spec(StepId, Attempt, FailurePayload),
          event_spec('workflow.failed', StepId, maps:get(step_version, Attempt),
                     maps:get(idempotency_key, Attempt), FailurePayload)],
     case append_events(RunId, ExpectedSeq, Lease, EventSpecs) of
-        {ok, [_StepFailedEvent, _WorkflowFailedEvent] = Events} ->
+        {ok, [_StepFailedEvent, _ActivityFailedEvent, _WorkflowFailedEvent] = Events} ->
             State1 = apply_runtime_events(State, Events),
             _ = maybe_snapshot_state(RunId, State1, true),
             {ok, State1};
@@ -652,10 +660,11 @@ append_attempt_callback_failure(RunId, State, Attempt, Callback, CallbackError,
     EventSpecs =
         [event_spec('step.failed', StepId, maps:get(step_version, Attempt),
                     maps:get(idempotency_key, Attempt), Payload),
+         activity_failed_event_spec(StepId, Attempt, Payload),
          event_spec('workflow.failed', StepId, maps:get(step_version, Attempt),
                     maps:get(idempotency_key, Attempt), Payload)],
     case append_events(RunId, maps:get(last_event_seq, State, 0), Lease, EventSpecs) of
-        {ok, [_StepFailedEvent, _WorkflowFailedEvent] = Events} ->
+        {ok, [_StepFailedEvent, _ActivityFailedEvent, _WorkflowFailedEvent] = Events} ->
             State1 = apply_runtime_events(State, Events),
             _ = maybe_snapshot_state(RunId, State1, true),
             {ok, State1};
@@ -759,6 +768,34 @@ append_events(RunId, ExpectedSeq, Lease, EventSpecs) ->
     (beamtrail_config:storage()):append_events(
       RunId, ExpectedSeq, beamtrail_lease_manager:fencing_token(Lease),
       EventSpecs).
+
+activity_event_spec(EventType, StepId, Attempt) ->
+    activity_event_spec(EventType,
+                        StepId,
+                        maps:get(step_version, Attempt),
+                        maps:get(idempotency_key, Attempt),
+                        maps:get(attempt, Attempt)).
+
+activity_event_spec(EventType, StepId, StepVersion, IdempotencyKey, AttemptNo) ->
+    event_spec(EventType, StepId, StepVersion, IdempotencyKey,
+               activity_payload(EventType, AttemptNo)).
+
+activity_failed_event_spec(StepId, Attempt, FailurePayload) ->
+    event_spec('activity.failed',
+               StepId,
+               maps:get(step_version, Attempt),
+               maps:get(idempotency_key, Attempt),
+               activity_payload('activity.failed',
+                                maps:get(attempt, Attempt),
+                                FailurePayload)).
+
+activity_payload(EventType, AttemptNo) ->
+    activity_payload(EventType, AttemptNo, #{}).
+
+activity_payload(EventType, AttemptNo, Extra) ->
+    Extra#{activity_type => step,
+           activity_status => beamtrail_activity:status(EventType),
+           attempt => AttemptNo}.
 
 event_spec(EventType, StepId, StepVersion, IdempotencyKey, Payload) ->
     #{event_type => EventType,

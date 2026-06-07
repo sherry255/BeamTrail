@@ -73,6 +73,10 @@ Important event types:
 - `workflow.instance.created` records the workflow module, original input, and
   the linear step list.
 - `attempt.started` records that a step attempt crossed the execution boundary.
+- `activity.scheduled`, `activity.started`, `activity.succeeded`, and
+  `activity.failed` record the observable lifecycle of the step callback for
+  that attempt. They are audit facts only; reducer state is still driven by the
+  attempt and step events below.
 - `step.succeeded` records a completed step and advances to the next step.
 - `step.failed` records a failed attempt.
 - `retry.scheduled` records the retry decision and `next_retry_at`.
@@ -82,9 +86,10 @@ Important event types:
   without changing the underlying run status.
 - `recovery.requeued` records an observable recovery takeover decision.
 
-Failure decisions are written atomically. A failed step and its retry-or-terminal
-decision are appended in one storage call, so a crash cannot leave a persistent
-state where `step.failed` is recorded but the retry/terminal decision is missing.
+Failure decisions are written atomically. Activity failure, failed step, and the
+retry-or-terminal decision are appended in one storage call, so a crash cannot
+leave a persistent state where `step.failed` is recorded but the
+retry/terminal decision is missing.
 
 Successful step results are retained in reducer state as an ordered
 `results` list and exposed through `beamtrail_query:describe/1`. This makes

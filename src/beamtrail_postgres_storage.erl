@@ -813,6 +813,14 @@ decode_event_type(<<"workflow.instance.created">>) ->
     {ok, 'workflow.instance.created'};
 decode_event_type(<<"attempt.started">>) ->
     {ok, 'attempt.started'};
+decode_event_type(<<"activity.scheduled">>) ->
+    {ok, 'activity.scheduled'};
+decode_event_type(<<"activity.started">>) ->
+    {ok, 'activity.started'};
+decode_event_type(<<"activity.succeeded">>) ->
+    {ok, 'activity.succeeded'};
+decode_event_type(<<"activity.failed">>) ->
+    {ok, 'activity.failed'};
 decode_event_type(<<"step.succeeded">>) ->
     {ok, 'step.succeeded'};
 decode_event_type(<<"step.failed">>) ->

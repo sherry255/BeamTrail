@@ -69,7 +69,7 @@ postgres_workflow_survives_application_restart() ->
     State = beamtrail:get_state(RunId),
     ?assertEqual(completed, maps:get(status, State)),
     {ok, Events} = beamtrail:events(RunId),
-    ?assertEqual([1, 2, 3, 4, 5, 6], [maps:get(event_seq, E) || E <- Events]).
+    ?assertEqual(lists:seq(1, 12), [maps:get(event_seq, E) || E <- Events]).
 
 postgres_recovery_replays_unfinished_attempt_after_restart() ->
     RunId = unique_run_id("pg-recover"),
@@ -149,7 +149,10 @@ postgres_signal_wakes_waiting_workflow() ->
         'workflow.waiting',
         'signal.received',
         'attempt.started',
+        'activity.scheduled',
+        'activity.started',
         'step.succeeded',
+        'activity.succeeded',
        'workflow.completed'],
        [maps:get(event_type, E) || E <- Events]).
 
@@ -162,6 +165,7 @@ postgres_timer_wakes_waiting_workflow() ->
                                            #{run_id => RunId}),
     {ok, Waiting} = wait_for_state(RunId, waiting, 1000),
     ?assertMatch(#{next_wake_at := WakeAt} when is_integer(WakeAt), Waiting),
+    ok = wait_until_pg_lease_expired(RunId, 1000),
     {ok, [RunId]} = beamtrail_scanner:scan_now(),
     {ok, State} = beamtrail:await_terminal(RunId, 1000),
     ?assertMatch(#{status := completed,
@@ -206,7 +210,10 @@ postgres_approval_signal_before_deadline_completes() ->
         'workflow.waiting',
         'signal.received',
         'attempt.started',
+        'activity.scheduled',
+        'activity.started',
         'step.succeeded',
+        'activity.succeeded',
         'workflow.completed'],
        [maps:get(event_type, E) || E <- Events]).
 
