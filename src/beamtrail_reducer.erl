@@ -288,9 +288,7 @@ add_effect_lifecycle_seq(scheduled, Event, Effect) ->
             scheduled_at => maps:get(occurred_at, Event, undefined)};
 add_effect_lifecycle_seq(started, Event, Effect) ->
     Effect#{started_event_seq => maps:get(event_seq, Event),
-            started_at => maps:get(occurred_at, Event, undefined)};
-add_effect_lifecycle_seq(_Status, _Event, Effect) ->
-    Effect.
+            started_at => maps:get(occurred_at, Event, undefined)}.
 
 clear_event_effect(Event, State) ->
     Payload = maps:get(payload, Event, #{}),
