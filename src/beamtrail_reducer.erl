@@ -203,6 +203,7 @@ apply_event_type('workflow.completed', State, Event) ->
     State#{status => completed,
            current_step => undefined,
            pending_attempt => undefined,
+           pending_effects => #{},
            terminal => true,
            workflow_result => maps:get(result, Payload, undefined),
            failure => undefined};
@@ -210,6 +211,7 @@ apply_event_type('workflow.failed', State, Event) ->
     State#{status => failed,
            current_step => undefined,
            pending_attempt => undefined,
+           pending_effects => #{},
            terminal => true,
            failure => maps:get(payload, Event)};
 apply_event_type('workflow.cancelled', State, Event) ->
@@ -217,6 +219,7 @@ apply_event_type('workflow.cancelled', State, Event) ->
     State#{status => cancelled,
            current_step => undefined,
            pending_attempt => undefined,
+           pending_effects => #{},
            terminal => true,
            failure => Payload,
            parked => false,
