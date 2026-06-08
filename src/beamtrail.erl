@@ -5,7 +5,7 @@
          recover_unfinished/0]).
 -export([get_state/1, await_terminal/2, events/1, storage/0]).
 -export([cancel_run/2, park_run/2, resume_run/1, requeue_run/2]).
--export([signal_run/3]).
+-export([signal_run/3, complete_effect/3]).
 -export([list_recoverable/0, list_recoverable/2,
          mark_recovery_requeued/1, mark_recovery_requeued_with_lease/1]).
 
@@ -24,6 +24,7 @@
 -type workflow_start_result() ::
     {ok, run_id()} | {error, {create_failed | dispatch_failed, run_id(), term()}}.
 -type state_result() :: {ok, state()} | {error, term()}.
+-type effect_completion_result() :: {ok, state()} | {ok, ignored} | {error, term()}.
 -type recovery_mark_result() :: {ok, requeued | failed | skipped} | {error, term()}.
 -type recovery_with_lease_result() ::
     {ok, {requeued, lease()} | {failed, state()} | skipped} | {error, term()}.
@@ -331,6 +332,128 @@ release_waiting_lease(RunId, #{status := waiting}) ->
             ok
     end;
 release_waiting_lease(_RunId, _State) ->
+    ok.
+
+-spec complete_effect(run_id(), term(), {ok, term()} | {error, term()}) ->
+    effect_completion_result().
+complete_effect(RunId, EffectId, Result) ->
+    ok = ensure_storage(),
+    case normalize_effect_result(Result) of
+        {ok, Completion} ->
+            complete_effect_loaded(RunId, EffectId, Completion);
+        {error, _} = Error ->
+            Error
+    end.
+
+normalize_effect_result({ok, _} = Result) ->
+    {ok, Result};
+normalize_effect_result({error, _} = Result) ->
+    {ok, Result};
+normalize_effect_result(Other) ->
+    {error, {bad_effect_result, Other}}.
+
+complete_effect_loaded(RunId, EffectId, Result) ->
+    case load_state(RunId) of
+        {ok, State} ->
+            case complete_effect_candidate(State, EffectId) of
+                complete ->
+                    complete_effect_with_new_lease(RunId, EffectId, Result);
+                ignored ->
+                    {ok, ignored};
+                {error, _} = Error ->
+                    Error
+            end;
+        {error, _} = Error ->
+            Error
+    end.
+
+complete_effect_candidate(#{terminal := true}, _EffectId) ->
+    ignored;
+complete_effect_candidate(#{parked := true}, _EffectId) ->
+    {error, parked};
+complete_effect_candidate(State, EffectId) ->
+    case pending_effect_attempt(State, EffectId) of
+        {ok, _Attempt} -> complete;
+        ignored -> ignored;
+        {error, _} = Error -> Error
+    end.
+
+complete_effect_with_new_lease(RunId, EffectId, Result) ->
+    case (storage()):acquire_lease(
+           RunId, beamtrail_transition:owner(),
+           beamtrail_lease_manager:default_ttl_ms()) of
+        {ok, Lease} ->
+            complete_effect_with_lease(RunId, Lease, EffectId, Result);
+        {error, _} = Error ->
+            Error
+    end.
+
+complete_effect_with_lease(RunId, Lease, EffectId, Result) ->
+    FencingToken = beamtrail_lease_manager:fencing_token(Lease),
+    Completion =
+        case load_state(RunId) of
+            {ok, State} ->
+                complete_effect_locked(RunId, State, Lease, EffectId, Result);
+            {error, _} = Error ->
+                Error
+        end,
+    _ = beamtrail_lease_manager:release(RunId, FencingToken),
+    case Completion of
+        {ok, ignored} ->
+            {ok, ignored};
+        {ok, State1} ->
+            dispatch_after_external_effect(RunId, State1),
+            {ok, State1};
+        Other ->
+            Other
+    end.
+
+complete_effect_locked(_RunId, #{terminal := true}, _Lease, _EffectId, _Result) ->
+    {ok, ignored};
+complete_effect_locked(_RunId, #{parked := true}, _Lease, _EffectId, _Result) ->
+    {error, parked};
+complete_effect_locked(RunId, State, Lease, EffectId, Result) ->
+    case pending_effect_attempt(State, EffectId) of
+        {ok, Attempt} ->
+            beamtrail_transition:complete_effect(RunId, Lease, Attempt, Result, State);
+        ignored ->
+            {ok, ignored};
+        {error, _} = Error ->
+            Error
+    end.
+
+pending_effect_attempt(State, EffectId) ->
+    PendingEffects = maps:get(pending_effects, State, #{}),
+    case maps:get(EffectId, PendingEffects, undefined) of
+        undefined ->
+            ignored;
+        #{effect_type := call_step} ->
+            pending_call_step_attempt(State, EffectId);
+        #{effect_type := EffectType} ->
+            {error, {unsupported_effect_type, EffectType}};
+        _ ->
+            {error, {bad_pending_effect, EffectId}}
+    end.
+
+pending_call_step_attempt(State, EffectId) ->
+    case maps:get(pending_attempt, State, undefined) of
+        #{effect_id := EffectId} = Attempt ->
+            {ok, Attempt};
+        #{step_id := StepId, attempt := AttemptNo} = Attempt ->
+            case beamtrail_effect:call_step_id(StepId, AttemptNo) =:= EffectId of
+                true -> {ok, Attempt#{effect_id => EffectId}};
+                false -> ignored
+            end;
+        _ ->
+            ignored
+    end.
+
+dispatch_after_external_effect(_RunId, #{terminal := true}) ->
+    ok;
+dispatch_after_external_effect(_RunId, #{parked := true}) ->
+    ok;
+dispatch_after_external_effect(RunId, _State) ->
+    _ = dispatch_supervised(RunId),
     ok.
 
 cancel_run_with_new_lease(RunId, Reason) ->

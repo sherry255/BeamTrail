@@ -10,6 +10,9 @@ durable_runtime_test_() ->
       fun successful_workflow_writes_append_only_events_and_snapshot/0,
       fun call_step_effect_executes_workflow_callback/0,
       fun runner_transition_returns_tagged_effect/0,
+      fun complete_effect_finishes_pending_call_step_once/0,
+      fun complete_effect_ignores_cancelled_pending_call_step/0,
+      fun complete_effect_failure_uses_retry_decision/0,
       fun retry_uses_stable_idempotency_key_across_attempts/0,
       fun recovery_replays_unknown_attempt_with_recorded_step_version/0,
       fun step_timeout_records_observable_failure/0
@@ -127,6 +130,81 @@ runner_transition_returns_tagged_effect() ->
                        status := started}},
        maps:get(pending_effects, State1)).
 
+complete_effect_finishes_pending_call_step_once() ->
+    RunId = <<"complete-effect-success-run">>,
+    Input = #{order_id => <<"complete-effect-1">>,
+              test_pid => self(),
+              gate => complete_effect_gate},
+    {ok, RunId} =
+        beamtrail:start_workflow(bt_blocking_success_workflow, Input,
+                                 #{run_id => RunId, auto_dispatch => false}),
+    {_Attempt, Effect, _PreparedState} = prepare_pending_call_step(RunId),
+    EffectId = beamtrail_effect:id(Effect),
+
+    ?assertEqual(timeout, receive_exec_short()),
+    {ok, State1} =
+        beamtrail:complete_effect(RunId, EffectId, {ok, #{external => done}}),
+    ?assertEqual(#{}, maps:get(pending_effects, State1)),
+    ok = wait_for_status(RunId, completed, 1000),
+    ?assertEqual(timeout, receive_exec_short()),
+
+    {ok, Events1} = beamtrail:events(RunId),
+    ?assertEqual(1, count_events('step.succeeded', Events1)),
+    ?assertEqual(1, count_events('activity.succeeded', Events1)),
+    Succeeded = only_event('step.succeeded', Events1),
+    ?assertEqual(EffectId, maps:get(effect_id, maps:get(payload, Succeeded))),
+    ?assertEqual(#{external => done}, maps:get(result, maps:get(payload, Succeeded))),
+
+    ?assertEqual({ok, ignored},
+                 beamtrail:complete_effect(RunId, EffectId,
+                                           {ok, #{external => duplicate}})),
+    {ok, Events2} = beamtrail:events(RunId),
+    ?assertEqual(length(Events1), length(Events2)).
+
+complete_effect_ignores_cancelled_pending_call_step() ->
+    RunId = <<"complete-effect-cancelled-run">>,
+    Input = #{order_id => <<"complete-effect-2">>,
+              test_pid => self(),
+              gate => complete_effect_cancelled_gate},
+    {ok, RunId} =
+        beamtrail:start_workflow(bt_blocking_success_workflow, Input,
+                                 #{run_id => RunId, auto_dispatch => false}),
+    {_Attempt, Effect, _PreparedState} = prepare_pending_call_step(RunId),
+    EffectId = beamtrail_effect:id(Effect),
+
+    {ok, Cancelled} = beamtrail:cancel_run(RunId, operator_cancel),
+    ?assertMatch(#{status := cancelled, terminal := true}, Cancelled),
+    ?assertEqual({ok, ignored},
+                 beamtrail:complete_effect(RunId, EffectId,
+                                           {ok, #{external => too_late}})),
+    ?assertEqual(timeout, receive_exec_short()),
+    {ok, Events} = beamtrail:events(RunId),
+    ?assertEqual(0, count_events('step.succeeded', Events)),
+    ?assertEqual(0, count_events('activity.succeeded', Events)).
+
+complete_effect_failure_uses_retry_decision() ->
+    RunId = <<"complete-effect-failure-run">>,
+    Input = #{order_id => <<"complete-effect-3">>, test_pid => self()},
+    {ok, RunId} =
+        beamtrail:start_workflow(bt_single_fail_workflow, Input,
+                                 #{run_id => RunId, auto_dispatch => false}),
+    {_Attempt, Effect, _PreparedState} = prepare_pending_call_step(RunId),
+    EffectId = beamtrail_effect:id(Effect),
+
+    {ok, State1} = beamtrail:complete_effect(RunId, EffectId, {error, transient}),
+    ?assertMatch(#{status := failed, terminal := true}, State1),
+    ?assertEqual(#{}, maps:get(pending_effects, State1)),
+    ?assertEqual(timeout, receive_exec_short()),
+    {ok, Events1} = beamtrail:events(RunId),
+    ?assertEqual(1, count_events('step.failed', Events1)),
+    ?assertEqual(1, count_events('activity.failed', Events1)),
+    ?assertEqual(1, count_events('workflow.failed', Events1)),
+
+    ?assertEqual({ok, ignored},
+                 beamtrail:complete_effect(RunId, EffectId, {error, transient})),
+    {ok, Events2} = beamtrail:events(RunId),
+    ?assertEqual(length(Events1), length(Events2)).
+
 retry_uses_stable_idempotency_key_across_attempts() ->
     Input = #{order_id => <<"order-2">>, test_pid => self()},
     {ok, RunId} = beamtrail:start_workflow(bt_retry_workflow, Input),
@@ -235,6 +313,33 @@ receive_exec() ->
     after 1000 ->
         timeout
     end.
+
+receive_exec_short() ->
+    receive
+        Message -> Message
+    after 50 ->
+        timeout
+    end.
+
+prepare_pending_call_step(RunId) ->
+    {ok, Lease} =
+        beamtrail_memory_storage:acquire_lease(
+          RunId, #{owner => complete_effect_test}, 30000),
+    {ok, State0} = beamtrail_runner_transition:load_state(RunId),
+    {ok, {execute, Attempt, Effect, State1}} =
+        beamtrail_runner_transition:next_action(RunId, Lease, State0),
+    ok = beamtrail_memory_storage:release_lease(
+           RunId, maps:get(fencing_token, Lease)),
+    {Attempt, Effect, State1}.
+
+count_events(EventType, Events) ->
+    length([Event || Event <- Events,
+                     maps:get(event_type, Event) =:= EventType]).
+
+only_event(EventType, Events) ->
+    [Event] = [Event || Event <- Events,
+                        maps:get(event_type, Event) =:= EventType],
+    Event.
 
 wait_for_status(_RunId, _Target, Remaining) when Remaining =< 0 ->
     {error, timeout};

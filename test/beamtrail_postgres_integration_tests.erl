@@ -11,6 +11,7 @@ postgres_integration_test_() ->
              fun() -> setup(Config) end,
              fun cleanup/1,
              [fun postgres_workflow_survives_application_restart/0,
+              fun postgres_complete_effect_finishes_pending_call_step/0,
               fun postgres_recovery_replays_unfinished_attempt_after_restart/0,
               fun postgres_recovery_budget_exceeded_fails_open_attempt/0,
               fun postgres_signal_wakes_waiting_workflow/0,
@@ -70,6 +71,35 @@ postgres_workflow_survives_application_restart() ->
     ?assertEqual(completed, maps:get(status, State)),
     {ok, Events} = beamtrail:events(RunId),
     ?assertEqual(lists:seq(1, 12), [maps:get(event_seq, E) || E <- Events]).
+
+postgres_complete_effect_finishes_pending_call_step() ->
+    RunId = unique_run_id("pg-complete-effect"),
+    Input = #{order_id => RunId,
+              test_pid => self(),
+              gate => pg_complete_effect_gate},
+    {ok, RunId} =
+        beamtrail:start_workflow(bt_blocking_success_workflow, Input,
+                                 #{run_id => RunId, auto_dispatch => false}),
+    Effect = prepare_pending_call_step_pg(RunId),
+    EffectId = beamtrail_effect:id(Effect),
+
+    ?assertEqual(timeout, receive_exec_short()),
+    {ok, State1} =
+        beamtrail:complete_effect(RunId, EffectId, {ok, #{external => pg_done}}),
+    ?assertEqual(#{}, maps:get(pending_effects, State1)),
+    {ok, Completed} = beamtrail:await_terminal(RunId, 1000),
+    ?assertMatch(#{status := completed, terminal := true}, Completed),
+    ?assertEqual(timeout, receive_exec_short()),
+
+    {ok, Events1} = beamtrail:events(RunId),
+    ?assertEqual(1, count_events('step.succeeded', Events1)),
+    ?assertEqual(1, count_events('activity.succeeded', Events1)),
+    ?assertEqual(1, count_events('workflow.completed', Events1)),
+    ?assertEqual({ok, ignored},
+                 beamtrail:complete_effect(RunId, EffectId,
+                                           {ok, #{external => duplicate}})),
+    {ok, Events2} = beamtrail:events(RunId),
+    ?assertEqual(length(Events1), length(Events2)).
 
 postgres_recovery_replays_unfinished_attempt_after_restart() ->
     RunId = unique_run_id("pg-recover"),
@@ -826,6 +856,26 @@ receive_exec() ->
     receive Message -> Message
     after 1000 -> timeout
     end.
+
+receive_exec_short() ->
+    receive Message -> Message
+    after 50 -> timeout
+    end.
+
+prepare_pending_call_step_pg(RunId) ->
+    {ok, Lease} =
+        beamtrail_postgres_storage:acquire_lease(
+          RunId, #{owner => complete_effect_test}, 30000),
+    {ok, State0} = beamtrail_runner_transition:load_state(RunId),
+    {ok, {execute, _Attempt, Effect, _State1}} =
+        beamtrail_runner_transition:next_action(RunId, Lease, State0),
+    ok = beamtrail_postgres_storage:release_lease(
+           RunId, maps:get(fencing_token, Lease)),
+    Effect.
+
+count_events(EventType, Events) ->
+    length([Event || Event <- Events,
+                     maps:get(event_type, Event) =:= EventType]).
 
 wait_for_state(_RunId, _Target, Remaining) when Remaining =< 0 ->
     {error, timeout};
