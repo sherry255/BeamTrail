@@ -36,6 +36,7 @@ snapshot_schema_definition() ->
            parked_at,
            parked_reason,
            pending_attempt,
+           pending_effects,
            results,
            run_id,
            signals,

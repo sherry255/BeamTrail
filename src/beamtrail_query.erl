@@ -93,6 +93,7 @@ describe_loaded_events(RunId, Mod, State, Events) ->
       migration_required_for_version_change =>
           maps:get(migration_required_for_version_change, State, false),
       pending_attempt => maps:get(pending_attempt, State, undefined),
+      pending_effects => maps:get(pending_effects, State, #{}),
       attempts => Attempts,
       activities => activities_from_events(Events),
       results => maps:get(results, State, []),
@@ -280,9 +281,11 @@ collect_activity_event(#{event_type := EventType} = Event, {Groups, Order})
     Payload = maps:get(payload, Event, #{}),
     StepId = maps:get(step_id, Event, undefined),
     Attempt = maps:get(attempt, Payload, undefined),
-    Key = {StepId, Attempt},
+    EffectId = maps:get(effect_id, Payload, {StepId, Attempt}),
+    Key = EffectId,
     Entry =
         #{event_type => EventType,
+          effect_id => EffectId,
           event_seq => maps:get(event_seq, Event),
           status => maps:get(activity_status, Payload,
                              beamtrail_activity:status(EventType)),
@@ -294,6 +297,7 @@ collect_activity_event(#{event_type := EventType} = Event, {Groups, Order})
                 {Group, Order};
             error ->
                 {#{step_id => StepId,
+                   effect_id => EffectId,
                    attempt => Attempt,
                    step_version => maps:get(step_version, Event, undefined),
                    idempotency_key => maps:get(idempotency_key, Event, undefined),

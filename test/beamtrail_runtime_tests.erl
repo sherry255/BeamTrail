@@ -61,7 +61,20 @@ successful_workflow_writes_append_only_events_and_snapshot() ->
 
     {ok, Snapshot} = beamtrail_memory_storage:read_snapshot(RunId),
     ?assertEqual(12, maps:get(snapshot_seq, Snapshot)),
-    ?assertEqual(completed, maps:get(status, maps:get(state, Snapshot))).
+    ?assertEqual(completed, maps:get(status, maps:get(state, Snapshot))),
+
+    Q = beamtrail_query:describe(RunId),
+    ?assertEqual(#{}, maps:get(pending_effects, Q)),
+    ?assertMatch(
+       [#{effect_id := {call_step, charge, 1},
+          events := [#{effect_id := {call_step, charge, 1}},
+                     #{effect_id := {call_step, charge, 1}},
+                     #{effect_id := {call_step, charge, 1}}]},
+        #{effect_id := {call_step, ship, 1},
+          events := [#{effect_id := {call_step, ship, 1}},
+                     #{effect_id := {call_step, ship, 1}},
+                     #{effect_id := {call_step, ship, 1}}]}],
+       maps:get(activities, Q)).
 
 call_step_effect_executes_workflow_callback() ->
     Input = #{order_id => <<"effect-1">>, test_pid => self()},
@@ -81,6 +94,7 @@ call_step_effect_executes_workflow_callback() ->
     ?assertEqual(call_step, beamtrail_effect:type(Effect)),
     ?assertEqual(charge, beamtrail_effect:step_id(Effect)),
     ?assertEqual(infinity, beamtrail_effect:timeout_ms(Effect)),
+    ?assertEqual({call_step, charge, 1}, beamtrail_effect:id(Effect)),
     ?assertEqual({ok, #{step => charge}},
                  beamtrail_executor:execute_attempt(Effect)),
     ?assertMatch({executed, charge, 1, {charge, <<"effect-1">>}},
@@ -96,14 +110,22 @@ runner_transition_returns_tagged_effect() ->
           RunId, #{owner => effect_test}, 30000),
     {ok, State} = beamtrail_runner_transition:load_state(RunId),
 
-    {ok, {execute, Attempt, Effect, _State1}} =
+    {ok, {execute, Attempt, Effect, State1}} =
         beamtrail_runner_transition:next_action(RunId, Lease, State),
+    EffectId = beamtrail_effect:id(Effect),
 
     ?assertEqual(charge, maps:get(step_id, Attempt)),
     ?assertEqual(call_step, beamtrail_effect:type(Effect)),
     ?assertEqual(charge, beamtrail_effect:step_id(Effect)),
     ?assertEqual({charge, <<"effect-2">>},
-                 beamtrail_effect:idempotency_key(Effect)).
+                 beamtrail_effect:idempotency_key(Effect)),
+    ?assertMatch(
+       #{EffectId := #{effect_id := EffectId,
+                       effect_type := call_step,
+                       step_id := charge,
+                       attempt := 1,
+                       status := started}},
+       maps:get(pending_effects, State1)).
 
 retry_uses_stable_idempotency_key_across_attempts() ->
     Input = #{order_id => <<"order-2">>, test_pid => self()},

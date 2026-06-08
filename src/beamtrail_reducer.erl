@@ -23,6 +23,7 @@ new() ->
       attempt_counts => #{},
       attempts => [],
       pending_attempt => undefined,
+      pending_effects => #{},
       next_retry_at => undefined,
       failure => undefined,
       parked => false,
@@ -92,15 +93,18 @@ apply_event_type('attempt.started', State, Event) ->
         #{step_id => StepId,
           step_version => maps:get(step_version, Event),
           idempotency_key => maps:get(idempotency_key, Event),
+          effect_id => maps:get(effect_id, Payload, undefined),
           step_input => StepInput,
           attempt => PayloadAttempt,
           status => unknown,
           started_event_seq => maps:get(event_seq, Event)},
-    State#{status => running,
-           next_retry_at => undefined,
-           pending_attempt => Attempt,
-           attempt_counts => maps:put(StepId, AttemptNo, AttemptCounts0),
-           attempts => maps:get(attempts, State) ++ [Attempt]};
+    State1 =
+        State#{status => running,
+               next_retry_at => undefined,
+               pending_attempt => Attempt,
+               attempt_counts => maps:put(StepId, AttemptNo, AttemptCounts0),
+               attempts => maps:get(attempts, State) ++ [Attempt]},
+    register_pending_effect(State1, Event, Attempt);
 apply_event_type('step.succeeded', State, Event) ->
     StepId = maps:get(step_id, Event),
     CompletedSteps = maps:get(completed_steps, State) + 1,
@@ -114,6 +118,7 @@ apply_event_type('step.succeeded', State, Event) ->
            attempts => update_latest_attempt(StepId, succeeded, Event, State),
            results => maps:get(results, State) ++
                [result_entry(StepId, Result, Event, State)],
+           pending_effects => clear_event_effect(Event, State),
            failure => undefined};
 apply_event_type('timer.scheduled', State, Event) ->
     Payload = maps:get(payload, Event),
@@ -157,8 +162,17 @@ apply_event_type('step.failed', State, Event) ->
     Payload = maps:get(payload, Event),
     State#{status => failed,
            pending_attempt => undefined,
+           pending_effects => clear_event_effect(Event, State),
            failure => Payload,
            attempts => update_latest_attempt(StepId, failed, Event, State)};
+apply_event_type('activity.scheduled', State, Event) ->
+    update_pending_effect_status(State, Event, scheduled);
+apply_event_type('activity.started', State, Event) ->
+    update_pending_effect_status(State, Event, started);
+apply_event_type('activity.succeeded', State, Event) ->
+    State#{pending_effects => clear_event_effect(Event, State)};
+apply_event_type('activity.failed', State, Event) ->
+    State#{pending_effects => clear_event_effect(Event, State)};
 apply_event_type('retry.scheduled', State, Event) ->
     Payload = maps:get(payload, Event),
     State#{status => retrying,
@@ -220,6 +234,69 @@ apply_event_type('workflow.resumed', State, _Event) ->
            parked_at => undefined};
 apply_event_type(_Other, State, _Event) ->
     State.
+
+register_pending_effect(State, Event, Attempt) ->
+    Payload = maps:get(payload, Event, #{}),
+    case maps:get(effect_id, Payload, undefined) of
+        undefined ->
+            State;
+        EffectId ->
+            Pending0 = maps:get(pending_effects, State, #{}),
+            Effect =
+                #{effect_id => EffectId,
+                  effect_type => maps:get(effect_type, Payload, call_step),
+                  step_id => maps:get(step_id, Attempt),
+                  step_version => maps:get(step_version, Attempt),
+                  idempotency_key => maps:get(idempotency_key, Attempt),
+                  attempt => maps:get(attempt, Attempt),
+                  status => requested,
+                  requested_event_seq => maps:get(event_seq, Event),
+                  requested_at => maps:get(occurred_at, Event, undefined)},
+            State#{pending_effects => maps:put(EffectId, Effect, Pending0)}
+    end.
+
+update_pending_effect_status(State, Event, Status) ->
+    Payload = maps:get(payload, Event, #{}),
+    case maps:get(effect_id, Payload, undefined) of
+        undefined ->
+            State;
+        EffectId ->
+            Pending0 = maps:get(pending_effects, State, #{}),
+            Effect0 =
+                maps:get(EffectId,
+                         Pending0,
+                         pending_effect_from_activity(Event, Payload, EffectId)),
+            Effect1 = Effect0#{status => Status},
+            Effect2 = add_effect_lifecycle_seq(Status, Event, Effect1),
+            State#{pending_effects => maps:put(EffectId, Effect2, Pending0)}
+    end.
+
+pending_effect_from_activity(Event, Payload, EffectId) ->
+    #{effect_id => EffectId,
+      effect_type => maps:get(effect_type, Payload, call_step),
+      step_id => maps:get(step_id, Event),
+      step_version => maps:get(step_version, Event),
+      idempotency_key => maps:get(idempotency_key, Event),
+      attempt => maps:get(attempt, Payload, undefined),
+      status => requested}.
+
+add_effect_lifecycle_seq(scheduled, Event, Effect) ->
+    Effect#{scheduled_event_seq => maps:get(event_seq, Event),
+            scheduled_at => maps:get(occurred_at, Event, undefined)};
+add_effect_lifecycle_seq(started, Event, Effect) ->
+    Effect#{started_event_seq => maps:get(event_seq, Event),
+            started_at => maps:get(occurred_at, Event, undefined)};
+add_effect_lifecycle_seq(_Status, _Event, Effect) ->
+    Effect.
+
+clear_event_effect(Event, State) ->
+    Payload = maps:get(payload, Event, #{}),
+    case maps:get(effect_id, Payload, undefined) of
+        undefined ->
+            maps:get(pending_effects, State, #{});
+        EffectId ->
+            maps:remove(EffectId, maps:get(pending_effects, State, #{}))
+    end.
 
 first_step([]) ->
     undefined;

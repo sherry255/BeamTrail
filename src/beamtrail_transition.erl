@@ -414,18 +414,21 @@ ensure_attempt_started(RunId, Workflow, Input, State, StepId, Lease) ->
             StepInput = Input,
             case step_metadata(RunId, Workflow, StepId, StepInput) of
                 {ok, StepVersion, IdempotencyKey} ->
+                    EffectId = beamtrail_effect:call_step_id(StepId, AttemptNo),
                     EventSpecs =
                         [event_spec('attempt.started', StepId, StepVersion,
                                     IdempotencyKey,
                                     #{attempt => AttemptNo,
+                                      effect_id => EffectId,
+                                      effect_type => call_step,
                                       owner_node => owner(),
                                       step_input => StepInput}),
                          activity_event_spec('activity.scheduled', StepId,
                                              StepVersion, IdempotencyKey,
-                                             AttemptNo),
+                                             AttemptNo, EffectId),
                          activity_event_spec('activity.started', StepId,
                                              StepVersion, IdempotencyKey,
-                                             AttemptNo)],
+                                             AttemptNo, EffectId)],
                     case append_events(
                            RunId, maps:get(last_event_seq, State, 0), Lease,
                            EventSpecs) of
@@ -500,7 +503,8 @@ handle_step_success_state(RunId, State, Attempt, Value, Lease, Options) ->
                 [event_spec('step.succeeded', StepId,
                             maps:get(step_version, Attempt),
                             maps:get(idempotency_key, Attempt),
-                            #{result => Value}),
+                            (effect_payload_fields(StepId, Attempt))#{
+                              result => Value}),
                  activity_event_spec('activity.succeeded', StepId, Attempt)],
             case append_events(RunId, ExpectedSeq, Lease, EventSpecs) of
                 {ok, Events} when length(Events) =:= length(EventSpecs) ->
@@ -541,8 +545,11 @@ handle_step_failure_reload(RunId, Attempt, Reason, Lease, Options) ->
 
 handle_step_failure_state(RunId, State, Attempt, Reason, Lease, Options) ->
     StepId = maps:get(step_id, Attempt),
-    FailurePayload = #{reason => Reason, class => error_key(Reason),
-                       attempt => maps:get(attempt, Attempt)},
+    FailurePayload =
+        (effect_payload_fields(StepId, Attempt))#{
+          reason => Reason,
+          class => error_key(Reason),
+          attempt => maps:get(attempt, Attempt)},
     case pending_attempt_expected_seq_from_state(State, Attempt) of
         {ok, ExpectedSeq} ->
             Workflow = maps:get(workflow, State),
@@ -664,7 +671,9 @@ append_attempt_callback_failure(RunId, State, Attempt, Callback, CallbackError,
     StepId = maps:get(step_id, Attempt),
     Payload =
         (callback_failure_payload(Callback, CallbackError))#{
-          attempt => maps:get(attempt, Attempt)},
+          attempt => maps:get(attempt, Attempt),
+          effect_id => effect_id_from_attempt(StepId, Attempt),
+          effect_type => call_step},
     EventSpecs =
         [event_spec('step.failed', StepId, maps:get(step_version, Attempt),
                     maps:get(idempotency_key, Attempt), Payload),
@@ -782,11 +791,13 @@ activity_event_spec(EventType, StepId, Attempt) ->
                         StepId,
                         maps:get(step_version, Attempt),
                         maps:get(idempotency_key, Attempt),
-                        maps:get(attempt, Attempt)).
+                        maps:get(attempt, Attempt),
+                        effect_id_from_attempt(StepId, Attempt)).
 
-activity_event_spec(EventType, StepId, StepVersion, IdempotencyKey, AttemptNo) ->
+activity_event_spec(EventType, StepId, StepVersion, IdempotencyKey, AttemptNo,
+                    EffectId) ->
     event_spec(EventType, StepId, StepVersion, IdempotencyKey,
-               activity_payload(EventType, AttemptNo)).
+               activity_payload(EventType, AttemptNo, EffectId)).
 
 activity_failed_event_spec(StepId, Attempt, FailurePayload) ->
     event_spec('activity.failed',
@@ -795,15 +806,30 @@ activity_failed_event_spec(StepId, Attempt, FailurePayload) ->
                maps:get(idempotency_key, Attempt),
                activity_payload('activity.failed',
                                 maps:get(attempt, Attempt),
+                                effect_id_from_attempt(StepId, Attempt),
                                 FailurePayload)).
 
-activity_payload(EventType, AttemptNo) ->
-    activity_payload(EventType, AttemptNo, #{}).
+activity_payload(EventType, AttemptNo, EffectId) ->
+    activity_payload(EventType, AttemptNo, EffectId, #{}).
 
-activity_payload(EventType, AttemptNo, Extra) ->
+activity_payload(EventType, AttemptNo, EffectId, Extra) ->
     Extra#{activity_type => step,
+           effect_id => EffectId,
+           effect_type => call_step,
            activity_status => beamtrail_activity:status(EventType),
            attempt => AttemptNo}.
+
+effect_id_from_attempt(StepId, Attempt) ->
+    case maps:get(effect_id, Attempt, undefined) of
+        undefined ->
+            beamtrail_effect:call_step_id(StepId, maps:get(attempt, Attempt));
+        EffectId ->
+            EffectId
+    end.
+
+effect_payload_fields(StepId, Attempt) ->
+    #{effect_id => effect_id_from_attempt(StepId, Attempt),
+      effect_type => call_step}.
 
 event_spec(EventType, StepId, StepVersion, IdempotencyKey, Payload) ->
     #{event_type => EventType,
