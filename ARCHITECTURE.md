@@ -77,6 +77,10 @@ Important event types:
   `activity.failed` record the observable lifecycle of the step callback for
   that attempt. They are audit facts only; reducer state is still driven by the
   attempt and step events below.
+- External step effects emit `attempt.started` and `activity.scheduled`, then
+  stop in `waiting_effect` until an outside worker calls `complete_effect/3`.
+  They deliberately do not emit `activity.started` until a future worker-claim
+  protocol exists.
 - `step.succeeded` records a completed step and advances to the next step.
 - `step.failed` records a failed attempt.
 - `retry.scheduled` records the retry decision and `next_retry_at`.
@@ -238,6 +242,15 @@ returns one durable command at a time. Step results are retained and queryable,
 and each attempt persists its chosen `step_input`. Legacy linear workflows still
 pass the original workflow input to every step; decider workflows can choose
 explicit step inputs from the reduced view.
+
+External effects are a minimal worker handoff, not a full task queue. The current
+runtime exposes pending external effects and accepts `complete_effect/3`, but it
+does not yet provide effect claim leases, visibility timeouts, deadlines, or
+automatic failure of abandoned external work. A run in `waiting_effect` is not
+recoverable by the scanner; if no worker completes the effect, the run remains
+pending until an operator or worker completes it. The next step is an effect
+deadline or visibility-timeout mechanism that can turn abandoned work into a
+retry or terminal failure.
 
 The decider is deliberately not a Temporal-style arbitrary workflow-code replay
 system; it is a deterministic callback over a reduced view that returns the next

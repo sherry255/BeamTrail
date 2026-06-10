@@ -250,6 +250,8 @@ after_dispatch_nonterminal(State, Data) ->
             schedule_retry_or_dispatch(State, Data);
         waiting ->
             stop_after_releasing_lease(Data);
+        waiting_effect ->
+            stop_after_releasing_lease(Data);
         _ ->
             schedule_immediate(Data)
     end.

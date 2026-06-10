@@ -246,6 +246,7 @@ recoverable_query(undefined, Limit, NowMs) ->
      "LEFT JOIN workflow_leases l ON l.run_id = r.run_id "
      "WHERE r.terminal = false "
      "AND r.parked = false "
+     "AND r.status <> 'waiting_effect' "
      "AND (r.status <> 'waiting' OR r.next_wake_at_ms <= $1) "
      "AND (r.status <> 'retrying' OR r.next_retry_at_ms <= $1) "
      "AND (l.lease_until_ms IS NULL OR l.lease_until_ms <= $1) "
@@ -256,6 +257,7 @@ recoverable_query(Cursor, Limit, NowMs) ->
      "LEFT JOIN workflow_leases l ON l.run_id = r.run_id "
      "WHERE r.terminal = false "
      "AND r.parked = false "
+     "AND r.status <> 'waiting_effect' "
      "AND (r.status <> 'waiting' OR r.next_wake_at_ms <= $1) "
      "AND (r.status <> 'retrying' OR r.next_retry_at_ms <= $1) "
      "AND (l.lease_until_ms IS NULL OR l.lease_until_ms <= $1) "
@@ -557,6 +559,9 @@ project_event(#{event_type := 'retry.scheduled', payload := Payload}, Acc) ->
                    maps:get(next_retry_at, Payload, null), false, Acc);
 project_event(#{event_type := 'workflow.waiting'}, Acc) ->
     project_status(<<"waiting">>, false, null, false, Acc);
+project_event(#{event_type := 'activity.scheduled',
+                payload := #{effect_type := external_step}}, Acc) ->
+    project_status(<<"waiting_effect">>, false, null, false, Acc);
 project_event(#{event_type := 'signal.received'}, Acc) ->
     project_status(<<"running">>, false, null, false, Acc);
 project_event(#{event_type := 'workflow.completed'}, _Acc) ->

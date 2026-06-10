@@ -13,6 +13,8 @@ durable_runtime_test_() ->
       fun complete_effect_finishes_pending_call_step_once/0,
       fun complete_effect_ignores_cancelled_pending_call_step/0,
       fun complete_effect_failure_uses_retry_decision/0,
+      fun external_step_waits_for_worker_completion/0,
+      fun complete_effect_matches_legacy_external_attempt_by_effect_type/0,
       fun retry_uses_stable_idempotency_key_across_attempts/0,
       fun recovery_replays_unknown_attempt_with_recorded_step_version/0,
       fun step_timeout_records_observable_failure/0
@@ -204,6 +206,99 @@ complete_effect_failure_uses_retry_decision() ->
                  beamtrail:complete_effect(RunId, EffectId, {error, transient})),
     {ok, Events2} = beamtrail:events(RunId),
     ?assertEqual(length(Events1), length(Events2)).
+
+external_step_waits_for_worker_completion() ->
+    RunId = <<"external-step-run">>,
+    Input = #{order_id => <<"external-1">>, test_pid => self()},
+    {ok, RunId} =
+        beamtrail:start_workflow(bt_external_step_workflow, Input,
+                                 #{run_id => RunId}),
+    ok = wait_for_status(RunId, waiting_effect, 1000),
+    ?assertEqual(timeout, receive_exec_short()),
+
+    {ok, Pending} = beamtrail:list_pending_effects(),
+    ?assertMatch(
+       [#{run_id := RunId,
+          effect_id := {external_step, external_charge, 1},
+          effect_type := external_step,
+          step_id := external_charge,
+          status := scheduled}],
+       Pending),
+
+    [Effect] = Pending,
+    EffectId = maps:get(effect_id, Effect),
+    {ok, State1} =
+        beamtrail:complete_effect(RunId, EffectId,
+                                  {ok, #{external_result => authorized}}),
+    ?assertEqual(#{}, maps:get(pending_effects, State1)),
+    {ok, Completed} = beamtrail:await_terminal(RunId, 1000),
+    ?assertMatch(#{status := completed,
+                   terminal := true,
+                   completed_steps := 1},
+                 Completed),
+    {ok, []} = beamtrail:list_pending_effects(),
+
+    {ok, Events} = beamtrail:events(RunId),
+    ?assertEqual(
+       ['workflow.instance.created',
+        'attempt.started',
+        'activity.scheduled',
+        'step.succeeded',
+        'activity.succeeded',
+        'workflow.completed'],
+       [maps:get(event_type, E) || E <- Events]),
+    ActivityScheduled = only_event('activity.scheduled', Events),
+    ?assertEqual(external_step,
+                 maps:get(effect_type, maps:get(payload, ActivityScheduled))),
+    ?assertEqual(0, count_events('activity.started', Events)).
+
+complete_effect_matches_legacy_external_attempt_by_effect_type() ->
+    RunId = <<"legacy-external-effect-run">>,
+    Input = #{order_id => <<"legacy-external">>, test_pid => self()},
+    EffectId = beamtrail_effect:external_step_id(external_charge, 1),
+    {ok, _Created} =
+        beamtrail_memory_storage:append_event(
+          RunId,
+          0,
+          undefined,
+          'workflow.instance.created',
+          undefined,
+          undefined,
+          undefined,
+          #{workflow => bt_external_step_workflow,
+            input => Input,
+            steps => [external_charge]}),
+    {ok, Lease} =
+        beamtrail_memory_storage:acquire_lease(
+          RunId, #{owner => legacy_external_test}, 30000),
+    Fence = maps:get(fencing_token, Lease),
+    {ok, [_Started, _Scheduled]} =
+        beamtrail_memory_storage:append_events(
+          RunId,
+          1,
+          Fence,
+          [#{event_type => 'attempt.started',
+             step_id => external_charge,
+             step_version => 1,
+             idempotency_key => {external_charge, <<"legacy-external">>},
+             payload => #{attempt => 1}},
+           #{event_type => 'activity.scheduled',
+             step_id => external_charge,
+             step_version => 1,
+             idempotency_key => {external_charge, <<"legacy-external">>},
+             payload => #{activity_type => step,
+                          activity_status => scheduled,
+                          effect_id => EffectId,
+                          effect_type => external_step,
+                          attempt => 1}}]),
+    ok = beamtrail_memory_storage:release_lease(RunId, Fence),
+
+    {ok, State1} =
+        beamtrail:complete_effect(RunId, EffectId,
+                                  {ok, #{external_result => legacy_done}}),
+    ?assertEqual(#{}, maps:get(pending_effects, State1)),
+    {ok, Completed} = beamtrail:await_terminal(RunId, 1000),
+    ?assertMatch(#{status := completed, terminal := true}, Completed).
 
 retry_uses_stable_idempotency_key_across_attempts() ->
     Input = #{order_id => <<"order-2">>, test_pid => self()},

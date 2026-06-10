@@ -336,6 +336,7 @@ candidate_status(Reduced, NowMs) ->
             case maps:get(status, Reduced) of
                 retrying -> maps:get(next_retry_at, Reduced, 0) =< NowMs;
                 waiting -> wake_due(Reduced, NowMs);
+                waiting_effect -> false;
                 _ -> true
             end
     end.

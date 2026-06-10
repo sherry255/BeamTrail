@@ -12,6 +12,7 @@ postgres_integration_test_() ->
              fun cleanup/1,
              [fun postgres_workflow_survives_application_restart/0,
               fun postgres_complete_effect_finishes_pending_call_step/0,
+              fun postgres_external_step_waits_for_worker_completion/0,
               fun postgres_recovery_replays_unfinished_attempt_after_restart/0,
               fun postgres_recovery_budget_exceeded_fails_open_attempt/0,
               fun postgres_signal_wakes_waiting_workflow/0,
@@ -100,6 +101,50 @@ postgres_complete_effect_finishes_pending_call_step() ->
                                            {ok, #{external => duplicate}})),
     {ok, Events2} = beamtrail:events(RunId),
     ?assertEqual(length(Events1), length(Events2)).
+
+postgres_external_step_waits_for_worker_completion() ->
+    RunId = unique_run_id("pg-external-step"),
+    Input = #{order_id => RunId, test_pid => self()},
+    {ok, RunId} =
+        beamtrail:start_workflow(bt_external_step_workflow, Input,
+                                 #{run_id => RunId}),
+    {ok, Waiting} = wait_for_state(RunId, waiting_effect, 1000),
+    ?assertMatch(#{pending_effects := Pending} when map_size(Pending) =:= 1,
+                 Waiting),
+    ?assertEqual(timeout, receive_exec_short()),
+
+    {ok, PendingEffects} = beamtrail:list_pending_effects(),
+    ?assertMatch(
+       [#{run_id := RunId,
+          effect_id := {external_step, external_charge, 1},
+          effect_type := external_step,
+          step_id := external_charge,
+          status := scheduled}],
+       PendingEffects),
+    {ok, #{run_ids := []}} =
+        beamtrail_postgres_storage:list_recoverable_run_ids(
+          undefined, 100, erlang:system_time(millisecond)),
+
+    [Effect] = PendingEffects,
+    EffectId = maps:get(effect_id, Effect),
+    {ok, State1} =
+        beamtrail:complete_effect(RunId, EffectId,
+                                  {ok, #{external_result => pg_authorized}}),
+    ?assertEqual(#{}, maps:get(pending_effects, State1)),
+    {ok, Completed} = beamtrail:await_terminal(RunId, 1000),
+    ?assertMatch(#{status := completed, terminal := true}, Completed),
+    {ok, []} = beamtrail:list_pending_effects(),
+    ?assertEqual(timeout, receive_exec_short()),
+
+    {ok, Events} = beamtrail:events(RunId),
+    ?assertEqual(
+       ['workflow.instance.created',
+        'attempt.started',
+        'activity.scheduled',
+        'step.succeeded',
+        'activity.succeeded',
+        'workflow.completed'],
+       [maps:get(event_type, E) || E <- Events]).
 
 postgres_recovery_replays_unfinished_attempt_after_restart() ->
     RunId = unique_run_id("pg-recover"),

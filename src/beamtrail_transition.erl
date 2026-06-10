@@ -378,31 +378,46 @@ run_step(RunId, State, StepId, StepInput, Lease, Options) ->
                 false ->
                     ok
             end,
-            case maps:get(runner_mode, Options, dispatch) of
-                prepare ->
-                    case execution_spec(RunId, Workflow, StepId, StepInput, Attempt) of
-                        {ok, Effect} ->
-                            {ok, {execute, Attempt, Effect, State1}};
-                        {error, {bad_workflow_callback, Callback, CallbackError}} ->
-                            append_attempt_callback_failure(
-                              RunId, State1, Attempt, Callback, CallbackError, Lease)
-                    end;
-                _ ->
-                    Result = execute_attempt(RunId, Workflow, StepInput, Attempt, Lease),
-                    case Result of
-                        {ok, Value} ->
-                            handle_step_success(RunId, Attempt, Value, Lease, Options1);
-                        {error, {bad_workflow_callback, Callback, CallbackError}} ->
-                            append_attempt_callback_failure(
-                              RunId, State1, Attempt, Callback, CallbackError, Lease);
-                        {error, Reason} ->
-                            handle_step_failure(RunId, Attempt, Reason, Lease, Options1)
-                    end
-            end;
+            dispatch_attempt_effect(RunId, Workflow, StepId, StepInput, Attempt,
+                                    State1, Lease, Options, Options1);
         {terminal, State1} ->
             {ok, State1};
         {error, _} = Error ->
             Error
+    end.
+
+dispatch_attempt_effect(RunId, Workflow, StepId, StepInput, Attempt, State,
+                        Lease, Options, Options1) ->
+    case maps:get(effect_type, Attempt, call_step) of
+        external_step ->
+            {ok, State};
+        call_step ->
+            dispatch_local_call_step(RunId, Workflow, StepId, StepInput, Attempt,
+                                     State, Lease, Options, Options1)
+    end.
+
+dispatch_local_call_step(RunId, Workflow, StepId, StepInput, Attempt, State,
+                         Lease, Options, Options1) ->
+    case maps:get(runner_mode, Options, dispatch) of
+        prepare ->
+            case execution_spec(RunId, Workflow, StepId, StepInput, Attempt) of
+                {ok, Effect} ->
+                    {ok, {execute, Attempt, Effect, State}};
+                {error, {bad_workflow_callback, Callback, CallbackError}} ->
+                    append_attempt_callback_failure(
+                      RunId, State, Attempt, Callback, CallbackError, Lease)
+            end;
+        _ ->
+            Result = execute_attempt(RunId, Workflow, StepInput, Attempt, Lease),
+            case Result of
+                {ok, Value} ->
+                    handle_step_success(RunId, Attempt, Value, Lease, Options1);
+                {error, {bad_workflow_callback, Callback, CallbackError}} ->
+                    append_attempt_callback_failure(
+                      RunId, State, Attempt, Callback, CallbackError, Lease);
+                {error, Reason} ->
+                    handle_step_failure(RunId, Attempt, Reason, Lease, Options1)
+            end
     end.
 
 ensure_attempt_started(RunId, Workflow, Input, State, StepId, Lease) ->
@@ -414,21 +429,13 @@ ensure_attempt_started(RunId, Workflow, Input, State, StepId, Lease) ->
             StepInput = Input,
             case step_metadata(RunId, Workflow, StepId, StepInput) of
                 {ok, StepVersion, IdempotencyKey} ->
-                    EffectId = beamtrail_effect:call_step_id(StepId, AttemptNo),
+                    EffectType = step_effect_type(Workflow, StepId),
+                    EffectId = beamtrail_effect:step_effect_id(EffectType, StepId,
+                                                               AttemptNo),
                     EventSpecs =
-                        [event_spec('attempt.started', StepId, StepVersion,
-                                    IdempotencyKey,
-                                    #{attempt => AttemptNo,
-                                      effect_id => EffectId,
-                                      effect_type => call_step,
-                                      owner_node => owner(),
-                                      step_input => StepInput}),
-                         activity_event_spec('activity.scheduled', StepId,
-                                             StepVersion, IdempotencyKey,
-                                             AttemptNo, EffectId),
-                         activity_event_spec('activity.started', StepId,
-                                             StepVersion, IdempotencyKey,
-                                             AttemptNo, EffectId)],
+                        attempt_start_event_specs(StepId, StepVersion,
+                                                  IdempotencyKey, AttemptNo,
+                                                  EffectId, EffectType, StepInput),
                     case append_events(
                            RunId, maps:get(last_event_seq, State, 0), Lease,
                            EventSpecs) of
@@ -445,6 +452,28 @@ ensure_attempt_started(RunId, Workflow, Input, State, StepId, Lease) ->
                     append_pre_attempt_callback_failure(
                       RunId, State, StepId, Callback, CallbackError, Lease)
             end
+    end.
+
+attempt_start_event_specs(StepId, StepVersion, IdempotencyKey, AttemptNo,
+                          EffectId, EffectType, StepInput) ->
+    AttemptStarted =
+        event_spec('attempt.started', StepId, StepVersion, IdempotencyKey,
+                   #{attempt => AttemptNo,
+                     effect_id => EffectId,
+                     effect_type => EffectType,
+                     owner_node => owner(),
+                     step_input => StepInput}),
+    Scheduled =
+        activity_event_spec('activity.scheduled', StepId, StepVersion,
+                            IdempotencyKey, AttemptNo, EffectId, EffectType),
+    case EffectType of
+        external_step ->
+            [AttemptStarted, Scheduled];
+        call_step ->
+            Started =
+                activity_event_spec('activity.started', StepId, StepVersion,
+                                    IdempotencyKey, AttemptNo, EffectId, EffectType),
+            [AttemptStarted, Scheduled, Started]
     end.
 
 execution_spec(RunId, Workflow, StepId, Input, Attempt) ->
@@ -650,6 +679,21 @@ step_metadata(RunId, Workflow, StepId, Input) ->
             {error, {step_version, CallbackError}}
     end.
 
+step_effect_type(Workflow, StepId) ->
+    _ = code:ensure_loaded(Workflow),
+    case erlang:function_exported(Workflow, effect_mode, 1) of
+        true ->
+            case safe_workflow_callback(effect_mode,
+                                        fun() -> Workflow:effect_mode(StepId) end) of
+                {ok, external} -> external_step;
+                {ok, local} -> call_step;
+                {ok, _Other} -> call_step;
+                {error, _CallbackError} -> call_step
+            end;
+        false ->
+            call_step
+    end.
+
 append_pre_attempt_callback_failure(RunId, State, StepId, Callback,
                                     CallbackError, Lease) ->
     Payload = callback_failure_payload(Callback, CallbackError),
@@ -792,12 +836,13 @@ activity_event_spec(EventType, StepId, Attempt) ->
                         maps:get(step_version, Attempt),
                         maps:get(idempotency_key, Attempt),
                         maps:get(attempt, Attempt),
-                        effect_id_from_attempt(StepId, Attempt)).
+                        effect_id_from_attempt(StepId, Attempt),
+                        effect_type_from_attempt(Attempt)).
 
 activity_event_spec(EventType, StepId, StepVersion, IdempotencyKey, AttemptNo,
-                    EffectId) ->
+                    EffectId, EffectType) ->
     event_spec(EventType, StepId, StepVersion, IdempotencyKey,
-               activity_payload(EventType, AttemptNo, EffectId)).
+               activity_payload(EventType, AttemptNo, EffectId, EffectType)).
 
 activity_failed_event_spec(StepId, Attempt, FailurePayload) ->
     event_spec('activity.failed',
@@ -807,29 +852,35 @@ activity_failed_event_spec(StepId, Attempt, FailurePayload) ->
                activity_payload('activity.failed',
                                 maps:get(attempt, Attempt),
                                 effect_id_from_attempt(StepId, Attempt),
+                                effect_type_from_attempt(Attempt),
                                 FailurePayload)).
 
-activity_payload(EventType, AttemptNo, EffectId) ->
-    activity_payload(EventType, AttemptNo, EffectId, #{}).
+activity_payload(EventType, AttemptNo, EffectId, EffectType) ->
+    activity_payload(EventType, AttemptNo, EffectId, EffectType, #{}).
 
-activity_payload(EventType, AttemptNo, EffectId, Extra) ->
+activity_payload(EventType, AttemptNo, EffectId, EffectType, Extra) ->
     Extra#{activity_type => step,
            effect_id => EffectId,
-           effect_type => call_step,
+           effect_type => EffectType,
            activity_status => beamtrail_activity:status(EventType),
            attempt => AttemptNo}.
 
 effect_id_from_attempt(StepId, Attempt) ->
     case maps:get(effect_id, Attempt, undefined) of
         undefined ->
-            beamtrail_effect:call_step_id(StepId, maps:get(attempt, Attempt));
+            beamtrail_effect:step_effect_id(effect_type_from_attempt(Attempt),
+                                            StepId,
+                                            maps:get(attempt, Attempt));
         EffectId ->
             EffectId
     end.
 
 effect_payload_fields(StepId, Attempt) ->
     #{effect_id => effect_id_from_attempt(StepId, Attempt),
-      effect_type => call_step}.
+      effect_type => effect_type_from_attempt(Attempt)}.
+
+effect_type_from_attempt(Attempt) ->
+    maps:get(effect_type, Attempt, call_step).
 
 event_spec(EventType, StepId, StepVersion, IdempotencyKey, Payload) ->
     #{event_type => EventType,

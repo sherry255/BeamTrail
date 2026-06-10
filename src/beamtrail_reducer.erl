@@ -94,6 +94,7 @@ apply_event_type('attempt.started', State, Event) ->
           step_version => maps:get(step_version, Event),
           idempotency_key => maps:get(idempotency_key, Event),
           effect_id => maps:get(effect_id, Payload, undefined),
+          effect_type => maps:get(effect_type, Payload, call_step),
           step_input => StepInput,
           attempt => PayloadAttempt,
           status => unknown,
@@ -271,7 +272,8 @@ update_pending_effect_status(State, Event, Status) ->
                          pending_effect_from_activity(Event, Payload, EffectId)),
             Effect1 = Effect0#{status => Status},
             Effect2 = add_effect_lifecycle_seq(Status, Event, Effect1),
-            State#{pending_effects => maps:put(EffectId, Effect2, Pending0)}
+            State1 = State#{pending_effects => maps:put(EffectId, Effect2, Pending0)},
+            maybe_wait_for_external_effect(State1, Effect2, Status)
     end.
 
 pending_effect_from_activity(Event, Payload, EffectId) ->
@@ -282,6 +284,12 @@ pending_effect_from_activity(Event, Payload, EffectId) ->
       idempotency_key => maps:get(idempotency_key, Event),
       attempt => maps:get(attempt, Payload, undefined),
       status => requested}.
+
+maybe_wait_for_external_effect(State, #{effect_type := external_step}, scheduled) ->
+    State#{status => waiting_effect,
+           next_retry_at => undefined};
+maybe_wait_for_external_effect(State, _Effect, _Status) ->
+    State.
 
 add_effect_lifecycle_seq(scheduled, Event, Effect) ->
     Effect#{scheduled_event_seq => maps:get(event_seq, Event),

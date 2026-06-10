@@ -2,6 +2,8 @@
 
 -export([call_step/6,
          call_step_id/2,
+         external_step_id/2,
+         step_effect_id/3,
          id/1,
          type/1,
          workflow/1,
@@ -25,6 +27,14 @@ call_step(Workflow, StepId, StepVersion, Input, TimeoutMs, Context) ->
 
 call_step_id(StepId, AttemptNo) ->
     {call_step, StepId, AttemptNo}.
+
+external_step_id(StepId, AttemptNo) ->
+    {external_step, StepId, AttemptNo}.
+
+step_effect_id(call_step, StepId, AttemptNo) ->
+    call_step_id(StepId, AttemptNo);
+step_effect_id(external_step, StepId, AttemptNo) ->
+    external_step_id(StepId, AttemptNo).
 
 id(#{effect_id := EffectId}) ->
     EffectId.

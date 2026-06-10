@@ -51,12 +51,14 @@ Available now:
 - Retry backoff, step/workflow timeouts, and crash recovery
 - Version mismatch gating during replay
 - Durable signals and scanner-driven durable timers
+- External step effects that can be listed and completed by workers
 - Executable human approval deadline pattern
 
 Not in scope yet:
 
 - DAGs, fan-out/fan-in, or parallel command batches
 - Timer cancellation, recurring timers, or child workflows
+- External effect visibility timeouts, deadlines, or claim leases
 - First-class human task assignment, forms, escalation, or RBAC
 - HTTP API or browser UI
 - SQL-native JSON inspection
@@ -269,6 +271,19 @@ storage adapters on the same contract and avoids hidden replay incompatibilities
 
 `execute/4` should treat `Ctx.idempotency_key` as the key for any external
 side effect.
+
+Workflow modules may implement optional `effect_mode/1`. Return `external` for
+a step that should be scheduled for an outside worker instead of executed by the
+active runner. External steps are exposed through `beamtrail:list_pending_effects/0`
+and completed with `beamtrail:complete_effect/3`.
+
+External effects currently have no visibility timeout, deadline, or automatic
+failure path. If no worker completes a pending external effect, the run remains
+in `waiting_effect` and recovery will not re-dispatch it. Workers must monitor
+pending effects and retry `complete_effect/3` on transient errors such as
+`{error, leased}`. The state returned from `complete_effect/3` is the immediate
+post-completion transition state; use `await_terminal/2` or `describe/1` to
+observe final workflow completion.
 
 Workflow modules may also implement a deterministic `decide/1` callback to
 choose one durable command at a time. If `decide/1` is present, optional

@@ -5,7 +5,7 @@
          recover_unfinished/0]).
 -export([get_state/1, await_terminal/2, events/1, storage/0]).
 -export([cancel_run/2, park_run/2, resume_run/1, requeue_run/2]).
--export([signal_run/3, complete_effect/3]).
+-export([signal_run/3, complete_effect/3, list_pending_effects/0]).
 -export([list_recoverable/0, list_recoverable/2,
          mark_recovery_requeued/1, mark_recovery_requeued_with_lease/1]).
 
@@ -427,21 +427,26 @@ pending_effect_attempt(State, EffectId) ->
     case maps:get(EffectId, PendingEffects, undefined) of
         undefined ->
             ignored;
-        #{effect_type := call_step} ->
-            pending_call_step_attempt(State, EffectId);
+        #{effect_type := EffectType}
+          when EffectType =:= call_step; EffectType =:= external_step ->
+            pending_step_attempt(State, EffectId, EffectType);
         #{effect_type := EffectType} ->
             {error, {unsupported_effect_type, EffectType}};
         _ ->
             {error, {bad_pending_effect, EffectId}}
     end.
 
-pending_call_step_attempt(State, EffectId) ->
+pending_step_attempt(State, EffectId, EffectType) ->
     case maps:get(pending_attempt, State, undefined) of
         #{effect_id := EffectId} = Attempt ->
             {ok, Attempt};
         #{step_id := StepId, attempt := AttemptNo} = Attempt ->
-            case beamtrail_effect:call_step_id(StepId, AttemptNo) =:= EffectId of
-                true -> {ok, Attempt#{effect_id => EffectId}};
+            ExpectedId = beamtrail_effect:step_effect_id(EffectType, StepId,
+                                                         AttemptNo),
+            case ExpectedId =:= EffectId of
+                true ->
+                    {ok, Attempt#{effect_id => EffectId,
+                                   effect_type => EffectType}};
                 false -> ignored
             end;
         _ ->
@@ -455,6 +460,36 @@ dispatch_after_external_effect(_RunId, #{parked := true}) ->
 dispatch_after_external_effect(RunId, _State) ->
     _ = dispatch_supervised(RunId),
     ok.
+
+-spec list_pending_effects() -> {ok, [map()]} | {error, term()}.
+list_pending_effects() ->
+    ok = ensure_storage(),
+    case (storage()):list_run_ids() of
+        {ok, RunIds} ->
+            list_pending_effects_for_runs(lists:sort(RunIds), []);
+        {error, _} = Error ->
+            Error
+    end.
+
+list_pending_effects_for_runs([], Acc) ->
+    {ok, lists:reverse(Acc)};
+list_pending_effects_for_runs([RunId | Rest], Acc) ->
+    case load_state(RunId) of
+        {ok, State} ->
+            list_pending_effects_for_runs(
+              Rest, lists:reverse(pending_effects_for_state(State), Acc));
+        {error, _} = Error ->
+            Error
+    end.
+
+pending_effects_for_state(#{terminal := true}) ->
+    [];
+pending_effects_for_state(#{parked := true}) ->
+    [];
+pending_effects_for_state(State) ->
+    RunId = maps:get(run_id, State),
+    Effects = maps:values(maps:get(pending_effects, State, #{})),
+    [Effect#{run_id => RunId} || Effect <- lists:sort(Effects)].
 
 cancel_run_with_new_lease(RunId, Reason) ->
     append_control_with_new_lease(
@@ -864,6 +899,8 @@ recoverable_by_status(State) ->
             maps:get(next_retry_at, State, 0) =< erlang:system_time(millisecond);
         waiting ->
             wake_due(State);
+        waiting_effect ->
+            false;
         _ ->
             true
     end.

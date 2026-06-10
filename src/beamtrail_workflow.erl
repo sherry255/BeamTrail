@@ -51,6 +51,7 @@
 -callback execute(StepId :: step_id(), StepVersion :: step_version(), Input :: term(),
                   Context :: execution_context()) ->
     {ok, term()} | {error, term()}.
+-callback effect_mode(StepId :: step_id()) -> local | external.
 
 %% Optional deterministic orchestration callback. BeamTrail calls decide/1 only
 %% when no attempt is open, validates the returned command, and persists the
@@ -64,5 +65,6 @@
 %% infinity (no workflow-level timeout). When the runtime dispatches and
 %% finds the budget exceeded, it emits workflow.failed with reason
 %% workflow_timeout instead of running the next step.
--optional_callbacks([decide/1, decider_version/0, workflow_timeout_ms/0]).
+-optional_callbacks([decide/1, decider_version/0, effect_mode/1,
+                     workflow_timeout_ms/0]).
 -callback workflow_timeout_ms() -> timeout().
