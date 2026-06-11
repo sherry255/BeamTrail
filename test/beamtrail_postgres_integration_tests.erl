@@ -13,6 +13,7 @@ postgres_integration_test_() ->
              [fun postgres_workflow_survives_application_restart/0,
               fun postgres_complete_effect_finishes_pending_call_step/0,
               fun postgres_external_step_waits_for_worker_completion/0,
+              fun postgres_claim_effect_requires_token_completion/0,
               fun postgres_recovery_replays_unfinished_attempt_after_restart/0,
               fun postgres_recovery_budget_exceeded_fails_open_attempt/0,
               fun postgres_signal_wakes_waiting_workflow/0,
@@ -147,6 +148,37 @@ postgres_external_step_waits_for_worker_completion() ->
         'activity.succeeded',
         'workflow.completed'],
        [maps:get(event_type, E) || E <- Events]).
+
+postgres_claim_effect_requires_token_completion() ->
+    RunId = unique_run_id("pg-claim-effect"),
+    Input = #{order_id => RunId, test_pid => self()},
+    {ok, RunId} =
+        beamtrail:start_workflow(bt_external_step_workflow, Input,
+                                 #{run_id => RunId}),
+    {ok, _Waiting} = wait_for_state(RunId, waiting_effect, 1000),
+    {ok, [Effect]} = beamtrail:list_pending_effects(),
+    EffectId = maps:get(effect_id, Effect),
+
+    {ok, Claim} = beamtrail:claim_effect(RunId, EffectId, pg_worker),
+    ClaimToken = maps:get(claim_token, Claim),
+    ?assertEqual(pg_worker, maps:get(claim_owner, Claim)),
+    {ok, []} = beamtrail:list_pending_effects(),
+    {ok, Events0} = beamtrail:events(RunId),
+    ?assert(lists:member('effect.claimed',
+                         [maps:get(event_type, E) || E <- Events0])),
+
+    ?assertEqual({error, claimed},
+                 beamtrail:complete_effect(RunId, EffectId,
+                                           {ok, #{external_result => stale}})),
+    ?assertEqual({error, stale_claim},
+                 beamtrail:complete_effect(RunId, EffectId, wrong_token,
+                                           {ok, #{external_result => stale}})),
+    {ok, State1} =
+        beamtrail:complete_effect(RunId, EffectId, ClaimToken,
+                                  {ok, #{external_result => pg_claimed}}),
+    ?assertEqual(#{}, maps:get(pending_effects, State1)),
+    {ok, Completed} = beamtrail:await_terminal(RunId, 1000),
+    ?assertMatch(#{status := completed, terminal := true}, Completed).
 
 postgres_recovery_replays_unfinished_attempt_after_restart() ->
     RunId = unique_run_id("pg-recover"),

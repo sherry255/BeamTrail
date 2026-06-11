@@ -15,6 +15,8 @@ durable_runtime_test_() ->
       fun complete_effect_failure_uses_retry_decision/0,
       fun external_step_waits_for_worker_completion/0,
       fun list_pending_effects_filters_future_visible_at/0,
+      fun claim_effect_hides_pending_effect_until_claim_expires/0,
+      fun complete_effect_requires_active_claim_token/0,
       fun complete_effect_matches_legacy_external_attempt_by_effect_type/0,
       fun retry_uses_stable_idempotency_key_across_attempts/0,
       fun recovery_replays_unknown_attempt_with_recorded_step_version/0,
@@ -34,7 +36,8 @@ setup() ->
 
 cleanup(_) ->
     stop_runner_infra(),
-    ok = beamtrail_memory_storage:reset().
+    ok = beamtrail_memory_storage:reset(),
+    ok = application:unset_env(beamtrail, external_effect_visibility_timeout_ms).
 
 successful_workflow_writes_append_only_events_and_snapshot() ->
     Input = #{order_id => <<"order-1">>, test_pid => self()},
@@ -270,6 +273,61 @@ list_pending_effects_filters_future_visible_at() ->
     [Visible] =
         [Effect || Effect <- Pending, maps:get(run_id, Effect) =:= VisibleRunId],
     ?assertEqual(Now - 1, maps:get(visible_at_ms, Visible)).
+
+claim_effect_hides_pending_effect_until_claim_expires() ->
+    ok = application:set_env(beamtrail, external_effect_visibility_timeout_ms, 20),
+    RunId = <<"claim-visible-effect-run">>,
+    Input = #{order_id => <<"claim-visible">>, test_pid => self()},
+    {ok, RunId} =
+        beamtrail:start_workflow(bt_external_step_workflow, Input,
+                                 #{run_id => RunId}),
+    ok = wait_for_status(RunId, waiting_effect, 1000),
+    {ok, [Effect]} = beamtrail:list_pending_effects(),
+    EffectId = maps:get(effect_id, Effect),
+
+    {ok, Claim} = beamtrail:claim_effect(RunId, EffectId, worker_a),
+    ?assertEqual(EffectId, maps:get(effect_id, Claim)),
+    ?assertEqual(worker_a, maps:get(claim_owner, Claim)),
+    ?assert(maps:is_key(claim_token, Claim)),
+    ?assert(is_integer(maps:get(claim_until_ms, Claim))),
+    {ok, []} = beamtrail:list_pending_effects(),
+
+    timer:sleep(30),
+    {ok, [VisibleAgain]} = beamtrail:list_pending_effects(),
+    ?assertEqual(RunId, maps:get(run_id, VisibleAgain)),
+    ?assertEqual(EffectId, maps:get(effect_id, VisibleAgain)),
+    ?assertEqual(worker_a, maps:get(claim_owner, VisibleAgain)),
+    ?assertEqual(maps:get(claim_token, Claim),
+                 maps:get(claim_token, VisibleAgain)).
+
+complete_effect_requires_active_claim_token() ->
+    ok = application:set_env(beamtrail, external_effect_visibility_timeout_ms, 5000),
+    RunId = <<"claim-complete-effect-run">>,
+    Input = #{order_id => <<"claim-complete">>, test_pid => self()},
+    {ok, RunId} =
+        beamtrail:start_workflow(bt_external_step_workflow, Input,
+                                 #{run_id => RunId}),
+    ok = wait_for_status(RunId, waiting_effect, 1000),
+    {ok, [Effect]} = beamtrail:list_pending_effects(),
+    EffectId = maps:get(effect_id, Effect),
+    {ok, Claim} = beamtrail:claim_effect(RunId, EffectId, worker_a),
+    ClaimToken = maps:get(claim_token, Claim),
+
+    ?assertEqual({error, claimed},
+                 beamtrail:complete_effect(RunId, EffectId,
+                                           {ok, #{external_result => stale}})),
+    ?assertEqual({error, stale_claim},
+                 beamtrail:complete_effect(RunId, EffectId, wrong_token,
+                                           {ok, #{external_result => stale}})),
+    {ok, State1} =
+        beamtrail:complete_effect(RunId, EffectId, ClaimToken,
+                                  {ok, #{external_result => claimed_done}}),
+    ?assertEqual(#{}, maps:get(pending_effects, State1)),
+    {ok, Completed} = beamtrail:await_terminal(RunId, 1000),
+    ?assertMatch(#{status := completed, terminal := true}, Completed),
+    ?assertEqual({ok, ignored},
+                 beamtrail:complete_effect(RunId, EffectId, ClaimToken,
+                                           {ok, #{external_result => duplicate}})).
 
 complete_effect_matches_legacy_external_attempt_by_effect_type() ->
     RunId = <<"legacy-external-effect-run">>,

@@ -5,7 +5,8 @@
          recover_unfinished/0]).
 -export([get_state/1, await_terminal/2, events/1, storage/0]).
 -export([cancel_run/2, park_run/2, resume_run/1, requeue_run/2]).
--export([signal_run/3, complete_effect/3, list_pending_effects/0]).
+-export([signal_run/3, claim_effect/3, complete_effect/3, complete_effect/4,
+         list_pending_effects/0]).
 -export([list_recoverable/0, list_recoverable/2,
          mark_recovery_requeued/1, mark_recovery_requeued_with_lease/1]).
 
@@ -25,6 +26,7 @@
     {ok, run_id()} | {error, {create_failed | dispatch_failed, run_id(), term()}}.
 -type state_result() :: {ok, state()} | {error, term()}.
 -type effect_completion_result() :: {ok, state()} | {ok, ignored} | {error, term()}.
+-type effect_claim_result() :: {ok, map()} | {ok, ignored} | {error, term()}.
 -type recovery_mark_result() :: {ok, requeued | failed | skipped} | {error, term()}.
 -type recovery_with_lease_result() ::
     {ok, {requeued, lease()} | {failed, state()} | skipped} | {error, term()}.
@@ -340,7 +342,18 @@ complete_effect(RunId, EffectId, Result) ->
     ok = ensure_storage(),
     case normalize_effect_result(Result) of
         {ok, Completion} ->
-            complete_effect_loaded(RunId, EffectId, Completion);
+            complete_effect_loaded(RunId, EffectId, undefined, Completion);
+        {error, _} = Error ->
+            Error
+    end.
+
+-spec complete_effect(run_id(), term(), term(), {ok, term()} | {error, term()}) ->
+    effect_completion_result().
+complete_effect(RunId, EffectId, ClaimToken, Result) ->
+    ok = ensure_storage(),
+    case normalize_effect_result(Result) of
+        {ok, Completion} ->
+            complete_effect_loaded(RunId, EffectId, ClaimToken, Completion);
         {error, _} = Error ->
             Error
     end.
@@ -352,12 +365,13 @@ normalize_effect_result({error, _} = Result) ->
 normalize_effect_result(Other) ->
     {error, {bad_effect_result, Other}}.
 
-complete_effect_loaded(RunId, EffectId, Result) ->
+complete_effect_loaded(RunId, EffectId, ClaimToken, Result) ->
     case load_state(RunId) of
         {ok, State} ->
-            case complete_effect_candidate(State, EffectId) of
+            case complete_effect_candidate(State, EffectId, ClaimToken) of
                 complete ->
-                    complete_effect_with_new_lease(RunId, EffectId, Result);
+                    complete_effect_with_new_lease(RunId, EffectId, ClaimToken,
+                                                   Result);
                 ignored ->
                     {ok, ignored};
                 {error, _} = Error ->
@@ -367,33 +381,161 @@ complete_effect_loaded(RunId, EffectId, Result) ->
             Error
     end.
 
-complete_effect_candidate(#{terminal := true}, _EffectId) ->
+complete_effect_candidate(#{terminal := true}, _EffectId, _ClaimToken) ->
     ignored;
-complete_effect_candidate(#{parked := true}, _EffectId) ->
+complete_effect_candidate(#{parked := true}, _EffectId, _ClaimToken) ->
     {error, parked};
-complete_effect_candidate(State, EffectId) ->
-    case pending_effect_attempt(State, EffectId) of
-        {ok, _Attempt} -> complete;
+complete_effect_candidate(State, EffectId, ClaimToken) ->
+    case pending_effect_completion_allowed(State, EffectId, ClaimToken) of
+        ok -> complete;
         ignored -> ignored;
         {error, _} = Error -> Error
     end.
 
-complete_effect_with_new_lease(RunId, EffectId, Result) ->
-    case (storage()):acquire_lease(
-           RunId, beamtrail_transition:owner(),
-           beamtrail_lease_manager:default_ttl_ms()) of
-        {ok, Lease} ->
-            complete_effect_with_lease(RunId, Lease, EffectId, Result);
+-spec claim_effect(run_id(), term(), term()) -> effect_claim_result().
+claim_effect(RunId, EffectId, Owner) ->
+    ok = ensure_storage(),
+    case load_state(RunId) of
+        {ok, State} ->
+            case claim_effect_candidate(State, EffectId) of
+                claim ->
+                    claim_effect_with_new_lease(RunId, EffectId, Owner);
+                ignored ->
+                    {ok, ignored};
+                {error, _} = Error ->
+                    Error
+            end;
         {error, _} = Error ->
             Error
     end.
 
-complete_effect_with_lease(RunId, Lease, EffectId, Result) ->
+claim_effect_candidate(#{terminal := true}, _EffectId) ->
+    ignored;
+claim_effect_candidate(#{parked := true}, _EffectId) ->
+    {error, parked};
+claim_effect_candidate(State, EffectId) ->
+    Now = erlang:system_time(millisecond),
+    case pending_effect(State, EffectId) of
+        {ok, Effect} ->
+            case pending_effect_visible(Effect, Now) of
+                false ->
+                    {error, not_visible};
+                true ->
+                    case pending_effect_claim_available(Effect, Now) of
+                        true -> claim;
+                        false -> {error, claimed}
+                    end
+            end;
+        ignored ->
+            ignored;
+        {error, _} = Error ->
+            Error
+    end.
+
+claim_effect_with_new_lease(RunId, EffectId, Owner) ->
+    case (storage()):acquire_lease(
+           RunId, beamtrail_transition:owner(),
+           beamtrail_lease_manager:default_ttl_ms()) of
+        {ok, Lease} ->
+            claim_effect_with_lease(RunId, Lease, EffectId, Owner);
+        {error, _} = Error ->
+            Error
+    end.
+
+claim_effect_with_lease(RunId, Lease, EffectId, Owner) ->
+    FencingToken = beamtrail_lease_manager:fencing_token(Lease),
+    Claim =
+        case load_state(RunId) of
+            {ok, State} ->
+                claim_effect_locked(RunId, State, Lease, EffectId, Owner);
+            {error, _} = Error ->
+                Error
+        end,
+    _ = beamtrail_lease_manager:release(RunId, FencingToken),
+    Claim.
+
+claim_effect_locked(_RunId, #{terminal := true}, _Lease, _EffectId, _Owner) ->
+    {ok, ignored};
+claim_effect_locked(_RunId, #{parked := true}, _Lease, _EffectId, _Owner) ->
+    {error, parked};
+claim_effect_locked(RunId, State, Lease, EffectId, Owner) ->
+    Now = erlang:system_time(millisecond),
+    case pending_effect(State, EffectId) of
+        {ok, Effect} ->
+            case pending_effect_visible(Effect, Now) of
+                false ->
+                    {error, not_visible};
+                true ->
+                    case pending_effect_claim_available(Effect, Now) of
+                        true ->
+                            append_effect_claimed(RunId, State, Lease, Effect,
+                                                  Owner, Now);
+                        false ->
+                            {error, claimed}
+                    end
+            end;
+        ignored ->
+            {ok, ignored};
+        {error, _} = Error ->
+            Error
+    end.
+
+append_effect_claimed(RunId, State, Lease, Effect, Owner, Now) ->
+    ClaimToken = new_claim_token(),
+    TimeoutMs =
+        maps:get(visibility_timeout_ms, Effect,
+                 beamtrail_config:external_effect_visibility_timeout_ms()),
+    ClaimUntilMs = claim_until_ms(Now, TimeoutMs),
+    Payload =
+        #{effect_id => maps:get(effect_id, Effect),
+          effect_type => maps:get(effect_type, Effect),
+          claim_owner => Owner,
+          claim_token => ClaimToken,
+          claim_until_ms => ClaimUntilMs,
+          claimed_at_ms => Now},
+    case (storage()):append_event(
+           RunId,
+           maps:get(last_event_seq, State, 0),
+           beamtrail_lease_manager:fencing_token(Lease),
+           'effect.claimed',
+           maps:get(step_id, Effect, undefined),
+           maps:get(step_version, Effect, undefined),
+           maps:get(idempotency_key, Effect, undefined),
+           Payload) of
+        {ok, Event} ->
+            State1 = beamtrail_state:apply_event(State, Event),
+            _ = beamtrail_state:maybe_snapshot(RunId, State1, false, storage()),
+            {ok, Payload};
+        {error, _} = Error ->
+            Error
+    end.
+
+claim_until_ms(_Now, infinity) ->
+    infinity;
+claim_until_ms(Now, TimeoutMs) when is_integer(TimeoutMs), TimeoutMs >= 0 ->
+    Now + TimeoutMs.
+
+new_claim_token() ->
+    {claim, node(), erlang:unique_integer([monotonic, positive])}.
+
+complete_effect_with_new_lease(RunId, EffectId, ClaimToken, Result) ->
+    case (storage()):acquire_lease(
+           RunId, beamtrail_transition:owner(),
+           beamtrail_lease_manager:default_ttl_ms()) of
+        {ok, Lease} ->
+            complete_effect_with_lease(RunId, Lease, EffectId, ClaimToken,
+                                       Result);
+        {error, _} = Error ->
+            Error
+    end.
+
+complete_effect_with_lease(RunId, Lease, EffectId, ClaimToken, Result) ->
     FencingToken = beamtrail_lease_manager:fencing_token(Lease),
     Completion =
         case load_state(RunId) of
             {ok, State} ->
-                complete_effect_locked(RunId, State, Lease, EffectId, Result);
+                complete_effect_locked(RunId, State, Lease, EffectId,
+                                       ClaimToken, Result);
             {error, _} = Error ->
                 Error
         end,
@@ -408,14 +550,24 @@ complete_effect_with_lease(RunId, Lease, EffectId, Result) ->
             Other
     end.
 
-complete_effect_locked(_RunId, #{terminal := true}, _Lease, _EffectId, _Result) ->
+complete_effect_locked(_RunId, #{terminal := true}, _Lease, _EffectId,
+                       _ClaimToken, _Result) ->
     {ok, ignored};
-complete_effect_locked(_RunId, #{parked := true}, _Lease, _EffectId, _Result) ->
+complete_effect_locked(_RunId, #{parked := true}, _Lease, _EffectId,
+                       _ClaimToken, _Result) ->
     {error, parked};
-complete_effect_locked(RunId, State, Lease, EffectId, Result) ->
-    case pending_effect_attempt(State, EffectId) of
-        {ok, Attempt} ->
-            beamtrail_transition:complete_effect(RunId, Lease, Attempt, Result, State);
+complete_effect_locked(RunId, State, Lease, EffectId, ClaimToken, Result) ->
+    case pending_effect_completion_allowed(State, EffectId, ClaimToken) of
+        ok ->
+            case pending_effect_attempt(State, EffectId) of
+                {ok, Attempt} ->
+                    beamtrail_transition:complete_effect(RunId, Lease, Attempt,
+                                                        Result, State);
+                ignored ->
+                    {ok, ignored};
+                {error, _} = Error ->
+                    Error
+            end;
         ignored ->
             {ok, ignored};
         {error, _} = Error ->
@@ -423,18 +575,76 @@ complete_effect_locked(RunId, State, Lease, EffectId, Result) ->
     end.
 
 pending_effect_attempt(State, EffectId) ->
+    case pending_effect(State, EffectId) of
+        {ok, #{effect_type := EffectType}} ->
+            pending_step_attempt(State, EffectId, EffectType);
+        ignored ->
+            ignored;
+        {error, _} = Error ->
+            Error
+    end.
+
+pending_effect_completion_allowed(State, EffectId, ClaimToken) ->
+    Now = erlang:system_time(millisecond),
+    case pending_effect(State, EffectId) of
+        {ok, Effect} ->
+            pending_effect_claim_matches(Effect, ClaimToken, Now);
+        ignored ->
+            ignored;
+        {error, _} = Error ->
+            Error
+    end.
+
+pending_effect_claim_matches(Effect, undefined, Now) ->
+    case pending_effect_has_claim(Effect) of
+        false ->
+            ok;
+        true ->
+            case pending_effect_claim_available(Effect, Now) of
+                true -> {error, claim_required};
+                false -> {error, claimed}
+            end
+    end;
+pending_effect_claim_matches(Effect, ClaimToken, Now) ->
+    case maps:get(claim_token, Effect, undefined) of
+        undefined ->
+            {error, unclaimed};
+        ClaimToken ->
+            case pending_effect_claim_active(Effect, Now) of
+                true -> ok;
+                false -> {error, claim_expired}
+            end;
+        _Other ->
+            {error, stale_claim}
+    end.
+
+pending_effect(State, EffectId) ->
     PendingEffects = maps:get(pending_effects, State, #{}),
     case maps:get(EffectId, PendingEffects, undefined) of
         undefined ->
             ignored;
-        #{effect_type := EffectType}
+        #{effect_type := EffectType} = Effect
           when EffectType =:= call_step; EffectType =:= external_step ->
-            pending_step_attempt(State, EffectId, EffectType);
+            {ok, Effect};
         #{effect_type := EffectType} ->
             {error, {unsupported_effect_type, EffectType}};
         _ ->
             {error, {bad_pending_effect, EffectId}}
     end.
+
+pending_effect_has_claim(Effect) ->
+    maps:is_key(claim_token, Effect).
+
+pending_effect_claim_available(Effect, Now) ->
+    not pending_effect_claim_active(Effect, Now).
+
+pending_effect_claim_active(#{claim_until_ms := infinity}, _Now) ->
+    true;
+pending_effect_claim_active(#{claim_until_ms := ClaimUntilMs}, Now)
+  when is_integer(ClaimUntilMs) ->
+    ClaimUntilMs > Now;
+pending_effect_claim_active(_Effect, _Now) ->
+    false.
 
 pending_step_attempt(State, EffectId, EffectType) ->
     case maps:get(pending_attempt, State, undefined) of
@@ -492,7 +702,8 @@ pending_effects_for_state(State) ->
     Now = erlang:system_time(millisecond),
     [Effect#{run_id => RunId}
      || Effect <- lists:sort(Effects),
-        pending_effect_visible(Effect, Now)].
+        pending_effect_visible(Effect, Now),
+        pending_effect_claim_available(Effect, Now)].
 
 pending_effect_visible(#{visible_at_ms := VisibleAtMs}, Now)
   when is_integer(VisibleAtMs) ->

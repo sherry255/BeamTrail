@@ -174,6 +174,8 @@ apply_event_type('activity.succeeded', State, Event) ->
     State#{pending_effects => clear_event_effect(Event, State)};
 apply_event_type('activity.failed', State, Event) ->
     State#{pending_effects => clear_event_effect(Event, State)};
+apply_event_type('effect.claimed', State, Event) ->
+    update_pending_effect_claim(State, Event);
 apply_event_type('retry.scheduled', State, Event) ->
     Payload = maps:get(payload, Event),
     State#{status => retrying,
@@ -289,6 +291,30 @@ maybe_put_payload_field(Key, Payload, Effect) ->
     case maps:get(Key, Payload, undefined) of
         undefined -> Effect;
         Value -> Effect#{Key => Value}
+    end.
+
+update_pending_effect_claim(State, Event) ->
+    Payload = maps:get(payload, Event, #{}),
+    case maps:get(effect_id, Payload, undefined) of
+        undefined ->
+            State;
+        EffectId ->
+            Pending0 = maps:get(pending_effects, State, #{}),
+            Effect0 =
+                maps:get(EffectId,
+                         Pending0,
+                         pending_effect_from_activity(Event, Payload, EffectId)),
+            Effect1 =
+                Effect0#{status => claimed,
+                         claim_owner => maps:get(claim_owner, Payload, undefined),
+                         claim_token => maps:get(claim_token, Payload, undefined),
+                         claim_until_ms => maps:get(claim_until_ms, Payload,
+                                                    undefined),
+                         claimed_at_ms => maps:get(claimed_at_ms, Payload,
+                                                   maps:get(occurred_at, Event,
+                                                            undefined)),
+                         claimed_event_seq => maps:get(event_seq, Event)},
+            State#{pending_effects => maps:put(EffectId, Effect1, Pending0)}
     end.
 
 pending_effect_from_activity(Event, Payload, EffectId) ->

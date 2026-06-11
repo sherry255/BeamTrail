@@ -826,6 +826,8 @@ decode_event_type(<<"activity.succeeded">>) ->
     {ok, 'activity.succeeded'};
 decode_event_type(<<"activity.failed">>) ->
     {ok, 'activity.failed'};
+decode_event_type(<<"effect.claimed">>) ->
+    {ok, 'effect.claimed'};
 decode_event_type(<<"step.succeeded">>) ->
     {ok, 'step.succeeded'};
 decode_event_type(<<"step.failed">>) ->

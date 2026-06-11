@@ -58,7 +58,7 @@ Not in scope yet:
 
 - DAGs, fan-out/fan-in, or parallel command batches
 - Timer cancellation, recurring timers, or child workflows
-- External effect claim leases, deadlines, or automatic timeout failure
+- External effect deadlines or automatic timeout failure
 - First-class human task assignment, forms, escalation, or RBAC
 - HTTP API or browser UI
 - SQL-native JSON inspection
@@ -275,15 +275,20 @@ side effect.
 Workflow modules may implement optional `effect_mode/1`. Return `external` for
 a step that should be scheduled for an outside worker instead of executed by the
 active runner. External steps are exposed through `beamtrail:list_pending_effects/0`
-and completed with `beamtrail:complete_effect/3`.
+and completed with `beamtrail:complete_effect/4`.
 
 External effects carry `visible_at_ms` metadata and
 `beamtrail:list_pending_effects/0` only returns effects that are visible at the
-time of the call. They do not yet have claim leases, deadlines, or an automatic
-failure path. If no worker completes a pending external effect, the run remains
-in `waiting_effect` and recovery will not re-dispatch it. Workers must monitor
-pending effects and retry `complete_effect/3` on transient errors such as
-`{error, leased}`. The state returned from `complete_effect/3` is the immediate
+time of the call. Workers should claim an effect with `beamtrail:claim_effect/3`,
+then complete it with the returned `claim_token` via `beamtrail:complete_effect/4`.
+Active claims hide the effect until `claim_until_ms`; expired claims become
+visible again and can be claimed by another worker. `complete_effect/3` remains
+available for unclaimed effects, but an actively claimed effect must be completed
+with the matching token. External effects do not yet have deadlines or an
+automatic failure path. If no worker completes a pending external effect, the run
+remains in `waiting_effect` and recovery will not re-dispatch it. Workers must
+retry `claim_effect/3` or `complete_effect/4` on transient errors such as
+`{error, leased}`. The state returned from `complete_effect/4` is the immediate
 post-completion transition state; use `await_terminal/2` or `describe/1` to
 observe final workflow completion.
 
@@ -317,10 +322,10 @@ Set application environment before starting `beamtrail`:
 - `postgres_pool_checkout_timeout_ms`: checkout wait timeout, default `5000`
 - `postgres_pool_reconnect_interval_ms`: reconnect interval after a pooled
   connection replacement fails, default `1000`
-- `external_effect_visibility_timeout_ms`: metadata recorded on newly scheduled
-  external effects, default `30000`. The current runtime records it for worker
-  coordination, but does not yet enforce claim leases or automatic timeout
-  failure.
+- `external_effect_visibility_timeout_ms`: visibility and claim lease interval
+  for external effects, default `30000`. The current runtime uses it to hide
+  claimed effects until the claim expires, but does not yet turn expired work
+  into automatic retry or failure.
 - `workflow_modules`: workflow modules to preload on application start. This
   keeps PostgreSQL's safe external-term decoding from failing on atoms whose
   modules are present in the release but have not been loaded yet.
