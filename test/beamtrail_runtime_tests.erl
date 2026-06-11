@@ -16,6 +16,8 @@ durable_runtime_test_() ->
       fun external_step_waits_for_worker_completion/0,
       fun external_step_deadline_fails_abandoned_effect/0,
       fun list_pending_effects_filters_future_visible_at/0,
+      fun list_pending_effects_excludes_local_call_step_effects/0,
+      fun list_pending_effects_replay_fallback_returns_public_shape_in_order/0,
       fun claim_effect_hides_pending_effect_until_claim_expires/0,
       fun complete_effect_requires_active_claim_token/0,
       fun complete_effect_matches_legacy_external_attempt_by_effect_type/0,
@@ -38,6 +40,7 @@ setup() ->
 cleanup(_) ->
     stop_runner_infra(),
     ok = beamtrail_memory_storage:reset(),
+    ok = application:unset_env(beamtrail, storage_adapter),
     ok = application:unset_env(beamtrail, external_effect_visibility_timeout_ms),
     ok = application:unset_env(beamtrail, external_effect_timeout_ms).
 
@@ -300,6 +303,49 @@ list_pending_effects_filters_future_visible_at() ->
     [Visible] =
         [Effect || Effect <- Pending, maps:get(run_id, Effect) =:= VisibleRunId],
     ?assertEqual(Now - 1, maps:get(visible_at_ms, Visible)).
+
+list_pending_effects_excludes_local_call_step_effects() ->
+    RunId = <<"local-call-step-effect-not-worker-work">>,
+    Input = #{order_id => <<"local-call-step">>, test_pid => self()},
+    {ok, RunId} =
+        beamtrail:start_workflow(bt_success_workflow, Input,
+                                 #{run_id => RunId, auto_dispatch => false}),
+    {_Attempt, _Effect, _PreparedState} = prepare_pending_call_step(RunId),
+
+    ?assertEqual({ok, []}, beamtrail:list_pending_effects()),
+    ?assertEqual(timeout, receive_exec_short()).
+
+list_pending_effects_replay_fallback_returns_public_shape_in_order() ->
+    ok = application:set_env(beamtrail, storage_adapter, bt_counting_storage),
+    try
+        RunIdB = <<"fallback-effect-b">>,
+        RunIdA = <<"fallback-effect-a">>,
+        EffectId = beamtrail_effect:external_step_id(external_charge, 1),
+        Now = erlang:system_time(millisecond),
+        ok = append_external_pending_run(RunIdB, EffectId, Now - 1),
+        ok = append_external_pending_run(RunIdA, EffectId, Now - 1),
+
+        {ok, Pending} = beamtrail:list_pending_effects(),
+        ?assertMatch(
+           [#{run_id := RunIdA,
+              effect_id := EffectId,
+              effect_type := external_step,
+              step_id := external_charge,
+              step_version := 1,
+              idempotency_key := {external_charge, RunIdA},
+              attempt := 1,
+              status := scheduled,
+              visible_at_ms := _,
+              visibility_timeout_ms := _},
+            #{run_id := RunIdB,
+              effect_id := EffectId}],
+           Pending),
+        [First | _] = Pending,
+        ?assertNot(maps:is_key(scheduled_event_seq, First)),
+        ?assertNot(maps:is_key(scheduled_at, First))
+    after
+        ok = application:unset_env(beamtrail, storage_adapter)
+    end.
 
 claim_effect_hides_pending_effect_until_claim_expires() ->
     ok = application:set_env(beamtrail, external_effect_visibility_timeout_ms, 20),

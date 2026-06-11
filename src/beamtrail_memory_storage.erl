@@ -4,7 +4,8 @@
 
 -export([start_link/0, reset/0]).
 -export([append_event/8, append_events/4, read_events/3, events/1,
-         list_run_ids/0, list_run_ids/2, list_recoverable_run_ids/3]).
+         list_run_ids/0, list_run_ids/2, list_recoverable_run_ids/3,
+         list_pending_effects/1]).
 -export([write_snapshot/4, read_snapshot/1]).
 -export([acquire_lease/3, renew_lease/3, release_lease/2, read_lease/1]).
 -export([telemetry_counters/0]).
@@ -44,6 +45,9 @@ list_run_ids(Cursor, Limit) ->
 
 list_recoverable_run_ids(Cursor, Limit, NowMs) ->
     gen_server:call(?MODULE, {list_recoverable_run_ids, Cursor, Limit, NowMs}).
+
+list_pending_effects(NowMs) ->
+    gen_server:call(?MODULE, {list_pending_effects, NowMs}).
 
 write_snapshot(RunId, State, SnapshotSeq, SnapshotRevision) ->
     gen_server:call(?MODULE,
@@ -151,6 +155,13 @@ handle_call({list_recoverable_run_ids, Cursor, Limit, NowMs}, _From, State) ->
                    next_cursor => NextCursor,
                    has_more => HasMore}},
      State};
+handle_call({list_pending_effects, NowMs}, _From, State) ->
+    Effects =
+        sort_pending_effects(
+          [public_pending_effect(RunId, Effect)
+           || {RunId, Reduced} <- maps:to_list(maps:get(projections, State)),
+              Effect <- pending_effect_candidates(RunId, Reduced, NowMs)]),
+    {reply, {ok, Effects}, State};
 handle_call({write_snapshot, RunId, SnapshotState, SnapshotSeq, SnapshotRevision}, _From, State) ->
     Snapshot =
         #{run_id => RunId,
@@ -356,6 +367,78 @@ external_effect_deadline_due(Reduced, NowMs) ->
               false
       end,
       maps:values(maps:get(pending_effects, Reduced, #{}))).
+
+pending_effect_candidates(_RunId, #{terminal := true}, _NowMs) ->
+    [];
+pending_effect_candidates(_RunId, #{parked := true}, _NowMs) ->
+    [];
+pending_effect_candidates(_RunId, Reduced, NowMs) ->
+    [Effect
+     || Effect <- maps:values(maps:get(pending_effects, Reduced, #{})),
+        pending_effect_listable(Effect),
+        pending_effect_visible(Effect, NowMs),
+        pending_effect_claim_available(Effect, NowMs)].
+
+pending_effect_listable(#{effect_type := external_step, status := scheduled}) ->
+    true;
+pending_effect_listable(#{effect_type := external_step, status := claimed}) ->
+    true;
+pending_effect_listable(_Effect) ->
+    false.
+
+pending_effect_visible(#{visible_at_ms := VisibleAtMs}, NowMs)
+  when is_integer(VisibleAtMs) ->
+    VisibleAtMs =< NowMs;
+pending_effect_visible(_Effect, _NowMs) ->
+    true.
+
+pending_effect_claim_available(Effect, NowMs) ->
+    not pending_effect_claim_active(Effect, NowMs).
+
+pending_effect_claim_active(#{claim_until_ms := infinity}, _NowMs) ->
+    true;
+pending_effect_claim_active(#{claim_until_ms := ClaimUntilMs}, NowMs)
+  when is_integer(ClaimUntilMs) ->
+    ClaimUntilMs > NowMs;
+pending_effect_claim_active(_Effect, _NowMs) ->
+    false.
+
+public_pending_effect(RunId, Effect) ->
+    Base =
+        #{run_id => RunId,
+          effect_id => maps:get(effect_id, Effect),
+          effect_type => maps:get(effect_type, Effect),
+          step_id => maps:get(step_id, Effect, undefined),
+          step_version => maps:get(step_version, Effect, undefined),
+          idempotency_key => maps:get(idempotency_key, Effect, undefined),
+          attempt => maps:get(attempt, Effect, undefined),
+          status => maps:get(status, Effect),
+          visible_at_ms => maps:get(visible_at_ms, Effect, undefined),
+          visibility_timeout_ms =>
+              maps:get(visibility_timeout_ms, Effect, undefined)},
+    maybe_put_defined(
+      claimed_at_ms, maps:get(claimed_at_ms, Effect, undefined),
+      maybe_put_defined(
+        claim_until_ms, maps:get(claim_until_ms, Effect, undefined),
+        maybe_put_defined(
+          claim_token, maps:get(claim_token, Effect, undefined),
+          maybe_put_defined(
+            claim_owner, maps:get(claim_owner, Effect, undefined),
+            maybe_put_defined(deadline_at_ms,
+                              maps:get(deadline_at_ms, Effect, undefined),
+                              Base))))).
+
+maybe_put_defined(_Key, undefined, Map) ->
+    Map;
+maybe_put_defined(Key, Value, Map) ->
+    Map#{Key => Value}.
+
+sort_pending_effects(Effects) ->
+    lists:sort(fun pending_effect_order/2, Effects).
+
+pending_effect_order(A, B) ->
+    {maps:get(run_id, A), maps:get(effect_id, A)}
+        =< {maps:get(run_id, B), maps:get(effect_id, B)}.
 
 lease_open(undefined, _NowMs) -> true;
 lease_open(Lease, NowMs) -> maps:get(lease_until, Lease) =< NowMs.

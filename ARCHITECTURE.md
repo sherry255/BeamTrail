@@ -248,12 +248,19 @@ explicit step inputs from the reduced view.
 External effects are a minimal worker handoff, not a full task queue. The current
 runtime exposes visible pending external effects, records `effect.claimed`
 events, and accepts token-fenced `complete_effect/4`. `visible_at_ms` gates
-listing; `claim_until_ms` hides claimed work until the claim expires. By default
-there is no overall deadline. When `external_effect_timeout_ms` is configured,
-`deadline_at_ms` is stored on the scheduled activity and a due deadline makes the
-`waiting_effect` run recoverable; dispatch then records
-`external_effect_timeout` through the same atomic failure/retry decision path as
-local step failures.
+listing; `claim_until_ms` hides claimed work until the claim expires. The
+PostgreSQL adapter keeps visible pending external effects in a derived
+`workflow_effects` inbox index, updated in the same transaction as event appends;
+the event log remains authoritative and the index can be rebuilt from reduced
+state with `beamtrail_postgres_storage:backfill_effect_index/0`. Deployments
+upgrading from a version without the index must run the backfill before starting
+external workers, or pre-existing scheduled external effects will not be
+discoverable through the indexed listing. By default there is no overall
+deadline. When
+`external_effect_timeout_ms` is configured, `deadline_at_ms` is stored on the
+scheduled activity and a due deadline makes the `waiting_effect` run recoverable;
+dispatch then records `external_effect_timeout` through the same atomic
+failure/retry decision path as local step failures.
 
 The decider is deliberately not a Temporal-style arbitrary workflow-code replay
 system; it is a deterministic callback over a reduced view that returns the next

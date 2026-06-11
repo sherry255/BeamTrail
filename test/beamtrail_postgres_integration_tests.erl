@@ -14,6 +14,7 @@ postgres_integration_test_() ->
               fun postgres_complete_effect_finishes_pending_call_step/0,
               fun postgres_external_step_waits_for_worker_completion/0,
               fun postgres_external_step_deadline_uses_recoverable_index/0,
+              fun postgres_pending_effects_use_effect_index/0,
               fun postgres_claim_effect_requires_token_completion/0,
               fun postgres_recovery_replays_unfinished_attempt_after_restart/0,
               fun postgres_recovery_budget_exceeded_fails_open_attempt/0,
@@ -178,6 +179,48 @@ postgres_external_step_deadline_uses_recoverable_index() ->
     ?assertMatch(#{reason := external_effect_timeout,
                    class := external_effect_timeout},
                  maps:get(failure, Failed)).
+
+postgres_pending_effects_use_effect_index() ->
+    RunId = unique_run_id("pg-effect-index"),
+    Input = #{order_id => RunId, test_pid => self()},
+    {ok, RunId} =
+        beamtrail:start_workflow(bt_external_step_workflow, Input,
+                                 #{run_id => RunId}),
+    {ok, _Waiting} = wait_for_state(RunId, waiting_effect, 1000),
+
+    {ok, Indexed0} = beamtrail_postgres_storage:list_pending_effects(
+                       erlang:system_time(millisecond)),
+    ?assertMatch(
+       [#{run_id := RunId,
+          effect_id := {external_step, external_charge, 1},
+          effect_type := external_step,
+          step_id := external_charge,
+          status := scheduled}],
+       [Effect || Effect <- Indexed0, maps:get(run_id, Effect) =:= RunId]),
+
+    [Effect] = [Effect || Effect <- Indexed0,
+                          maps:get(run_id, Effect) =:= RunId],
+    {ok, PublicPending0} = beamtrail:list_pending_effects(),
+    ?assertEqual(
+       [maps:get(effect_id, Effect)],
+       [maps:get(effect_id, PublicEffect)
+        || PublicEffect <- PublicPending0,
+           maps:get(run_id, PublicEffect) =:= RunId]),
+    EffectId = maps:get(effect_id, Effect),
+    {ok, Claim} = beamtrail:claim_effect(RunId, EffectId, pg_index_worker),
+    ClaimToken = maps:get(claim_token, Claim),
+    {ok, IndexedClaimed} = beamtrail_postgres_storage:list_pending_effects(
+                             erlang:system_time(millisecond)),
+    ?assertEqual([], [E || E <- IndexedClaimed,
+                           maps:get(run_id, E) =:= RunId]),
+
+    {ok, _State1} =
+        beamtrail:complete_effect(RunId, EffectId, ClaimToken,
+                                  {ok, #{external_result => indexed_done}}),
+    {ok, IndexedDone} = beamtrail_postgres_storage:list_pending_effects(
+                          erlang:system_time(millisecond)),
+    ?assertEqual([], [E || E <- IndexedDone,
+                           maps:get(run_id, E) =:= RunId]).
 
 postgres_claim_effect_requires_token_completion() ->
     RunId = unique_run_id("pg-claim-effect"),
@@ -817,7 +860,7 @@ truncate_tables(Config) ->
                 case epgsql:squery(
                        C,
                        "TRUNCATE workflow_events, workflow_snapshots, "
-                       "workflow_leases, workflow_runs") of
+                       "workflow_leases, workflow_runs, workflow_effects") of
                     {ok, _, _} -> ok;
                     {error, Reason} -> {error, Reason}
                 end

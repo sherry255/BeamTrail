@@ -7,10 +7,10 @@
 %% terms as external-term-format bytea values so replay semantics come before
 %% SQL-level inspection.
 
--export([init_schema/0, backfill_run_projections/0]).
+-export([init_schema/0, backfill_run_projections/0, backfill_effect_index/0]).
 -export([append_event/8, append_events/4, read_events/3, events/1, write_snapshot/4, read_snapshot/1,
          acquire_lease/3, renew_lease/3, release_lease/2, read_lease/1, list_run_ids/0, list_run_ids/2,
-         list_recoverable_run_ids/3]).
+         list_recoverable_run_ids/3, list_pending_effects/1]).
 
 append_event(RunId, ExpectedSeq, FencingToken,
              EventType, StepId, StepVersion, IdempotencyKey, Payload) ->
@@ -230,6 +230,30 @@ list_recoverable_run_ids(Cursor, Limit, NowMs) ->
                       {ok, #{run_ids => Page,
                              next_cursor => next_cursor(Page),
                              has_more => length(All) > Limit}};
+                  {error, Reason} ->
+                      {error, Reason}
+              end
+      end).
+
+list_pending_effects(NowMs) ->
+    with_connection(
+      fun(C) ->
+              case epgsql:equery(
+                     C,
+                     "SELECT e.run_id, e.effect_id, e.effect_type, e.step_id, "
+                     "e.step_version, e.idempotency_key, e.attempt, e.status, "
+                     "e.visible_at_ms, e.visibility_timeout_ms, e.deadline_at_ms, "
+                     "e.claim_owner, e.claim_token, e.claim_until_ms, e.claimed_at_ms "
+                     "FROM workflow_effects e "
+                     "JOIN workflow_runs r ON r.run_id = e.run_id "
+                     "WHERE r.terminal = false AND r.parked = false "
+                     "AND e.status IN ('scheduled', 'claimed') "
+                     "AND (e.visible_at_ms IS NULL OR e.visible_at_ms <= $1) "
+                     "AND (e.claim_token IS NULL OR e.claim_until_ms <= $1) "
+                     "ORDER BY e.run_id, e.effect_id",
+                     [NowMs]) of
+                  {ok, _Cols, Rows} ->
+                      decode_pending_effect_rows(Rows);
                   {error, Reason} ->
                       {error, Reason}
               end
@@ -476,6 +500,14 @@ touch_run(C, RunId, UpdatedAt) ->
 %% batches (recovery.requeued) leave the projection unchanged, matching the
 %% reducer's no-op for unrecognized events; they still bump updated_at_ms.
 update_run_after_append(C, RunId, Events, UpdatedAt) ->
+    case update_run_projection_after_append(C, RunId, Events, UpdatedAt) of
+        ok ->
+            update_effect_index_after_append(C, RunId, Events, UpdatedAt);
+        {error, _} = Error ->
+            Error
+    end.
+
+update_run_projection_after_append(C, RunId, Events, UpdatedAt) ->
     case run_projection(Events) of
         no_change ->
             touch_run(C, RunId, UpdatedAt);
@@ -484,52 +516,66 @@ update_run_after_append(C, RunId, Events, UpdatedAt) ->
           next_retry_at := NextRetry,
           next_wake_at := NextWake,
           parked := Parked} ->
-            case epgsql:equery(
-                   C,
-                   "UPDATE workflow_runs SET updated_at_ms = $2, status = $3, "
-                   "terminal = $4, next_retry_at_ms = $5, "
-                   "next_wake_at_ms = $6, parked = $7 "
-                   "WHERE run_id = $1",
-                   [RunId, UpdatedAt, Status, Terminal, NextRetry, NextWake,
-                    Parked]) of
-                {ok, 1} -> ok;
-                {ok, 0} -> {error, run_lock_missing};
-                {error, Reason} -> {error, Reason}
-            end;
+            update_run_projection(C, RunId, UpdatedAt, Status, Terminal,
+                                  NextRetry, NextWake, Parked);
         #{status := Status,
           terminal := Terminal,
           next_retry_at := NextRetry,
           parked := Parked} ->
-            case epgsql:equery(
-                   C,
-                   "UPDATE workflow_runs SET updated_at_ms = $2, status = $3, "
-                   "terminal = $4, next_retry_at_ms = $5, parked = $6 "
-                   "WHERE run_id = $1",
-                   [RunId, UpdatedAt, Status, Terminal, NextRetry, Parked]) of
-                {ok, 1} -> ok;
-                {ok, 0} -> {error, run_lock_missing};
-                {error, Reason} -> {error, Reason}
-            end;
+            update_run_projection_without_wake(C, RunId, UpdatedAt, Status,
+                                               Terminal, NextRetry, Parked);
         #{next_wake_at := NextWake} ->
-            case epgsql:equery(
-                   C,
-                   "UPDATE workflow_runs SET updated_at_ms = $2, "
-                   "next_wake_at_ms = $3 WHERE run_id = $1",
-                   [RunId, UpdatedAt, NextWake]) of
-                {ok, 1} -> ok;
-                {ok, 0} -> {error, run_lock_missing};
-                {error, Reason} -> {error, Reason}
-            end;
+            update_run_next_wake(C, RunId, UpdatedAt, NextWake);
         #{parked := Parked} ->
-            case epgsql:equery(
-                   C,
-                   "UPDATE workflow_runs SET updated_at_ms = $2, parked = $3 "
-                   "WHERE run_id = $1",
-                   [RunId, UpdatedAt, Parked]) of
-                {ok, 1} -> ok;
-                {ok, 0} -> {error, run_lock_missing};
-                {error, Reason} -> {error, Reason}
-            end
+            update_run_parked(C, RunId, UpdatedAt, Parked)
+    end.
+
+update_run_projection(C, RunId, UpdatedAt, Status, Terminal, NextRetry,
+                      NextWake, Parked) ->
+    case epgsql:equery(
+           C,
+           "UPDATE workflow_runs SET updated_at_ms = $2, status = $3, "
+           "terminal = $4, next_retry_at_ms = $5, "
+           "next_wake_at_ms = $6, parked = $7 WHERE run_id = $1",
+           [RunId, UpdatedAt, Status, Terminal, NextRetry, NextWake, Parked]) of
+        {ok, 1} -> ok;
+        {ok, 0} -> {error, run_lock_missing};
+        {error, Reason} -> {error, Reason}
+    end.
+
+update_run_projection_without_wake(C, RunId, UpdatedAt, Status, Terminal,
+                                   NextRetry, Parked) ->
+    case epgsql:equery(
+           C,
+           "UPDATE workflow_runs SET updated_at_ms = $2, status = $3, "
+           "terminal = $4, next_retry_at_ms = $5, parked = $6 "
+           "WHERE run_id = $1",
+           [RunId, UpdatedAt, Status, Terminal, NextRetry, Parked]) of
+        {ok, 1} -> ok;
+        {ok, 0} -> {error, run_lock_missing};
+        {error, Reason} -> {error, Reason}
+    end.
+
+update_run_next_wake(C, RunId, UpdatedAt, NextWake) ->
+    case epgsql:equery(
+           C,
+           "UPDATE workflow_runs SET updated_at_ms = $2, "
+           "next_wake_at_ms = $3 WHERE run_id = $1",
+           [RunId, UpdatedAt, NextWake]) of
+        {ok, 1} -> ok;
+        {ok, 0} -> {error, run_lock_missing};
+        {error, Reason} -> {error, Reason}
+    end.
+
+update_run_parked(C, RunId, UpdatedAt, Parked) ->
+    case epgsql:equery(
+           C,
+           "UPDATE workflow_runs SET updated_at_ms = $2, parked = $3 "
+           "WHERE run_id = $1",
+           [RunId, UpdatedAt, Parked]) of
+        {ok, 1} -> ok;
+        {ok, 0} -> {error, run_lock_missing};
+        {error, Reason} -> {error, Reason}
     end.
 
 %% Derive the recovery-scan projection from a committed batch. The reducer is
@@ -599,6 +645,113 @@ project_next_wake(NextWake, no_change) ->
     #{next_wake_at => NextWake};
 project_next_wake(NextWake, Acc) ->
     Acc#{next_wake_at => NextWake}.
+
+update_effect_index_after_append(C, RunId, Events, UpdatedAt) ->
+    lists:foldl(
+      fun(_Event, {error, _} = Error) ->
+              Error;
+         (Event, ok) ->
+              project_effect_event(C, RunId, Event, UpdatedAt)
+      end,
+      ok,
+      Events).
+
+project_effect_event(C, RunId,
+                     #{event_type := 'activity.scheduled',
+                       step_id := StepId,
+                       step_version := StepVersion,
+                       idempotency_key := IdempotencyKey,
+                       payload := #{effect_id := EffectId,
+                                    effect_type := external_step,
+                                    attempt := Attempt} = Payload},
+                     UpdatedAt) ->
+    upsert_effect_index(C, RunId, EffectId, external_step, StepId, StepVersion,
+                        IdempotencyKey, Attempt, <<"scheduled">>, Payload,
+                        UpdatedAt);
+project_effect_event(C, RunId,
+                     #{event_type := 'effect.claimed',
+                       payload := #{effect_id := EffectId} = Payload},
+                     UpdatedAt) ->
+    update_effect_claim(C, RunId, EffectId, Payload, UpdatedAt);
+project_effect_event(C, RunId,
+                     #{event_type := EventType,
+                       payload := #{effect_id := EffectId}},
+                     _UpdatedAt)
+  when EventType =:= 'activity.succeeded';
+       EventType =:= 'activity.failed' ->
+    delete_effect_index(C, RunId, EffectId);
+project_effect_event(C, RunId, #{event_type := EventType}, _UpdatedAt)
+  when EventType =:= 'workflow.completed';
+       EventType =:= 'workflow.failed';
+       EventType =:= 'workflow.cancelled' ->
+    delete_all_effects_for_run(C, RunId);
+project_effect_event(_C, _RunId, _Event, _UpdatedAt) ->
+    ok.
+
+upsert_effect_index(C, RunId, EffectId, EffectType, StepId, StepVersion,
+                    IdempotencyKey, Attempt, Status, Payload, UpdatedAt) ->
+    case epgsql:equery(
+           C,
+           "INSERT INTO workflow_effects "
+           "(run_id, effect_id, effect_type, step_id, step_version, "
+           "idempotency_key, attempt, status, visible_at_ms, "
+           "visibility_timeout_ms, deadline_at_ms, updated_at_ms) "
+           "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) "
+           "ON CONFLICT (run_id, effect_id) DO UPDATE SET "
+           "effect_type = EXCLUDED.effect_type, "
+           "step_id = EXCLUDED.step_id, "
+           "step_version = EXCLUDED.step_version, "
+           "idempotency_key = EXCLUDED.idempotency_key, "
+           "attempt = EXCLUDED.attempt, "
+           "status = EXCLUDED.status, "
+           "visible_at_ms = EXCLUDED.visible_at_ms, "
+           "visibility_timeout_ms = EXCLUDED.visibility_timeout_ms, "
+           "deadline_at_ms = EXCLUDED.deadline_at_ms, "
+           "claim_owner = NULL, claim_token = NULL, claim_until_ms = NULL, "
+           "claimed_at_ms = NULL, updated_at_ms = EXCLUDED.updated_at_ms",
+           [RunId, term_to_binary(EffectId), atom_to_binary(EffectType, utf8),
+            nullable_atom(StepId), nullable_int(StepVersion),
+            nullable_term(IdempotencyKey), nullable_int(Attempt), Status,
+            nullable_int(maps:get(visible_at_ms, Payload, undefined)),
+            nullable_int(maps:get(visibility_timeout_ms, Payload, undefined)),
+            nullable_int(maps:get(deadline_at_ms, Payload, undefined)),
+            UpdatedAt]) of
+        {ok, 1} -> ok;
+        {error, Reason} -> {error, Reason}
+    end.
+
+update_effect_claim(C, RunId, EffectId, Payload, UpdatedAt) ->
+    case epgsql:equery(
+           C,
+           "UPDATE workflow_effects SET status = 'claimed', claim_owner = $3, "
+           "claim_token = $4, claim_until_ms = $5, claimed_at_ms = $6, "
+           "updated_at_ms = $7 WHERE run_id = $1 AND effect_id = $2",
+           [RunId, term_to_binary(EffectId),
+            nullable_term(maps:get(claim_owner, Payload, undefined)),
+            nullable_term(maps:get(claim_token, Payload, undefined)),
+            nullable_int(maps:get(claim_until_ms, Payload, undefined)),
+            nullable_int(maps:get(claimed_at_ms, Payload, undefined)),
+            UpdatedAt]) of
+        {ok, 1} -> ok;
+        {ok, 0} -> ok;
+        {error, Reason} -> {error, Reason}
+    end.
+
+delete_effect_index(C, RunId, EffectId) ->
+    case epgsql:equery(
+           C,
+           "DELETE FROM workflow_effects WHERE run_id = $1 AND effect_id = $2",
+           [RunId, term_to_binary(EffectId)]) of
+        {ok, _Count} -> ok;
+        {error, Reason} -> {error, Reason}
+    end.
+
+delete_all_effects_for_run(C, RunId) ->
+    case epgsql:equery(C, "DELETE FROM workflow_effects WHERE run_id = $1",
+                       [RunId]) of
+        {ok, _Count} -> ok;
+        {error, Reason} -> {error, Reason}
+    end.
 
 %% One-time normalization for runs that predate the projection columns: replays
 %% each run through the reducer and writes its current projection. Safe to run
@@ -674,6 +827,90 @@ write_backfill_projection(RunId, State) ->
         {error, Reason} ->
             {error, Reason}
     end.
+
+backfill_effect_index() ->
+    backfill_effect_index(undefined, []).
+
+backfill_effect_index(Cursor, Failures) ->
+    case list_run_ids(Cursor, 500) of
+        {ok, #{run_ids := []}} ->
+            backfill_result(Failures);
+        {ok, #{run_ids := RunIds, has_more := HasMore, next_cursor := Next}} ->
+            Failures1 = lists:foldl(fun collect_effect_backfill_result/2,
+                                     Failures,
+                                     RunIds),
+            case HasMore of
+                true -> backfill_effect_index(Next, Failures1);
+                false -> backfill_result(Failures1)
+            end;
+        {error, _} = Error ->
+            Error
+    end.
+
+collect_effect_backfill_result(RunId, Failures) ->
+    case backfill_effects_one(RunId) of
+        ok ->
+            Failures;
+        {error, Reason} ->
+            [#{run_id => RunId, reason => Reason} | Failures]
+    end.
+
+backfill_effects_one(RunId) ->
+    case beamtrail_state:load(RunId, ?MODULE) of
+        {ok, State} ->
+            write_backfill_effects(RunId, State);
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+write_backfill_effects(RunId, State) ->
+    Effects =
+        [Effect || Effect <- maps:values(maps:get(pending_effects, State, #{})),
+                   maps:get(effect_type, Effect, undefined) =:= external_step],
+    transaction(
+      fun(C) ->
+              case lock_run(C, RunId) of
+                  ok ->
+                      case delete_all_effects_for_run(C, RunId) of
+                          ok -> backfill_effect_rows(C, RunId, Effects, now_ms());
+                          {error, _} = Error -> Error
+                      end;
+                  {error, _} = Error ->
+                      Error
+              end
+      end).
+
+backfill_effect_rows(_C, _RunId, [], _UpdatedAt) ->
+    ok;
+backfill_effect_rows(C, RunId, [Effect | Rest], UpdatedAt) ->
+    case upsert_effect_index_from_effect(C, RunId, Effect, UpdatedAt) of
+        ok -> backfill_effect_rows(C, RunId, Rest, UpdatedAt);
+        {error, _} = Error -> Error
+    end.
+
+upsert_effect_index_from_effect(C, RunId, Effect, UpdatedAt) ->
+    Payload =
+        maps:with([visible_at_ms, visibility_timeout_ms, deadline_at_ms],
+                  Effect),
+    Status = atom_to_binary(maps:get(status, Effect, scheduled), utf8),
+    case upsert_effect_index(
+           C, RunId, maps:get(effect_id, Effect),
+           maps:get(effect_type, Effect), maps:get(step_id, Effect, undefined),
+           maps:get(step_version, Effect, undefined),
+           maps:get(idempotency_key, Effect, undefined),
+           maps:get(attempt, Effect, undefined), Status, Payload, UpdatedAt) of
+        ok ->
+            maybe_backfill_effect_claim(C, RunId, Effect, UpdatedAt);
+        {error, _} = Error ->
+            Error
+    end.
+
+maybe_backfill_effect_claim(C, RunId, #{claim_token := _} = Effect,
+                            UpdatedAt) ->
+    update_effect_claim(C, RunId, maps:get(effect_id, Effect), Effect,
+                        UpdatedAt);
+maybe_backfill_effect_claim(_C, _RunId, _Effect, _UpdatedAt) ->
+    ok.
 
 current_event_seq(C, RunId) ->
     case epgsql:equery(C,
@@ -810,6 +1047,66 @@ decode_event(RunId, {Seq, TypeBin, StepBin, StepVersion,
             Error
     end.
 
+decode_pending_effect_rows(Rows) ->
+    decode_pending_effect_rows(Rows, []).
+
+decode_pending_effect_rows([], Acc) ->
+    {ok, lists:reverse(Acc)};
+decode_pending_effect_rows([Row | Rest], Acc) ->
+    case decode_pending_effect_row(Row) of
+        {ok, Effect} -> decode_pending_effect_rows(Rest, [Effect | Acc]);
+        {error, _} = Error -> Error
+    end.
+
+decode_pending_effect_row({RunId, EffectIdBin, EffectTypeBin, StepBin,
+                           StepVersion, IdempotencyBin, Attempt, StatusBin,
+                           VisibleAt, VisibilityTimeout, DeadlineAt,
+                           ClaimOwnerBin, ClaimTokenBin, ClaimUntil,
+                           ClaimedAt}) ->
+    case {decode_term(EffectIdBin),
+          decode_effect_type(EffectTypeBin),
+          decode_step_id(StepBin),
+          decode_term(IdempotencyBin),
+          decode_term(ClaimOwnerBin),
+          decode_term(ClaimTokenBin)} of
+        {{ok, EffectId}, {ok, EffectType}, {ok, StepId},
+         {ok, IdempotencyKey}, {ok, ClaimOwner}, {ok, ClaimToken}} ->
+            Base =
+                #{run_id => RunId,
+                  effect_id => EffectId,
+                  effect_type => EffectType,
+                  step_id => StepId,
+                  step_version => decode_null(StepVersion),
+                  idempotency_key => IdempotencyKey,
+                  attempt => Attempt,
+                  status => decode_effect_status(StatusBin),
+                  visible_at_ms => decode_null(VisibleAt),
+                  visibility_timeout_ms => decode_null(VisibilityTimeout)},
+            {ok, maybe_put_defined(
+                   claimed_at_ms, decode_null(ClaimedAt),
+                   maybe_put_defined(
+                     claim_until_ms, decode_null(ClaimUntil),
+                     maybe_put_defined(
+                       claim_token, ClaimToken,
+                       maybe_put_defined(
+                         claim_owner, ClaimOwner,
+                         maybe_put_defined(deadline_at_ms,
+                                           decode_null(DeadlineAt),
+                                           Base)))))};
+        {{error, _} = Error, _, _, _, _, _} ->
+            Error;
+        {_, {error, _} = Error, _, _, _, _} ->
+            Error;
+        {_, _, {error, _} = Error, _, _, _} ->
+            Error;
+        {_, _, _, {error, _} = Error, _, _} ->
+            Error;
+        {_, _, _, _, {error, _} = Error, _} ->
+            Error;
+        {_, _, _, _, _, {error, _} = Error} ->
+            Error
+    end.
+
 nullable_atom(undefined) -> null;
 nullable_atom(Atom) when is_atom(Atom) -> atom_to_binary(Atom, utf8).
 
@@ -818,6 +1115,18 @@ nullable_int(Int) when is_integer(Int) -> Int.
 
 nullable_term(undefined) -> null;
 nullable_term(Term) -> term_to_binary(Term).
+
+decode_effect_type(<<"call_step">>) -> {ok, call_step};
+decode_effect_type(<<"external_step">>) -> {ok, external_step};
+decode_effect_type(Bin) when is_binary(Bin) -> {error, {unknown_effect_type, Bin}}.
+
+decode_effect_status(<<"scheduled">>) -> scheduled;
+decode_effect_status(<<"claimed">>) -> claimed.
+
+maybe_put_defined(_Key, undefined, Map) ->
+    Map;
+maybe_put_defined(Key, Value, Map) ->
+    Map#{Key => Value}.
 
 decode_event_type(<<"workflow.instance.created">>) ->
     {ok, 'workflow.instance.created'};

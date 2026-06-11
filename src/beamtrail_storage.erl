@@ -64,5 +64,7 @@
 
 %% Optional observability accessors. Never part of the primary source of truth.
 -optional_callbacks([release_lease/2, list_recoverable_run_ids/3,
-                     telemetry_counters/0]).
+                     list_pending_effects/1, telemetry_counters/0]).
+-callback list_pending_effects(NowMs :: integer()) ->
+    {ok, [map()]} | {error, term()}.
 -callback telemetry_counters() -> map().

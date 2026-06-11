@@ -167,6 +167,15 @@ ok = beamtrail_postgres_storage:init_schema().
 {ok, _} = application:ensure_all_started(beamtrail).
 ```
 
+When upgrading an existing PostgreSQL database, run `init_schema/0` before
+starting the application on the new code. If the deployment predates the run
+projection or external-effect inbox tables, also run
+`beamtrail_postgres_storage:backfill_run_projections/0` and
+`beamtrail_postgres_storage:backfill_effect_index/0` once after the schema is in
+place. The effect-index backfill is required before starting external workers;
+otherwise already-scheduled external effects will not appear in
+`list_pending_effects/0` until another event updates the run.
+
 Run a workflow:
 
 ```erlang
@@ -285,6 +294,14 @@ Active claims hide the effect until `claim_until_ms`; expired claims become
 visible again and can be claimed by another worker. `complete_effect/3` remains
 available for unclaimed effects, but an actively claimed effect must be completed
 with the matching token.
+
+With PostgreSQL, pending external effects are also maintained in the
+`workflow_effects` operational index in the same transaction as the event append,
+so workers do not need to replay every run to discover available work. The event
+log remains authoritative; the index can be rebuilt with
+`beamtrail_postgres_storage:backfill_effect_index/0`. On upgrades from versions
+that did not have `workflow_effects`, run that backfill before starting external
+workers.
 
 By default external effects have no overall deadline. Configure
 `external_effect_timeout_ms` to make an abandoned external effect recoverable

@@ -51,6 +51,30 @@ CREATE INDEX IF NOT EXISTS workflow_runs_recoverable_idx
 CREATE INDEX IF NOT EXISTS workflow_runs_recoverable_active_idx
   ON workflow_runs (run_id) WHERE terminal = false AND parked = false;
 
+CREATE TABLE IF NOT EXISTS workflow_effects (
+  run_id bytea NOT NULL,
+  effect_id bytea NOT NULL,
+  effect_type text NOT NULL,
+  step_id text,
+  step_version integer,
+  idempotency_key bytea,
+  attempt integer,
+  status text NOT NULL,
+  visible_at_ms bigint,
+  visibility_timeout_ms bigint,
+  deadline_at_ms bigint,
+  claim_owner bytea,
+  claim_token bytea,
+  claim_until_ms bigint,
+  claimed_at_ms bigint,
+  updated_at_ms bigint NOT NULL,
+  PRIMARY KEY (run_id, effect_id)
+);
+
+CREATE INDEX IF NOT EXISTS workflow_effects_pending_idx
+  ON workflow_effects (visible_at_ms, claim_until_ms, run_id)
+  WHERE status IN ('scheduled', 'claimed');
+
 CREATE TABLE IF NOT EXISTS workflow_snapshots (
   run_id bytea PRIMARY KEY,
   snapshot_seq bigint NOT NULL,
