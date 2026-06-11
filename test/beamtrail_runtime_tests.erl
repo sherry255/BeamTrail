@@ -14,6 +14,7 @@ durable_runtime_test_() ->
       fun complete_effect_ignores_cancelled_pending_call_step/0,
       fun complete_effect_failure_uses_retry_decision/0,
       fun external_step_waits_for_worker_completion/0,
+      fun list_pending_effects_filters_future_visible_at/0,
       fun complete_effect_matches_legacy_external_attempt_by_effect_type/0,
       fun retry_uses_stable_idempotency_key_across_attempts/0,
       fun recovery_replays_unknown_attempt_with_recorded_step_version/0,
@@ -226,6 +227,8 @@ external_step_waits_for_worker_completion() ->
        Pending),
 
     [Effect] = Pending,
+    ?assert(is_integer(maps:get(visible_at_ms, Effect))),
+    ?assertEqual(30000, maps:get(visibility_timeout_ms, Effect)),
     EffectId = maps:get(effect_id, Effect),
     {ok, State1} =
         beamtrail:complete_effect(RunId, EffectId,
@@ -251,6 +254,22 @@ external_step_waits_for_worker_completion() ->
     ?assertEqual(external_step,
                  maps:get(effect_type, maps:get(payload, ActivityScheduled))),
     ?assertEqual(0, count_events('activity.started', Events)).
+
+list_pending_effects_filters_future_visible_at() ->
+    HiddenRunId = <<"future-visible-effect-run">>,
+    VisibleRunId = <<"past-visible-effect-run">>,
+    EffectId = beamtrail_effect:external_step_id(external_charge, 1),
+    Now = erlang:system_time(millisecond),
+    ok = append_external_pending_run(HiddenRunId, EffectId, Now + 60000),
+    ok = append_external_pending_run(VisibleRunId, EffectId, Now - 1),
+
+    {ok, Pending} = beamtrail:list_pending_effects(),
+    PendingRunIds = [maps:get(run_id, Effect) || Effect <- Pending],
+    ?assertNot(lists:member(HiddenRunId, PendingRunIds)),
+    ?assert(lists:member(VisibleRunId, PendingRunIds)),
+    [Visible] =
+        [Effect || Effect <- Pending, maps:get(run_id, Effect) =:= VisibleRunId],
+    ?assertEqual(Now - 1, maps:get(visible_at_ms, Visible)).
 
 complete_effect_matches_legacy_external_attempt_by_effect_type() ->
     RunId = <<"legacy-external-effect-run">>,
@@ -426,6 +445,49 @@ prepare_pending_call_step(RunId) ->
     ok = beamtrail_memory_storage:release_lease(
            RunId, maps:get(fencing_token, Lease)),
     {Attempt, Effect, State1}.
+
+append_external_pending_run(RunId, EffectId, VisibleAtMs) ->
+    Input = #{order_id => RunId, test_pid => self()},
+    {ok, _Created} =
+        beamtrail_memory_storage:append_event(
+          RunId,
+          0,
+          undefined,
+          'workflow.instance.created',
+          undefined,
+          undefined,
+          undefined,
+          #{workflow => bt_external_step_workflow,
+            input => Input,
+            steps => [external_charge]}),
+    {ok, Lease} =
+        beamtrail_memory_storage:acquire_lease(
+          RunId, #{owner => visible_effect_test}, 30000),
+    Fence = maps:get(fencing_token, Lease),
+    {ok, [_Started, _Scheduled]} =
+        beamtrail_memory_storage:append_events(
+          RunId,
+          1,
+          Fence,
+          [#{event_type => 'attempt.started',
+             step_id => external_charge,
+             step_version => 1,
+             idempotency_key => {external_charge, RunId},
+             payload => #{attempt => 1,
+                          effect_id => EffectId,
+                          effect_type => external_step,
+                          step_input => Input}},
+           #{event_type => 'activity.scheduled',
+             step_id => external_charge,
+             step_version => 1,
+             idempotency_key => {external_charge, RunId},
+             payload => #{activity_type => step,
+                          activity_status => scheduled,
+                          effect_id => EffectId,
+                          effect_type => external_step,
+                          attempt => 1,
+                          visible_at_ms => VisibleAtMs}}]),
+    ok = beamtrail_memory_storage:release_lease(RunId, Fence).
 
 count_events(EventType, Events) ->
     length([Event || Event <- Events,

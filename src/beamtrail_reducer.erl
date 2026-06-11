@@ -271,9 +271,24 @@ update_pending_effect_status(State, Event, Status) ->
                          Pending0,
                          pending_effect_from_activity(Event, Payload, EffectId)),
             Effect1 = Effect0#{status => Status},
-            Effect2 = add_effect_lifecycle_seq(Status, Event, Effect1),
-            State1 = State#{pending_effects => maps:put(EffectId, Effect2, Pending0)},
-            maybe_wait_for_external_effect(State1, Effect2, Status)
+            Effect2 = merge_effect_visibility(Status, Payload, Effect1),
+            Effect3 = add_effect_lifecycle_seq(Status, Event, Effect2),
+            State2 = State#{pending_effects => maps:put(EffectId, Effect3, Pending0)},
+            maybe_wait_for_external_effect(State2, Effect3, Status)
+    end.
+
+merge_effect_visibility(scheduled, Payload, Effect) ->
+    maybe_put_payload_field(
+      visibility_timeout_ms,
+      Payload,
+      maybe_put_payload_field(visible_at_ms, Payload, Effect));
+merge_effect_visibility(_Status, _Payload, Effect) ->
+    Effect.
+
+maybe_put_payload_field(Key, Payload, Effect) ->
+    case maps:get(Key, Payload, undefined) of
+        undefined -> Effect;
+        Value -> Effect#{Key => Value}
     end.
 
 pending_effect_from_activity(Event, Payload, EffectId) ->
@@ -283,7 +298,10 @@ pending_effect_from_activity(Event, Payload, EffectId) ->
       step_version => maps:get(step_version, Event),
       idempotency_key => maps:get(idempotency_key, Event),
       attempt => maps:get(attempt, Payload, undefined),
-      status => requested}.
+      status => requested,
+      visible_at_ms => maps:get(visible_at_ms, Payload, undefined),
+      visibility_timeout_ms =>
+          maps:get(visibility_timeout_ms, Payload, undefined)}.
 
 maybe_wait_for_external_effect(State, #{effect_type := external_step}, scheduled) ->
     State#{status => waiting_effect,

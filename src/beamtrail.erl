@@ -489,7 +489,16 @@ pending_effects_for_state(#{parked := true}) ->
 pending_effects_for_state(State) ->
     RunId = maps:get(run_id, State),
     Effects = maps:values(maps:get(pending_effects, State, #{})),
-    [Effect#{run_id => RunId} || Effect <- lists:sort(Effects)].
+    Now = erlang:system_time(millisecond),
+    [Effect#{run_id => RunId}
+     || Effect <- lists:sort(Effects),
+        pending_effect_visible(Effect, Now)].
+
+pending_effect_visible(#{visible_at_ms := VisibleAtMs}, Now)
+  when is_integer(VisibleAtMs) ->
+    VisibleAtMs =< Now;
+pending_effect_visible(_Effect, _Now) ->
+    true.
 
 cancel_run_with_new_lease(RunId, Reason) ->
     append_control_with_new_lease(

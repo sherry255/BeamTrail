@@ -126,6 +126,8 @@ postgres_external_step_waits_for_worker_completion() ->
           undefined, 100, erlang:system_time(millisecond)),
 
     [Effect] = PendingEffects,
+    ?assert(is_integer(maps:get(visible_at_ms, Effect))),
+    ?assertEqual(30000, maps:get(visibility_timeout_ms, Effect)),
     EffectId = maps:get(effect_id, Effect),
     {ok, State1} =
         beamtrail:complete_effect(RunId, EffectId,

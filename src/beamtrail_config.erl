@@ -1,10 +1,11 @@
 -module(beamtrail_config).
 
 -export([storage/0, ensure_storage/0, preload_workflows/0,
-         max_recoveries_per_attempt/0]).
+         max_recoveries_per_attempt/0, external_effect_visibility_timeout_ms/0]).
 
 -define(STORAGE_DEFAULT, beamtrail_memory_storage).
 -define(DEFAULT_MAX_RECOVERIES_PER_ATTEMPT, 3).
+-define(DEFAULT_EXTERNAL_EFFECT_VISIBILITY_TIMEOUT_MS, 30000).
 
 storage() ->
     case application:get_env(beamtrail, storage_adapter) of
@@ -40,6 +41,10 @@ max_recoveries_per_attempt() ->
         _ ->
             ?DEFAULT_MAX_RECOVERIES_PER_ATTEMPT
     end.
+
+external_effect_visibility_timeout_ms() ->
+    positive_or_infinity_env_ms(external_effect_visibility_timeout_ms,
+                                ?DEFAULT_EXTERNAL_EFFECT_VISIBILITY_TIMEOUT_MS).
 
 preload_workflows() ->
     case workflow_modules() of
@@ -105,6 +110,16 @@ module_atom(Module) when is_list(Module) ->
     end;
 module_atom(Module) ->
     {error, {bad_workflow_module, Module}}.
+
+positive_or_infinity_env_ms(Key, Default) ->
+    case application:get_env(beamtrail, Key) of
+        {ok, infinity} ->
+            infinity;
+        {ok, Ms} when is_integer(Ms), Ms >= 0 ->
+            Ms;
+        _ ->
+            Default
+    end.
 
 charlist(List) ->
     lists:all(fun is_integer/1, List).

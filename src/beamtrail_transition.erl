@@ -463,9 +463,11 @@ attempt_start_event_specs(StepId, StepVersion, IdempotencyKey, AttemptNo,
                      effect_type => EffectType,
                      owner_node => owner(),
                      step_input => StepInput}),
+    ScheduledExtra = scheduled_effect_visibility(EffectType),
     Scheduled =
         activity_event_spec('activity.scheduled', StepId, StepVersion,
-                            IdempotencyKey, AttemptNo, EffectId, EffectType),
+                            IdempotencyKey, AttemptNo, EffectId, EffectType,
+                            ScheduledExtra),
     case EffectType of
         external_step ->
             [AttemptStarted, Scheduled];
@@ -475,6 +477,13 @@ attempt_start_event_specs(StepId, StepVersion, IdempotencyKey, AttemptNo,
                                     IdempotencyKey, AttemptNo, EffectId, EffectType),
             [AttemptStarted, Scheduled, Started]
     end.
+
+scheduled_effect_visibility(external_step) ->
+    #{visible_at_ms => erlang:system_time(millisecond),
+      visibility_timeout_ms =>
+          beamtrail_config:external_effect_visibility_timeout_ms()};
+scheduled_effect_visibility(_EffectType) ->
+    #{}.
 
 execution_spec(RunId, Workflow, StepId, Input, Attempt) ->
     StepVersion = maps:get(step_version, Attempt),
@@ -841,8 +850,14 @@ activity_event_spec(EventType, StepId, Attempt) ->
 
 activity_event_spec(EventType, StepId, StepVersion, IdempotencyKey, AttemptNo,
                     EffectId, EffectType) ->
+    activity_event_spec(EventType, StepId, StepVersion, IdempotencyKey,
+                        AttemptNo, EffectId, EffectType, #{}).
+
+activity_event_spec(EventType, StepId, StepVersion, IdempotencyKey, AttemptNo,
+                    EffectId, EffectType, Extra) ->
     event_spec(EventType, StepId, StepVersion, IdempotencyKey,
-               activity_payload(EventType, AttemptNo, EffectId, EffectType)).
+               activity_payload(EventType, AttemptNo, EffectId, EffectType,
+                                Extra)).
 
 activity_failed_event_spec(StepId, Attempt, FailurePayload) ->
     event_spec('activity.failed',
@@ -854,9 +869,6 @@ activity_failed_event_spec(StepId, Attempt, FailurePayload) ->
                                 effect_id_from_attempt(StepId, Attempt),
                                 effect_type_from_attempt(Attempt),
                                 FailurePayload)).
-
-activity_payload(EventType, AttemptNo, EffectId, EffectType) ->
-    activity_payload(EventType, AttemptNo, EffectId, EffectType, #{}).
 
 activity_payload(EventType, AttemptNo, EffectId, EffectType, Extra) ->
     Extra#{activity_type => step,

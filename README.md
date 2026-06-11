@@ -58,7 +58,7 @@ Not in scope yet:
 
 - DAGs, fan-out/fan-in, or parallel command batches
 - Timer cancellation, recurring timers, or child workflows
-- External effect visibility timeouts, deadlines, or claim leases
+- External effect claim leases, deadlines, or automatic timeout failure
 - First-class human task assignment, forms, escalation, or RBAC
 - HTTP API or browser UI
 - SQL-native JSON inspection
@@ -277,7 +277,9 @@ a step that should be scheduled for an outside worker instead of executed by the
 active runner. External steps are exposed through `beamtrail:list_pending_effects/0`
 and completed with `beamtrail:complete_effect/3`.
 
-External effects currently have no visibility timeout, deadline, or automatic
+External effects carry `visible_at_ms` metadata and
+`beamtrail:list_pending_effects/0` only returns effects that are visible at the
+time of the call. They do not yet have claim leases, deadlines, or an automatic
 failure path. If no worker completes a pending external effect, the run remains
 in `waiting_effect` and recovery will not re-dispatch it. Workers must monitor
 pending effects and retry `complete_effect/3` on transient errors such as
@@ -315,6 +317,10 @@ Set application environment before starting `beamtrail`:
 - `postgres_pool_checkout_timeout_ms`: checkout wait timeout, default `5000`
 - `postgres_pool_reconnect_interval_ms`: reconnect interval after a pooled
   connection replacement fails, default `1000`
+- `external_effect_visibility_timeout_ms`: metadata recorded on newly scheduled
+  external effects, default `30000`. The current runtime records it for worker
+  coordination, but does not yet enforce claim leases or automatic timeout
+  failure.
 - `workflow_modules`: workflow modules to preload on application start. This
   keeps PostgreSQL's safe external-term decoding from failing on atoms whose
   modules are present in the release but have not been loaded yet.

@@ -244,13 +244,13 @@ pass the original workflow input to every step; decider workflows can choose
 explicit step inputs from the reduced view.
 
 External effects are a minimal worker handoff, not a full task queue. The current
-runtime exposes pending external effects and accepts `complete_effect/3`, but it
-does not yet provide effect claim leases, visibility timeouts, deadlines, or
-automatic failure of abandoned external work. A run in `waiting_effect` is not
-recoverable by the scanner; if no worker completes the effect, the run remains
-pending until an operator or worker completes it. The next step is an effect
-deadline or visibility-timeout mechanism that can turn abandoned work into a
-retry or terminal failure.
+runtime exposes visible pending external effects and accepts `complete_effect/3`,
+but it does not yet provide effect claim leases, deadlines, or automatic failure
+of abandoned external work. `visible_at_ms` is a listing gate, not ownership. A
+run in `waiting_effect` is not recoverable by the scanner; if no worker completes
+the effect, the run remains pending until an operator or worker completes it. The
+next step is an effect claim/deadline mechanism that can turn abandoned work into
+a retry or terminal failure.
 
 The decider is deliberately not a Temporal-style arbitrary workflow-code replay
 system; it is a deterministic callback over a reduced view that returns the next
