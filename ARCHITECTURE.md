@@ -79,8 +79,10 @@ Important event types:
   attempt and step events below.
 - External step effects emit `attempt.started` and `activity.scheduled`, then
   stop in `waiting_effect` until an outside worker calls `complete_effect/3`.
-  They deliberately do not emit `activity.started` until a future worker-claim
-  protocol exists.
+  They do not emit `activity.started`; worker ownership is tracked by
+  `effect.claimed`. If `external_effect_timeout_ms` is configured, the scheduled
+  activity carries `deadline_at_ms` and a due deadline makes the run recoverable
+  so the effect can fail through the normal retry policy.
 - `step.succeeded` records a completed step and advances to the next step.
 - `step.failed` records a failed attempt.
 - `retry.scheduled` records the retry decision and `next_retry_at`.
@@ -246,12 +248,12 @@ explicit step inputs from the reduced view.
 External effects are a minimal worker handoff, not a full task queue. The current
 runtime exposes visible pending external effects, records `effect.claimed`
 events, and accepts token-fenced `complete_effect/4`. `visible_at_ms` gates
-listing; `claim_until_ms` hides claimed work until the claim expires. It does not
-yet provide deadlines or automatic failure of abandoned external work. A run in
-`waiting_effect` is not recoverable by the scanner; if no worker completes the
-effect, the run remains pending until a worker claims or completes it. The next
-step is an effect deadline mechanism that can turn abandoned work into a retry or
-terminal failure.
+listing; `claim_until_ms` hides claimed work until the claim expires. By default
+there is no overall deadline. When `external_effect_timeout_ms` is configured,
+`deadline_at_ms` is stored on the scheduled activity and a due deadline makes the
+`waiting_effect` run recoverable; dispatch then records
+`external_effect_timeout` through the same atomic failure/retry decision path as
+local step failures.
 
 The decider is deliberately not a Temporal-style arbitrary workflow-code replay
 system; it is a deterministic callback over a reduced view that returns the next

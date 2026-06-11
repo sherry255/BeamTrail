@@ -336,7 +336,7 @@ candidate_status(Reduced, NowMs) ->
             case maps:get(status, Reduced) of
                 retrying -> maps:get(next_retry_at, Reduced, 0) =< NowMs;
                 waiting -> wake_due(Reduced, NowMs);
-                waiting_effect -> false;
+                waiting_effect -> external_effect_deadline_due(Reduced, NowMs);
                 _ -> true
             end
     end.
@@ -346,6 +346,16 @@ wake_due(Reduced, NowMs) ->
         WakeAt when is_integer(WakeAt) -> WakeAt =< NowMs;
         _ -> false
     end.
+
+external_effect_deadline_due(Reduced, NowMs) ->
+    lists:any(
+      fun(#{effect_type := external_step, deadline_at_ms := DeadlineAt})
+            when is_integer(DeadlineAt) ->
+              DeadlineAt =< NowMs;
+         (_Effect) ->
+              false
+      end,
+      maps:values(maps:get(pending_effects, Reduced, #{}))).
 
 lease_open(undefined, _NowMs) -> true;
 lease_open(Lease, NowMs) -> maps:get(lease_until, Lease) =< NowMs.

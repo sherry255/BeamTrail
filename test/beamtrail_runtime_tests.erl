@@ -14,6 +14,7 @@ durable_runtime_test_() ->
       fun complete_effect_ignores_cancelled_pending_call_step/0,
       fun complete_effect_failure_uses_retry_decision/0,
       fun external_step_waits_for_worker_completion/0,
+      fun external_step_deadline_fails_abandoned_effect/0,
       fun list_pending_effects_filters_future_visible_at/0,
       fun claim_effect_hides_pending_effect_until_claim_expires/0,
       fun complete_effect_requires_active_claim_token/0,
@@ -37,7 +38,8 @@ setup() ->
 cleanup(_) ->
     stop_runner_infra(),
     ok = beamtrail_memory_storage:reset(),
-    ok = application:unset_env(beamtrail, external_effect_visibility_timeout_ms).
+    ok = application:unset_env(beamtrail, external_effect_visibility_timeout_ms),
+    ok = application:unset_env(beamtrail, external_effect_timeout_ms).
 
 successful_workflow_writes_append_only_events_and_snapshot() ->
     Input = #{order_id => <<"order-1">>, test_pid => self()},
@@ -257,6 +259,31 @@ external_step_waits_for_worker_completion() ->
     ?assertEqual(external_step,
                  maps:get(effect_type, maps:get(payload, ActivityScheduled))),
     ?assertEqual(0, count_events('activity.started', Events)).
+
+external_step_deadline_fails_abandoned_effect() ->
+    ok = application:set_env(beamtrail, external_effect_timeout_ms, 20),
+    RunId = <<"external-step-deadline-run">>,
+    Input = #{order_id => <<"external-deadline">>, test_pid => self()},
+    {ok, RunId} =
+        beamtrail:start_workflow(bt_external_step_workflow, Input,
+                                 #{run_id => RunId}),
+    ok = wait_for_status(RunId, waiting_effect, 1000),
+    ?assertEqual(timeout, receive_exec_short()),
+
+    timer:sleep(30),
+    {ok, _Recovered} = beamtrail:recover_unfinished(),
+    {ok, Failed} = beamtrail:await_terminal(RunId, 1000),
+    ?assertMatch(#{status := failed, terminal := true}, Failed),
+    ?assertEqual(#{}, maps:get(pending_effects, Failed)),
+    ?assertMatch(#{reason := external_effect_timeout,
+                   class := external_effect_timeout},
+                 maps:get(failure, Failed)),
+
+    {ok, []} = beamtrail:list_pending_effects(),
+    {ok, Events} = beamtrail:events(RunId),
+    ?assertEqual(1, count_events('step.failed', Events)),
+    ?assertEqual(1, count_events('activity.failed', Events)),
+    ?assertEqual(1, count_events('workflow.failed', Events)).
 
 list_pending_effects_filters_future_visible_at() ->
     HiddenRunId = <<"future-visible-effect-run">>,

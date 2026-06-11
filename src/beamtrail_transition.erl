@@ -109,6 +109,17 @@ dispatch_ready(RunId, State, Lease, Options) ->
         true ->
             fail_workflow_with_timeout(RunId, State, Lease);
         false ->
+            dispatch_not_timed_out_or_effect_timed_out(RunId, State, Lease,
+                                                       Options)
+    end.
+
+dispatch_not_timed_out_or_effect_timed_out(RunId, State, Lease, Options) ->
+    case due_external_effect_attempt(State) of
+        {ok, Attempt} ->
+            handle_step_failure_state(RunId, State, Attempt,
+                                      external_effect_timeout, Lease,
+                                      Options#{runner_state => State});
+        false ->
             dispatch_not_timed_out(RunId, State, Lease, Options)
     end.
 
@@ -479,7 +490,17 @@ attempt_start_event_specs(StepId, StepVersion, IdempotencyKey, AttemptNo,
     end.
 
 scheduled_effect_visibility(external_step) ->
-    #{visible_at_ms => erlang:system_time(millisecond),
+    Now = erlang:system_time(millisecond),
+    DeadlineFields =
+        case beamtrail_config:external_effect_timeout_ms() of
+            infinity ->
+                #{};
+            TimeoutMs when is_integer(TimeoutMs), TimeoutMs >= 0 ->
+                #{deadline_at_ms => Now + TimeoutMs,
+                  timeout_ms => TimeoutMs}
+        end,
+    DeadlineFields#{
+      visible_at_ms => Now,
       visibility_timeout_ms =>
           beamtrail_config:external_effect_visibility_timeout_ms()};
 scheduled_effect_visibility(_EffectType) ->
@@ -893,6 +914,24 @@ effect_payload_fields(StepId, Attempt) ->
 
 effect_type_from_attempt(Attempt) ->
     maps:get(effect_type, Attempt, call_step).
+
+due_external_effect_attempt(State) ->
+    case maps:get(pending_attempt, State, undefined) of
+        #{effect_type := external_step, step_id := StepId} = Attempt ->
+            EffectId = effect_id_from_attempt(StepId, Attempt),
+            Now = erlang:system_time(millisecond),
+            case maps:get(EffectId, maps:get(pending_effects, State, #{}),
+                          undefined) of
+                #{deadline_at_ms := DeadlineAt} when is_integer(DeadlineAt),
+                                                    DeadlineAt =< Now ->
+                    {ok, Attempt#{effect_id => EffectId,
+                                  effect_type => external_step}};
+                _ ->
+                    false
+            end;
+        _ ->
+            false
+    end.
 
 event_spec(EventType, StepId, StepVersion, IdempotencyKey, Payload) ->
     #{event_type => EventType,

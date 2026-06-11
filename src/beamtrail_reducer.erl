@@ -112,15 +112,18 @@ apply_event_type('step.succeeded', State, Event) ->
     Steps = maps:get(steps, State),
     Payload = maps:get(payload, Event),
     Result = maps:get(result, Payload, undefined),
-    State#{status => running,
-           current_step => next_step(Steps, CompletedSteps),
-           completed_steps => CompletedSteps,
-           pending_attempt => undefined,
-           attempts => update_latest_attempt(StepId, succeeded, Event, State),
-           results => maps:get(results, State) ++
-               [result_entry(StepId, Result, Event, State)],
-           pending_effects => clear_event_effect(Event, State),
-           failure => undefined};
+    PendingEffects = clear_event_effect(Event, State),
+    State1 =
+        State#{status => running,
+               current_step => next_step(Steps, CompletedSteps),
+               completed_steps => CompletedSteps,
+               pending_attempt => undefined,
+               attempts => update_latest_attempt(StepId, succeeded, Event, State),
+               results => maps:get(results, State) ++
+                   [result_entry(StepId, Result, Event, State)],
+               pending_effects => PendingEffects,
+               failure => undefined},
+    State1#{next_wake_at => next_pending_wake_at(State1)};
 apply_event_type('timer.scheduled', State, Event) ->
     Payload = maps:get(payload, Event),
     TimerId = maps:get(timer_id, Payload),
@@ -135,10 +138,10 @@ apply_event_type('timer.scheduled', State, Event) ->
           fired_event_seq => undefined,
           fired_at => undefined},
     Timers = maps:put(TimerId, Timer, maps:get(timers, State, #{})),
-    State#{status => running,
-           timers => Timers,
-           next_wake_at => next_wake_at(Timers),
-           next_retry_at => undefined};
+    State1 = State#{status => running,
+                    timers => Timers,
+                    next_retry_at => undefined},
+    State1#{next_wake_at => next_pending_wake_at(State1)};
 apply_event_type('timer.fired', State, Event) ->
     Payload = maps:get(payload, Event),
     TimerId = maps:get(timer_id, Payload),
@@ -154,26 +157,33 @@ apply_event_type('timer.fired', State, Event) ->
                     fired_at => maps:get(fired_at, Payload,
                                          maps:get(occurred_at, Event, undefined))},
     Timers = maps:put(TimerId, Timer, Timers0),
-    State#{status => running,
-           timers => Timers,
-           next_wake_at => next_wake_at(Timers),
-           next_retry_at => undefined};
+    State1 = State#{status => running,
+                    timers => Timers,
+                    next_retry_at => undefined},
+    State1#{next_wake_at => next_pending_wake_at(State1)};
 apply_event_type('step.failed', State, Event) ->
     StepId = maps:get(step_id, Event),
     Payload = maps:get(payload, Event),
-    State#{status => failed,
-           pending_attempt => undefined,
-           pending_effects => clear_event_effect(Event, State),
-           failure => Payload,
-           attempts => update_latest_attempt(StepId, failed, Event, State)};
+    PendingEffects = clear_event_effect(Event, State),
+    State1 =
+        State#{status => failed,
+               pending_attempt => undefined,
+               pending_effects => PendingEffects,
+               failure => Payload,
+               attempts => update_latest_attempt(StepId, failed, Event, State)},
+    State1#{next_wake_at => next_pending_wake_at(State1)};
 apply_event_type('activity.scheduled', State, Event) ->
     update_pending_effect_status(State, Event, scheduled);
 apply_event_type('activity.started', State, Event) ->
     update_pending_effect_status(State, Event, started);
 apply_event_type('activity.succeeded', State, Event) ->
-    State#{pending_effects => clear_event_effect(Event, State)};
+    PendingEffects = clear_event_effect(Event, State),
+    State1 = State#{pending_effects => PendingEffects},
+    State1#{next_wake_at => next_pending_wake_at(State1)};
 apply_event_type('activity.failed', State, Event) ->
-    State#{pending_effects => clear_event_effect(Event, State)};
+    PendingEffects = clear_event_effect(Event, State),
+    State1 = State#{pending_effects => PendingEffects},
+    State1#{next_wake_at => next_pending_wake_at(State1)};
 apply_event_type('effect.claimed', State, Event) ->
     update_pending_effect_claim(State, Event);
 apply_event_type('retry.scheduled', State, Event) ->
@@ -281,9 +291,15 @@ update_pending_effect_status(State, Event, Status) ->
 
 merge_effect_visibility(scheduled, Payload, Effect) ->
     maybe_put_payload_field(
-      visibility_timeout_ms,
+      deadline_at_ms,
       Payload,
-      maybe_put_payload_field(visible_at_ms, Payload, Effect));
+      maybe_put_payload_field(
+        timeout_ms,
+        Payload,
+        maybe_put_payload_field(
+          visibility_timeout_ms,
+          Payload,
+          maybe_put_payload_field(visible_at_ms, Payload, Effect))));
 merge_effect_visibility(_Status, _Payload, Effect) ->
     Effect.
 
@@ -330,8 +346,9 @@ pending_effect_from_activity(Event, Payload, EffectId) ->
           maps:get(visibility_timeout_ms, Payload, undefined)}.
 
 maybe_wait_for_external_effect(State, #{effect_type := external_step}, scheduled) ->
-    State#{status => waiting_effect,
-           next_retry_at => undefined};
+    State1 = State#{status => waiting_effect,
+                    next_retry_at => undefined},
+    State1#{next_wake_at => next_pending_wake_at(State1)};
 maybe_wait_for_external_effect(State, _Effect, _Status) ->
     State.
 
@@ -393,12 +410,21 @@ result_entry(StepId, Result, Event, State) ->
       event_seq => maps:get(event_seq, Event),
      result => Result}.
 
-next_wake_at(Timers) ->
-    Scheduled =
-        [FireAt || #{status := scheduled, fire_at_ms := FireAt}
-                       <- maps:values(Timers),
-                   is_integer(FireAt)],
-    case Scheduled of
+next_pending_wake_at(State) ->
+    Wakes = timer_wakes(maps:get(timers, State, #{})) ++
+        effect_deadline_wakes(maps:get(pending_effects, State, #{})),
+    case Wakes of
         [] -> undefined;
-        _ -> lists:min(Scheduled)
+        _ -> lists:min(Wakes)
     end.
+
+timer_wakes(Timers) ->
+    [FireAt || #{status := scheduled, fire_at_ms := FireAt}
+                   <- maps:values(Timers),
+               is_integer(FireAt)].
+
+effect_deadline_wakes(PendingEffects) ->
+    [DeadlineAt
+     || #{effect_type := external_step, deadline_at_ms := DeadlineAt}
+            <- maps:values(PendingEffects),
+        is_integer(DeadlineAt)].

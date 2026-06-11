@@ -284,13 +284,16 @@ then complete it with the returned `claim_token` via `beamtrail:complete_effect/
 Active claims hide the effect until `claim_until_ms`; expired claims become
 visible again and can be claimed by another worker. `complete_effect/3` remains
 available for unclaimed effects, but an actively claimed effect must be completed
-with the matching token. External effects do not yet have deadlines or an
-automatic failure path. If no worker completes a pending external effect, the run
-remains in `waiting_effect` and recovery will not re-dispatch it. Workers must
-retry `claim_effect/3` or `complete_effect/4` on transient errors such as
-`{error, leased}`. The state returned from `complete_effect/4` is the immediate
-post-completion transition state; use `await_terminal/2` or `describe/1` to
-observe final workflow completion.
+with the matching token.
+
+By default external effects have no overall deadline. Configure
+`external_effect_timeout_ms` to make an abandoned external effect recoverable
+after the deadline; recovery records the effect as `external_effect_timeout` and
+uses the step's normal retry policy to either retry or fail the workflow.
+Workers must retry `claim_effect/3` or `complete_effect/4` on transient errors
+such as `{error, leased}`. The state returned from `complete_effect/4` is the
+immediate post-completion transition state; use `await_terminal/2` or
+`describe/1` to observe final workflow completion.
 
 Workflow modules may also implement a deterministic `decide/1` callback to
 choose one durable command at a time. If `decide/1` is present, optional
@@ -323,9 +326,13 @@ Set application environment before starting `beamtrail`:
 - `postgres_pool_reconnect_interval_ms`: reconnect interval after a pooled
   connection replacement fails, default `1000`
 - `external_effect_visibility_timeout_ms`: visibility and claim lease interval
-  for external effects, default `30000`. The current runtime uses it to hide
-  claimed effects until the claim expires, but does not yet turn expired work
-  into automatic retry or failure.
+  for external effects, default `30000`. This controls when unclaimed or expired
+  claimed work appears in `list_pending_effects/0`; it is not an overall effect
+  deadline.
+- `external_effect_timeout_ms`: optional overall deadline for pending external
+  effects, default `infinity`. When set, abandoned external work fails with
+  `external_effect_timeout` after the deadline and then follows the step retry
+  policy.
 - `workflow_modules`: workflow modules to preload on application start. This
   keeps PostgreSQL's safe external-term decoding from failing on atoms whose
   modules are present in the release but have not been loaded yet.
@@ -395,8 +402,9 @@ suite on every push to `main` and on pull requests.
 PostgreSQL stores payloads, idempotency keys, leases, and snapshots as Erlang
 external-term-format `bytea` values. Replay fidelity comes first. Operational
 projections that the engine needs to query — the recovery-scan index columns
-(`status`, `terminal`, `next_retry_at_ms`) on `workflow_runs` — are kept as
-structured columns derived from the reducer, never by inspecting payload blobs.
+(`status`, `terminal`, `next_retry_at_ms`, `next_wake_at_ms`, and `parked`) on
+`workflow_runs` — are kept as structured columns derived from the reducer, never
+by inspecting payload blobs.
 
 BeamTrail decodes these terms with `binary_to_term/2` in safe mode. Configure
 `workflow_modules` in releases so workflow module atoms and step atoms are

@@ -236,7 +236,7 @@ list_recoverable_run_ids(Cursor, Limit, NowMs) ->
       end).
 
 %% Coarse recovery candidates at NowMs: not terminal, not parked, not waiting
-%% on a future retry/timer wake, and not currently leased. The
+%% on a future retry/timer/effect wake, and not currently leased. The
 %% lease is read live via LEFT JOIN (never denormalized into workflow_runs,
 %% which is updated in a different transaction).
 %% Mirrors beamtrail:recoverable_by_status/1 + lease_recoverable/1, minus the
@@ -246,7 +246,7 @@ recoverable_query(undefined, Limit, NowMs) ->
      "LEFT JOIN workflow_leases l ON l.run_id = r.run_id "
      "WHERE r.terminal = false "
      "AND r.parked = false "
-     "AND r.status <> 'waiting_effect' "
+     "AND (r.status <> 'waiting_effect' OR r.next_wake_at_ms <= $1) "
      "AND (r.status <> 'waiting' OR r.next_wake_at_ms <= $1) "
      "AND (r.status <> 'retrying' OR r.next_retry_at_ms <= $1) "
      "AND (l.lease_until_ms IS NULL OR l.lease_until_ms <= $1) "
@@ -257,7 +257,7 @@ recoverable_query(Cursor, Limit, NowMs) ->
      "LEFT JOIN workflow_leases l ON l.run_id = r.run_id "
      "WHERE r.terminal = false "
      "AND r.parked = false "
-     "AND r.status <> 'waiting_effect' "
+     "AND (r.status <> 'waiting_effect' OR r.next_wake_at_ms <= $1) "
      "AND (r.status <> 'waiting' OR r.next_wake_at_ms <= $1) "
      "AND (r.status <> 'retrying' OR r.next_retry_at_ms <= $1) "
      "AND (l.lease_until_ms IS NULL OR l.lease_until_ms <= $1) "
@@ -560,8 +560,9 @@ project_event(#{event_type := 'retry.scheduled', payload := Payload}, Acc) ->
 project_event(#{event_type := 'workflow.waiting'}, Acc) ->
     project_status(<<"waiting">>, false, null, false, Acc);
 project_event(#{event_type := 'activity.scheduled',
-                payload := #{effect_type := external_step}}, Acc) ->
-    project_status(<<"waiting_effect">>, false, null, false, Acc);
+                payload := #{effect_type := external_step} = Payload}, Acc) ->
+    project_status(<<"waiting_effect">>, false, null,
+                   maps:get(deadline_at_ms, Payload, null), false, Acc);
 project_event(#{event_type := 'signal.received'}, Acc) ->
     project_status(<<"running">>, false, null, false, Acc);
 project_event(#{event_type := 'workflow.completed'}, _Acc) ->
@@ -589,6 +590,10 @@ project_status(Status, Terminal, NextRetry, Parked, Acc) ->
         _ ->
             Base
     end.
+
+project_status(Status, Terminal, NextRetry, NextWake, Parked, _Acc) ->
+    #{status => Status, terminal => Terminal,
+      next_retry_at => NextRetry, next_wake_at => NextWake, parked => Parked}.
 
 project_next_wake(NextWake, no_change) ->
     #{next_wake_at => NextWake};

@@ -1,11 +1,13 @@
 -module(beamtrail_config).
 
 -export([storage/0, ensure_storage/0, preload_workflows/0,
-         max_recoveries_per_attempt/0, external_effect_visibility_timeout_ms/0]).
+         max_recoveries_per_attempt/0, external_effect_visibility_timeout_ms/0,
+         external_effect_timeout_ms/0]).
 
 -define(STORAGE_DEFAULT, beamtrail_memory_storage).
 -define(DEFAULT_MAX_RECOVERIES_PER_ATTEMPT, 3).
 -define(DEFAULT_EXTERNAL_EFFECT_VISIBILITY_TIMEOUT_MS, 30000).
+-define(DEFAULT_EXTERNAL_EFFECT_TIMEOUT_MS, infinity).
 
 storage() ->
     case application:get_env(beamtrail, storage_adapter) of
@@ -45,6 +47,10 @@ max_recoveries_per_attempt() ->
 external_effect_visibility_timeout_ms() ->
     positive_or_infinity_env_ms(external_effect_visibility_timeout_ms,
                                 ?DEFAULT_EXTERNAL_EFFECT_VISIBILITY_TIMEOUT_MS).
+
+external_effect_timeout_ms() ->
+    positive_or_infinity_env_ms(external_effect_timeout_ms,
+                                ?DEFAULT_EXTERNAL_EFFECT_TIMEOUT_MS).
 
 preload_workflows() ->
     case workflow_modules() of

@@ -13,6 +13,7 @@ postgres_integration_test_() ->
              [fun postgres_workflow_survives_application_restart/0,
               fun postgres_complete_effect_finishes_pending_call_step/0,
               fun postgres_external_step_waits_for_worker_completion/0,
+              fun postgres_external_step_deadline_uses_recoverable_index/0,
               fun postgres_claim_effect_requires_token_completion/0,
               fun postgres_recovery_replays_unfinished_attempt_after_restart/0,
               fun postgres_recovery_budget_exceeded_fails_open_attempt/0,
@@ -39,6 +40,7 @@ setup(Config) ->
     ok = application:unset_env(beamtrail, worker_max_children),
     ok = application:unset_env(beamtrail, lease_ttl_ms),
     ok = application:unset_env(beamtrail, max_recoveries_per_attempt),
+    ok = application:unset_env(beamtrail, external_effect_timeout_ms),
     ok = application:set_env(beamtrail, storage_adapter,
                              beamtrail_postgres_storage),
     ok = application:set_env(beamtrail, postgres, Config),
@@ -55,6 +57,7 @@ cleanup(_) ->
     ok = application:unset_env(beamtrail, worker_max_children),
     ok = application:unset_env(beamtrail, lease_ttl_ms),
     ok = application:unset_env(beamtrail, max_recoveries_per_attempt),
+    ok = application:unset_env(beamtrail, external_effect_timeout_ms),
     ok = application:unset_env(beamtrail, storage_adapter),
     ok = application:unset_env(beamtrail, postgres),
     ok = application:unset_env(beamtrail, postgres_pool_size),
@@ -148,6 +151,33 @@ postgres_external_step_waits_for_worker_completion() ->
         'activity.succeeded',
         'workflow.completed'],
        [maps:get(event_type, E) || E <- Events]).
+
+postgres_external_step_deadline_uses_recoverable_index() ->
+    ok = application:set_env(beamtrail, external_effect_timeout_ms, 500),
+    RunId = unique_run_id("pg-external-deadline"),
+    Input = #{order_id => RunId, test_pid => self()},
+    {ok, RunId} =
+        beamtrail:start_workflow(bt_external_step_workflow, Input,
+                                 #{run_id => RunId}),
+    {ok, _Waiting} = wait_for_state(RunId, waiting_effect, 1000),
+    Now0 = erlang:system_time(millisecond),
+    {ok, #{run_ids := []}} =
+        beamtrail_postgres_storage:list_recoverable_run_ids(undefined, 100, Now0),
+
+    timer:sleep(550),
+    Now1 = erlang:system_time(millisecond),
+    {ok, #{run_ids := CandidateRunIds}} =
+        beamtrail_postgres_storage:list_recoverable_run_ids(undefined, 100, Now1),
+    ?assert(lists:member(RunId, CandidateRunIds)),
+
+    {ok, ScannedRunIds} = beamtrail_scanner:scan_now(),
+    ?assert(lists:member(RunId, ScannedRunIds)),
+    {ok, Failed} = beamtrail:await_terminal(RunId, 1000),
+    ?assertMatch(#{status := failed, terminal := true}, Failed),
+    ?assertEqual(#{}, maps:get(pending_effects, Failed)),
+    ?assertMatch(#{reason := external_effect_timeout,
+                   class := external_effect_timeout},
+                 maps:get(failure, Failed)).
 
 postgres_claim_effect_requires_token_completion() ->
     RunId = unique_run_id("pg-claim-effect"),

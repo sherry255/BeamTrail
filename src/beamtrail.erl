@@ -1120,7 +1120,7 @@ recoverable_by_status(State) ->
         waiting ->
             wake_due(State);
         waiting_effect ->
-            false;
+            external_effect_deadline_due(State);
         _ ->
             true
     end.
@@ -1132,6 +1132,17 @@ wake_due(State) ->
         _ ->
             false
     end.
+
+external_effect_deadline_due(State) ->
+    Now = erlang:system_time(millisecond),
+    lists:any(
+      fun(#{effect_type := external_step, deadline_at_ms := DeadlineAt})
+            when is_integer(DeadlineAt) ->
+              DeadlineAt =< Now;
+         (_Effect) ->
+              false
+      end,
+      maps:values(maps:get(pending_effects, State, #{}))).
 
 lease_recoverable(RunId) ->
     Now = erlang:system_time(millisecond),
