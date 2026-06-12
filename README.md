@@ -385,6 +385,18 @@ complete the same attempt. The `approval` scenario kills VMs while approval
 workflows are waiting, then demonstrates both signal-driven completion and
 timer-driven timeout recovery. See `examples/crash_recovery/README.md`.
 
+External worker handoff demo:
+
+```sh
+examples/external_worker/run.sh
+```
+
+The external worker demo schedules a `charge` step for outside work, lets one
+worker claim it and stop before completion, waits for the claim to expire, then
+has another worker claim and complete the effect. It also demonstrates that the
+first worker's stale claim token cannot complete the effect after handoff. See
+`examples/external_worker/README.md`.
+
 PostgreSQL stress harness:
 
 ```sh
