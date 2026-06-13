@@ -20,6 +20,11 @@ The script starts a disposable PostgreSQL container, compiles the example
 modules, runs the workflow and worker loop, prints the event log, and removes
 the container unless `KEEP_BEAMTRAIL_EXTERNAL_WORKER=1` is set.
 
+The demo uses the low-level claim and complete APIs directly so it can show
+Worker A's stale claim token being rejected after Worker B reclaims the effect.
+For ordinary in-process workers, `beamtrail_external_worker:run_once/2` wraps the
+same list, claim, handle, and complete loop.
+
 The external worker result payload and claim owner use binary values on purpose.
 PostgreSQL payloads and effect-index terms are decoded with Erlang's safe
 external-term mode, so dynamic atoms created by a separate worker node are a

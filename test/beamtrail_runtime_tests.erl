@@ -21,6 +21,8 @@ durable_runtime_test_() ->
       fun claim_effect_hides_pending_effect_until_claim_expires/0,
       fun complete_effect_requires_active_claim_token/0,
       fun complete_effect_matches_legacy_external_attempt_by_effect_type/0,
+      fun external_worker_run_once_reclaims_expired_effect/0,
+      fun external_worker_run_once_leaves_claimed_effect_when_handler_crashes/0,
       fun retry_uses_stable_idempotency_key_across_attempts/0,
       fun recovery_replays_unknown_attempt_with_recorded_step_version/0,
       fun step_timeout_records_observable_failure/0
@@ -449,6 +451,84 @@ complete_effect_matches_legacy_external_attempt_by_effect_type() ->
     ?assertEqual(#{}, maps:get(pending_effects, State1)),
     {ok, Completed} = beamtrail:await_terminal(RunId, 1000),
     ?assertMatch(#{status := completed, terminal := true}, Completed).
+
+external_worker_run_once_reclaims_expired_effect() ->
+    ok = application:set_env(beamtrail, external_effect_visibility_timeout_ms, 20),
+    RunId = <<"external-worker-loop-run">>,
+    Input = #{order_id => <<"external-worker-loop">>, test_pid => self()},
+    {ok, RunId} =
+        beamtrail:start_workflow(bt_external_step_workflow, Input,
+                                 #{run_id => RunId}),
+    ok = wait_for_status(RunId, waiting_effect, 1000),
+    {ok, [Effect]} = beamtrail:list_pending_effects(),
+    EffectId = maps:get(effect_id, Effect),
+
+    {ok, ClaimA} = beamtrail:claim_effect(RunId, EffectId, <<"worker-a">>),
+    ?assertEqual({ok, idle},
+                 beamtrail_external_worker:run_once(
+                   <<"worker-b">>,
+                   fun(_ClaimedEffect) ->
+                           {ok, #{<<"external_result">> => <<"too_early">>}}
+                   end)),
+
+    timer:sleep(30),
+    TestPid = self(),
+    {ok, #{run_id := RunId,
+           effect_id := EffectId,
+           state := State1}} =
+        beamtrail_external_worker:run_once(
+          <<"worker-b">>,
+          fun(ClaimedEffect) ->
+                  TestPid ! {worker_claimed, ClaimedEffect},
+                  {ok, #{<<"external_result">> => <<"authorized">>}}
+          end),
+    ?assertEqual(#{}, maps:get(pending_effects, State1)),
+    ?assertMatch({worker_claimed,
+                  #{run_id := RunId,
+                    effect_id := EffectId,
+                    claim_owner := <<"worker-b">>,
+                    claim_token := _}},
+                 receive_exec()),
+    ?assertEqual({ok, ignored},
+                 beamtrail:complete_effect(
+                   RunId, EffectId, maps:get(claim_token, ClaimA),
+                   {ok, #{<<"external_result">> => <<"stale">>}})),
+    {ok, Completed} = beamtrail:await_terminal(RunId, 1000),
+    ?assertMatch(#{status := completed, terminal := true}, Completed),
+    ?assertEqual(timeout, receive_exec_short()),
+
+    {ok, Events} = beamtrail:events(RunId),
+    ?assertEqual(2, count_events('effect.claimed', Events)),
+    ?assertEqual(1, count_events('step.succeeded', Events)),
+    ?assertEqual(1, count_events('activity.succeeded', Events)).
+
+external_worker_run_once_leaves_claimed_effect_when_handler_crashes() ->
+    ok = application:set_env(beamtrail, external_effect_visibility_timeout_ms, 20),
+    RunId = <<"external-worker-crash-run">>,
+    Input = #{order_id => <<"external-worker-crash">>, test_pid => self()},
+    {ok, RunId} =
+        beamtrail:start_workflow(bt_external_step_workflow, Input,
+                                 #{run_id => RunId}),
+    ok = wait_for_status(RunId, waiting_effect, 1000),
+    {ok, [Effect]} = beamtrail:list_pending_effects(),
+    EffectId = maps:get(effect_id, Effect),
+
+    ?assertError(worker_crashed,
+                 beamtrail_external_worker:run_once(
+                   <<"worker-a">>,
+                   fun(_ClaimedEffect) ->
+                           error(worker_crashed)
+                   end)),
+    {ok, []} = beamtrail:list_pending_effects(),
+    {ok, EventsBeforeVisible} = beamtrail:events(RunId),
+    ?assertEqual(1, count_events('effect.claimed', EventsBeforeVisible)),
+    ?assertEqual(0, count_events('step.failed', EventsBeforeVisible)),
+    ?assertEqual(0, count_events('activity.failed', EventsBeforeVisible)),
+
+    timer:sleep(30),
+    {ok, [VisibleAgain]} = beamtrail:list_pending_effects(),
+    ?assertEqual(EffectId, maps:get(effect_id, VisibleAgain)),
+    ?assertEqual(<<"worker-a">>, maps:get(claim_owner, VisibleAgain)).
 
 retry_uses_stable_idempotency_key_across_attempts() ->
     Input = #{order_id => <<"order-2">>, test_pid => self()},

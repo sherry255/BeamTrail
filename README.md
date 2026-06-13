@@ -312,6 +312,40 @@ such as `{error, leased}`. The state returned from `complete_effect/4` is the
 immediate post-completion transition state; use `await_terminal/2` or
 `describe/1` to observe final workflow completion.
 
+For the smallest in-process worker loop, use `beamtrail_external_worker:run_once/2`:
+
+```erlang
+Handler =
+    fun(Effect) ->
+        %% Do the external work represented by Effect.
+        {ok, #{<<"external_result">> => <<"authorized">>}}
+    end,
+
+case beamtrail_external_worker:run_once(<<"billing-worker-1">>, Handler) of
+    {ok, idle} ->
+        no_visible_work;
+    {ok, #{run_id := RunId, effect_id := EffectId, state := State}} ->
+        {completed_effect, RunId, EffectId, State};
+    {error, Reason} ->
+        {worker_error, Reason}
+end.
+```
+
+`run_once/2` lists visible external effects, claims one, calls the handler with
+the claimed effect metadata, and completes it with the claim token. Handler
+exceptions are not converted into workflow failures; they crash the worker
+process, leaving the claim to expire so another worker can retry. Return
+`{error, Reason}` explicitly when the external work itself failed and the
+workflow should record that failure.
+
+External effects are delivered at least once. `run_once/2` does not renew the
+claim while the handler is running; if the handler runs longer than
+`external_effect_visibility_timeout_ms`, another worker may claim and execute
+the same effect before the first worker completes. Set the visibility timeout
+above the expected worst-case handler duration, and use the effect's
+`idempotency_key` as the downstream idempotency key for payments, HTTP APIs, or
+other side effects.
+
 Workflow modules may also implement a deterministic `decide/1` callback to
 choose one durable command at a time. If `decide/1` is present, optional
 `decider_version/0` defaults to `1`; changing it gates old runs as requiring
