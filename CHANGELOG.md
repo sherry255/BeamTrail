@@ -35,6 +35,21 @@ are pre-stable and may include breaking API or storage changes.
   into approve, reject, timeout, and stale-terminal safety paths.
 - Crash recovery demo approval scenario showing a waiting approval run surviving
   VM death, then resuming through either an approval signal or a deadline timer.
+- External step effects: workflow modules can mark steps as `external`, the
+  runtime records pending effects instead of executing them locally, and workers
+  can list and complete those effects through the public API.
+- External effect claim leases with `claim_token` fencing. Active claims hide
+  work until `claim_until_ms`, expired claims become visible again, and stale
+  claim tokens are rejected.
+- PostgreSQL `workflow_effects` operational index for visible external effects,
+  maintained in the same transaction as the event append and rebuildable with
+  `beamtrail_postgres_storage:backfill_effect_index/0`.
+- Optional external effect deadlines via `external_effect_timeout_ms`, allowing
+  abandoned external work to fail through the step retry policy.
+- `beamtrail_external_worker:run_once/2`, a minimal in-process external worker
+  loop that lists, claims, handles, and completes one visible external effect.
+- External worker handoff demo showing claim expiry, stale-token rejection, and
+  binary-safe worker result payloads against PostgreSQL.
 
 ## [0.2.0-pre.1] - 2026-06-03
 
