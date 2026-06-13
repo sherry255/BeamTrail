@@ -7,6 +7,10 @@ are pre-stable and may include breaking API or storage changes.
 
 ## [Unreleased]
 
+No changes yet.
+
+## [0.2.0-pre.2] - 2026-06-14
+
 ### Added
 
 - Reducer-level step result history and optional workflow result state, exposed
@@ -119,5 +123,7 @@ are pre-stable and may include breaking API or storage changes.
 - Initial BeamTrail MVP with event-sourced workflow state, memory storage,
   retry handling, timeouts, leases, snapshots, and early PostgreSQL hardening.
 
+[Unreleased]: https://github.com/sherry255/BeamTrail/compare/v0.2.0-pre.2...HEAD
+[0.2.0-pre.2]: https://github.com/sherry255/BeamTrail/compare/v0.2.0-pre.1...v0.2.0-pre.2
 [0.2.0-pre.1]: https://github.com/sherry255/BeamTrail/compare/v0.1.0...v0.2.0-pre.1
 [0.1.0]: https://github.com/sherry255/BeamTrail/releases/tag/v0.1.0

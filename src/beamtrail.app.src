@@ -1,6 +1,6 @@
 {application, beamtrail,
  [{description, "PostgreSQL-backed durable step runner for Erlang/OTP"},
-  {vsn, "0.2.0-pre.1"},
+  {vsn, "0.2.0-pre.2"},
   {registered, [beamtrail_memory_storage, beamtrail_postgres_pool,
                 beamtrail_run_registry, beamtrail_run_sup,
                 beamtrail_scanner]},

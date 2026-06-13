@@ -42,7 +42,7 @@ workflows, first-class human task assignment, HTTP APIs, or a browser UI.
 The next milestone is making the project easier to review, package, and trust as
 an Erlang library.
 
-- Publish `v0.2.0-pre.1` as a GitHub pre-release.
+- Publish `v0.2.0-pre.2` as a GitHub pre-release.
 - Add Hex package metadata and verify package contents.
 - Add `-spec` annotations on the public API and storage/workflow contracts.
 - Add Dialyzer to CI once the first useful specs are in place.
