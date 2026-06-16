@@ -5,7 +5,8 @@
          recover_unfinished/0]).
 -export([get_state/1, await_terminal/2, events/1, storage/0]).
 -export([cancel_run/2, park_run/2, resume_run/1, requeue_run/2]).
--export([signal_run/3, claim_effect/3, complete_effect/3, complete_effect/4,
+-export([signal_run/3, claim_effect/3, renew_effect_claim/3,
+         complete_effect/3, complete_effect/4,
          list_pending_effects/0]).
 -export([list_recoverable/0, list_recoverable/2,
          mark_recovery_requeued/1, mark_recovery_requeued_with_lease/1]).
@@ -409,6 +410,24 @@ claim_effect(RunId, EffectId, Owner) ->
             Error
     end.
 
+-spec renew_effect_claim(run_id(), term(), term()) -> effect_claim_result().
+renew_effect_claim(RunId, EffectId, ClaimToken) ->
+    ok = ensure_storage(),
+    case load_state(RunId) of
+        {ok, State} ->
+            case renew_effect_claim_candidate(State, EffectId, ClaimToken) of
+                renew ->
+                    renew_effect_claim_with_new_lease(RunId, EffectId,
+                                                      ClaimToken);
+                ignored ->
+                    {ok, ignored};
+                {error, _} = Error ->
+                    Error
+            end;
+        {error, _} = Error ->
+            Error
+    end.
+
 claim_effect_candidate(#{terminal := true}, _EffectId) ->
     ignored;
 claim_effect_candidate(#{parked := true}, _EffectId) ->
@@ -432,6 +451,17 @@ claim_effect_candidate(State, EffectId) ->
             Error
     end.
 
+renew_effect_claim_candidate(#{terminal := true}, _EffectId, _ClaimToken) ->
+    ignored;
+renew_effect_claim_candidate(#{parked := true}, _EffectId, _ClaimToken) ->
+    {error, parked};
+renew_effect_claim_candidate(State, EffectId, ClaimToken) ->
+    case pending_effect_completion_allowed(State, EffectId, ClaimToken) of
+        ok -> renew;
+        ignored -> ignored;
+        {error, _} = Error -> Error
+    end.
+
 claim_effect_with_new_lease(RunId, EffectId, Owner) ->
     case (storage()):acquire_lease(
            RunId, beamtrail_transition:owner(),
@@ -453,6 +483,29 @@ claim_effect_with_lease(RunId, Lease, EffectId, Owner) ->
         end,
     _ = beamtrail_lease_manager:release(RunId, FencingToken),
     Claim.
+
+renew_effect_claim_with_new_lease(RunId, EffectId, ClaimToken) ->
+    case (storage()):acquire_lease(
+           RunId, beamtrail_transition:owner(),
+           beamtrail_lease_manager:default_ttl_ms()) of
+        {ok, Lease} ->
+            renew_effect_claim_with_lease(RunId, Lease, EffectId, ClaimToken);
+        {error, _} = Error ->
+            Error
+    end.
+
+renew_effect_claim_with_lease(RunId, Lease, EffectId, ClaimToken) ->
+    FencingToken = beamtrail_lease_manager:fencing_token(Lease),
+    Renewal =
+        case load_state(RunId) of
+            {ok, State} ->
+                renew_effect_claim_locked(RunId, State, Lease, EffectId,
+                                          ClaimToken);
+            {error, _} = Error ->
+                Error
+        end,
+    _ = beamtrail_lease_manager:release(RunId, FencingToken),
+    Renewal.
 
 claim_effect_locked(_RunId, #{terminal := true}, _Lease, _EffectId, _Owner) ->
     {ok, ignored};
@@ -480,8 +533,35 @@ claim_effect_locked(RunId, State, Lease, EffectId, Owner) ->
             Error
     end.
 
+renew_effect_claim_locked(_RunId, #{terminal := true}, _Lease, _EffectId,
+                          _ClaimToken) ->
+    {ok, ignored};
+renew_effect_claim_locked(_RunId, #{parked := true}, _Lease, _EffectId,
+                          _ClaimToken) ->
+    {error, parked};
+renew_effect_claim_locked(RunId, State, Lease, EffectId, ClaimToken) ->
+    Now = erlang:system_time(millisecond),
+    case pending_effect(State, EffectId) of
+        {ok, Effect} ->
+            case pending_effect_claim_matches(Effect, ClaimToken, Now) of
+                ok ->
+                    Owner = maps:get(claim_owner, Effect, undefined),
+                    append_effect_claimed(RunId, State, Lease, Effect, Owner,
+                                          ClaimToken, Now);
+                {error, _} = Error ->
+                    Error
+            end;
+        ignored ->
+            {ok, ignored};
+        {error, _} = Error ->
+            Error
+    end.
+
 append_effect_claimed(RunId, State, Lease, Effect, Owner, Now) ->
-    ClaimToken = new_claim_token(),
+    append_effect_claimed(RunId, State, Lease, Effect, Owner,
+                          new_claim_token(), Now).
+
+append_effect_claimed(RunId, State, Lease, Effect, Owner, ClaimToken, Now) ->
     TimeoutMs =
         maps:get(visibility_timeout_ms, Effect,
                  beamtrail_config:external_effect_visibility_timeout_ms()),

@@ -4,8 +4,8 @@
 -export([steps/1, step_version/1, retry_policy/1, timeout_ms/1,
          idempotency_key/3, execute/4, effect_mode/1]).
 
-steps(_Input) ->
-    [external_charge].
+steps(Input) ->
+    maps:get(steps, Input, [external_charge]).
 
 step_version(_StepId) ->
     1.
@@ -20,6 +20,8 @@ idempotency_key(_RunId, StepId, Input) ->
     {StepId, maps:get(order_id, Input)}.
 
 effect_mode(external_charge) ->
+    external;
+effect_mode(external_refund) ->
     external.
 
 execute(StepId, StepVersion, Input, Ctx) ->

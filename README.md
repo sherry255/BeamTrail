@@ -311,6 +311,9 @@ Workers must retry `claim_effect/3` or `complete_effect/4` on transient errors
 such as `{error, leased}`. The state returned from `complete_effect/4` is the
 immediate post-completion transition state; use `await_terminal/2` or
 `describe/1` to observe final workflow completion.
+Long-running workers may extend an active claim with
+`beamtrail:renew_effect_claim/3`. Renewing keeps the same `claim_token` and only
+pushes `claim_until_ms` forward; completion still requires that token.
 
 For the smallest in-process worker loop, use `beamtrail_external_worker:run_once/2`:
 
@@ -331,6 +334,26 @@ case beamtrail_external_worker:run_once(<<"billing-worker-1">>, Handler) of
 end.
 ```
 
+`run_once/3` accepts a small options map:
+
+```erlang
+beamtrail_external_worker:run_once(
+  <<"billing-worker-1">>,
+  Handler,
+  #{step_ids => [external_charge],
+    effect_types => [external_step],
+    renew_claim => true,
+    claim_renew_interval_ms => 5000})
+```
+
+Use `step_ids` to keep heterogeneous workers from claiming work for steps they
+do not handle. `effect_types` defaults to all visible external effect types and
+currently only `external_step` is listed. With `renew_claim => true`, the helper
+renews the claim while the handler runs; `claim_renew_interval_ms` defaults to
+roughly one third of the effect's visibility timeout. If supplied explicitly,
+`claim_renew_interval_ms` must be positive and shorter than the effect's
+visibility timeout.
+
 `run_once/2` lists visible external effects, claims one, calls the handler with
 the claimed effect metadata, and completes it with the claim token. Handler
 exceptions are not converted into workflow failures; they crash the worker
@@ -338,13 +361,15 @@ process, leaving the claim to expire so another worker can retry. Return
 `{error, Reason}` explicitly when the external work itself failed and the
 workflow should record that failure.
 
-External effects are delivered at least once. `run_once/2` does not renew the
-claim while the handler is running; if the handler runs longer than
-`external_effect_visibility_timeout_ms`, another worker may claim and execute
-the same effect before the first worker completes. Set the visibility timeout
-above the expected worst-case handler duration, and use the effect's
+External effects are delivered at least once. If the handler runs longer than
+the claim visibility window and does not renew the claim, another worker may
+claim and execute the same effect before the first worker completes. Either set
+the visibility timeout above the expected worst-case handler duration or use
+`run_once/3` with claim renewal. In all cases, use the effect's
 `idempotency_key` as the downstream idempotency key for payments, HTTP APIs, or
-other side effects.
+other side effects. Claim renewal extends ownership while storage remains
+reachable, but a renewal failure does not interrupt a running handler; completion
+will fail with the normal claim-token errors if the claim was lost.
 
 Workflow modules may also implement a deterministic `decide/1` callback to
 choose one durable command at a time. If `decide/1` is present, optional

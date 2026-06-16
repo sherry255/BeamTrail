@@ -249,7 +249,14 @@ External effects are a minimal worker handoff, not a full task queue. The curren
 runtime exposes visible pending external effects, records `effect.claimed`
 events, and accepts token-fenced `complete_effect/4`. `visible_at_ms` gates
 listing; `claim_until_ms` hides claimed work until the claim expires. The
-PostgreSQL adapter keeps visible pending external effects in a derived
+`beamtrail_external_worker` helper can filter visible effects by `step_id` or
+effect type and can renew the active claim while a long handler runs. Claim
+renewal preserves the original token and extends only the visibility deadline;
+explicit renewal intervals must be shorter than the effect visibility timeout.
+If renewal fails, the helper does not interrupt the already-running handler, so
+workers still get at-least-once delivery and must use the effect's idempotency
+key for external side effects. The PostgreSQL adapter keeps visible pending
+external effects in a derived
 `workflow_effects` inbox index, updated in the same transaction as event appends;
 the event log remains authoritative and the index can be rebuilt from reduced
 state with `beamtrail_postgres_storage:backfill_effect_index/0`. Deployments

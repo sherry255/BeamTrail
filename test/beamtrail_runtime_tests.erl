@@ -23,6 +23,10 @@ durable_runtime_test_() ->
       fun complete_effect_matches_legacy_external_attempt_by_effect_type/0,
       fun external_worker_run_once_reclaims_expired_effect/0,
       fun external_worker_run_once_leaves_claimed_effect_when_handler_crashes/0,
+      fun external_worker_run_once_filters_by_step_id/0,
+      fun external_worker_run_once_renews_claim_while_handler_runs/0,
+      fun external_worker_run_once_rejects_unsafe_renew_interval/0,
+      fun external_worker_run_once_drains_renewer_stop_message/0,
       fun retry_uses_stable_idempotency_key_across_attempts/0,
       fun recovery_replays_unknown_attempt_with_recorded_step_version/0,
       fun step_timeout_records_observable_failure/0
@@ -530,6 +534,150 @@ external_worker_run_once_leaves_claimed_effect_when_handler_crashes() ->
     ?assertEqual(EffectId, maps:get(effect_id, VisibleAgain)),
     ?assertEqual(<<"worker-a">>, maps:get(claim_owner, VisibleAgain)).
 
+external_worker_run_once_filters_by_step_id() ->
+    ChargeRunId = <<"external-worker-filter-charge">>,
+    RefundRunId = <<"external-worker-filter-refund">>,
+    {ok, ChargeRunId} =
+        beamtrail:start_workflow(
+          bt_external_step_workflow,
+          #{order_id => <<"filter-charge">>,
+            steps => [external_charge],
+            test_pid => self()},
+          #{run_id => ChargeRunId}),
+    {ok, RefundRunId} =
+        beamtrail:start_workflow(
+          bt_external_step_workflow,
+          #{order_id => <<"filter-refund">>,
+            steps => [external_refund],
+            test_pid => self()},
+          #{run_id => RefundRunId}),
+    ok = wait_for_status(ChargeRunId, waiting_effect, 1000),
+    ok = wait_for_status(RefundRunId, waiting_effect, 1000),
+
+    TestPid = self(),
+    {ok, #{run_id := RefundRunId, effect_id := RefundEffectId}} =
+        beamtrail_external_worker:run_once(
+          <<"refund-worker">>,
+          fun(ClaimedEffect) ->
+                  TestPid ! {filtered_worker_claimed, ClaimedEffect},
+                  {ok, #{<<"external_result">> => <<"refunded">>}}
+          end,
+          #{step_ids => [external_refund]}),
+
+    ?assertMatch({filtered_worker_claimed,
+                  #{run_id := RefundRunId,
+                    effect_id := RefundEffectId,
+                    step_id := external_refund}},
+                 receive_exec()),
+    ok = wait_for_status(RefundRunId, completed, 1000),
+    ?assertEqual(waiting_effect,
+                 maps:get(status, beamtrail:get_state(ChargeRunId))),
+    {ok, Pending} = beamtrail:list_pending_effects(),
+    ?assertEqual([external_charge],
+                 [maps:get(step_id, Effect) || Effect <- Pending]).
+
+external_worker_run_once_renews_claim_while_handler_runs() ->
+    ok = application:set_env(beamtrail, external_effect_visibility_timeout_ms, 40),
+    RunId = <<"external-worker-renew-run">>,
+    Input = #{order_id => <<"external-worker-renew">>, test_pid => self()},
+    {ok, RunId} =
+        beamtrail:start_workflow(bt_external_step_workflow, Input,
+                                 #{run_id => RunId}),
+    ok = wait_for_status(RunId, waiting_effect, 1000),
+    TestPid = self(),
+    Worker =
+        spawn_link(
+          fun() ->
+                  Result =
+                      beamtrail_external_worker:run_once(
+                        <<"slow-worker">>,
+                        fun(ClaimedEffect) ->
+                                TestPid ! {slow_worker_started, ClaimedEffect},
+                                receive continue_slow_worker -> ok end,
+                                {ok, #{<<"external_result">> => <<"slow-ok">>}}
+                        end,
+                        #{renew_claim => true,
+                          claim_renew_interval_ms => 10}),
+                  TestPid ! {slow_worker_result, Result}
+          end),
+
+    ?assertMatch({slow_worker_started,
+                  #{run_id := RunId,
+                    effect_id := _,
+                    claim_token := _}},
+                 receive_exec()),
+    timer:sleep(90),
+    ?assertEqual({ok, []}, beamtrail:list_pending_effects()),
+    ?assertEqual({ok, idle},
+                 beamtrail_external_worker:run_once(
+                   <<"competing-worker">>,
+                   fun(_ClaimedEffect) ->
+                           {ok, #{<<"external_result">> => <<"stolen">>}}
+                   end)),
+
+    Worker ! continue_slow_worker,
+    ?assertMatch({slow_worker_result,
+                  {ok, #{run_id := RunId,
+                         effect_id := _,
+                         state := #{pending_effects := #{}}}}},
+                 receive_exec()),
+    ok = wait_for_status(RunId, completed, 1000),
+    {ok, Events} = beamtrail:events(RunId),
+    ?assert(count_events('effect.claimed', Events) >= 2).
+
+external_worker_run_once_rejects_unsafe_renew_interval() ->
+    ok = application:set_env(beamtrail, external_effect_visibility_timeout_ms, 40),
+    RunId = <<"external-worker-bad-renew-interval">>,
+    Input = #{order_id => <<"external-worker-bad-renew">>, test_pid => self()},
+    {ok, RunId} =
+        beamtrail:start_workflow(bt_external_step_workflow, Input,
+                                 #{run_id => RunId}),
+    ok = wait_for_status(RunId, waiting_effect, 1000),
+
+    ?assertEqual({error, {bad_worker_option, claim_renew_interval_ms}},
+                 beamtrail_external_worker:run_once(
+                   <<"bad-renew-worker">>,
+                   fun(_ClaimedEffect) ->
+                           {ok, #{<<"external_result">> => <<"bad">>}}
+                   end,
+                   #{renew_claim => true,
+                     claim_renew_interval_ms => 40})),
+    ?assertEqual(timeout, receive_exec_short()),
+    {ok, Events} = beamtrail:events(RunId),
+    ?assertEqual(0, count_events('effect.claimed', Events)),
+    {ok, [_StillVisible]} = beamtrail:list_pending_effects().
+
+external_worker_run_once_drains_renewer_stop_message() ->
+    ok = application:set_env(beamtrail, external_effect_visibility_timeout_ms, 1000),
+    RunId = <<"external-worker-renewer-drain">>,
+    Input = #{order_id => <<"external-worker-renewer-drain">>, test_pid => self()},
+    {ok, RunId} =
+        beamtrail:start_workflow(bt_external_step_workflow, Input,
+                                 #{run_id => RunId}),
+    ok = wait_for_status(RunId, waiting_effect, 1000),
+    TestPid = self(),
+    {ok, idle} =
+        beamtrail_external_worker:run_once(
+          <<"drain-worker">>,
+          fun(ClaimedEffect) ->
+                  EffectId = maps:get(effect_id, ClaimedEffect),
+                  ClaimToken = maps:get(claim_token, ClaimedEffect),
+                  spawn_link(
+                    fun() ->
+                            timer:sleep(30),
+                            _ = beamtrail:complete_effect(
+                                  RunId, EffectId, ClaimToken,
+                                  {ok, #{<<"external_result">> => <<"done">>}})
+                    end),
+                  timer:sleep(90),
+                  TestPid ! handler_returning_after_external_completion,
+                  {ok, #{<<"external_result">> => <<"late">>}}
+          end,
+          #{renew_claim => true,
+            claim_renew_interval_ms => 10}),
+    ?assertEqual(handler_returning_after_external_completion, receive_exec()),
+    ?assertEqual(timeout, receive_renewer_message_short()).
+
 retry_uses_stable_idempotency_key_across_attempts() ->
     Input = #{order_id => <<"order-2">>, test_pid => self()},
     {ok, RunId} = beamtrail:start_workflow(bt_retry_workflow, Input),
@@ -642,6 +790,18 @@ receive_exec() ->
 receive_exec_short() ->
     receive
         Message -> Message
+    after 50 ->
+        timeout
+    end.
+
+receive_renewer_message_short() ->
+    receive
+        {beamtrail_external_worker_claim_renew_stopped, _EffectId, _Reason} =
+                Message ->
+            Message;
+        {beamtrail_external_worker_claim_renew_failed, _EffectId, _Reason} =
+                Message ->
+            Message
     after 50 ->
         timeout
     end.
